@@ -19,29 +19,50 @@
 
 推荐使用 Docker 部署，适合放在 VPS、云服务器、NAS 或 1Panel / 宝塔这类面板里长期运行。
 
+完整部署命令：
+
 ```bash
+git clone https://github.com/Regert888/upstream-ratio-watch.git
+cd upstream-ratio-watch
 docker compose up -d
 ```
 
-启动后访问：
+然后访问：
 
 ```text
 http://服务器IP:8000
 ```
 
-默认会把运行数据保存到项目目录下的 `data/`：
+查看日志：
 
-```text
-./data:/app/data
+```bash
+docker compose logs -f
 ```
 
-这里会保存 SQLite 数据库、站点配置、系统访问令牌、SMTP 配置和监控历史。升级或重建容器前，请保留这个目录。
+停止服务：
 
-如果服务器已经占用 8000 端口，可以修改 `docker-compose.yml`：
+```bash
+docker compose down
+```
+
+更新项目：
+
+```bash
+cd upstream-ratio-watch
+git pull
+docker compose up -d --build
+```
+
+如果服务器已经占用 8000 端口，可以修改 `docker-compose.yml`，把：
 
 ```yaml
-ports:
-  - "18000:8000"
+- "8000:8000"
+```
+
+改成：
+
+```yaml
+- "18000:8000"
 ```
 
 然后访问：
@@ -50,13 +71,13 @@ ports:
 http://服务器IP:18000
 ```
 
-常用命令：
+运行数据会保存在项目目录下的 `data/`：
 
-```bash
-docker compose logs -f
-docker compose restart
-docker compose down
+```text
+./data:/app/data
 ```
+
+这里会保存 SQLite 数据库、站点配置、系统访问令牌、SMTP 配置和监控历史。升级或重建容器前，请保留这个目录。
 
 ## 本地启动
 
