@@ -1,48 +1,63 @@
 # Upstream Ratio Watch
 
-Upstream Ratio Watch is a small Python web dashboard for monitoring upstream AI provider group ratios. It is designed for a few manually managed upstream sites, not bulk registration or account farming.
+一个用于监控上游 AI 服务分组倍率变化的轻量级 Web 管理面板。
 
-The first release supports NewAPI-compatible group ratio monitoring. The project name is intentionally generic so other upstream formats, such as sub2api, can be added later.
+第一版主要支持 NewAPI 兼容站点，后续可以继续扩展 sub2api 等其他上游类型。项目适合少量上游站点的日常监控，不包含批量注册、账号批量操作等功能。
 
-## Features
+## 功能
 
-- Monitor NewAPI `GET /api/user/groups`
-- Optional authenticated group collection with system access token and `New-Api-User`
-- Detect group ratio changes, added groups, removed groups, and description changes
-- Show hidden/auth-only group counts
-- Store snapshots and change history in SQLite
-- Send email notifications for changes through SMTP
-- Single-file Python backend with static HTML/CSS/JS frontend
+- 手动添加 NewAPI 站点
+- 定时采集 `GET /api/user/groups`
+- 支持系统访问令牌和 `New-Api-User` 获取认证后可见分组
+- 监控分组倍率变化、新增分组、删除分组、描述变化
+- 展示隐藏分组和认证后新增分组
+- 使用 SQLite 保存快照和变化记录
+- 支持 SMTP 邮箱推送变化提醒
+- Python 标准库后端，静态 HTML/CSS/JS 前端
 
-## Run
+## 启动
 
 ```bash
 python app.py
 ```
 
-Open:
+打开浏览器访问：
 
 ```text
 http://127.0.0.1:8000
 ```
 
-The app creates runtime data under `data/`. Do not commit that directory because it may contain site URLs, access tokens, SMTP credentials, and monitoring history.
+## 运行数据
 
-## Notification
+程序会在 `data/` 目录下创建 SQLite 数据库。
 
-Email notification uses SMTP settings configured in the web UI:
+请不要提交 `data/` 目录，因为里面可能包含：
 
-- SMTP host
-- SMTP port
-- username
-- password or app authorization code
-- sender
-- recipients
-- SSL toggle
+- 站点地址
+- 系统访问令牌
+- NewAPI 用户 ID
+- SMTP 邮箱配置
+- 监控历史记录
 
-## Notes
+`.gitignore` 已默认排除这些运行数据。
 
-- Default monitor interval is 3 minutes.
-- Minimum monitor interval is 1 minute.
-- Current adapter: NewAPI-compatible group ratio monitoring.
-- Planned adapter direction: sub2api group ratio monitoring.
+## 邮箱推送
+
+在 Web UI 的“消息推送”页面配置 SMTP：
+
+- SMTP 服务器
+- 端口
+- 邮箱账号
+- 邮箱授权码或密码
+- 发件人
+- 收件人
+- SSL 开关
+
+当检测到倍率或分组变化时，会自动发送邮件提醒。
+
+## 说明
+
+- 默认监控间隔：3 分钟
+- 最低监控间隔：1 分钟
+- 当前适配器：NewAPI 兼容分组倍率监控
+- 后续计划：sub2api 分组倍率监控
