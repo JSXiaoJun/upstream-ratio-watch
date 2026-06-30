@@ -828,25 +828,30 @@ def fmt_local_time_for_message(value: str) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def platform_label(site: Dict[str, Any]) -> str:
+    return "sub2api" if (site.get("platform") or "newapi") == "sub2api" else "NewAPI"
+
+
 def format_change_subject(site: Dict[str, Any], changes: List[Dict[str, Any]]) -> str:
     site_name = site["name"]
+    platform = platform_label(site)
     ratio_changes = [item for item in changes if item.get("change_type") == "ratio_changed"]
     if len(ratio_changes) == 1:
         change = ratio_changes[0]
         label = "倍率上涨" if ratio_direction(change) == "up" else "倍率下降" if ratio_direction(change) == "down" else "倍率变动"
-        return f"【{label}】{site_name} / {change.get('group_name') or '-'}：{format_change_value(change.get('old_value'))} -> {format_change_value(change.get('new_value'))}"
+        return f"【{platform} {label}】{site_name} / {change.get('group_name') or '-'}：{format_change_value(change.get('old_value'))} -> {format_change_value(change.get('new_value'))}"
     if len(ratio_changes) > 1:
-        return f"【倍率变动】{site_name}：{len(ratio_changes)} 个分组有变化"
+        return f"【{platform} 倍率变动】{site_name}：{len(ratio_changes)} 个分组有变化"
 
     added = [item for item in changes if item.get("change_type") == "group_added"]
     removed = [item for item in changes if item.get("change_type") == "group_removed"]
     if len(added) == 1 and not removed:
         change = added[0]
-        return f"【新增分组】{site_name} / {change.get('group_name') or '-'}：{format_change_value(change.get('new_value'))}"
+        return f"【{platform} 新增分组】{site_name} / {change.get('group_name') or '-'}：{format_change_value(change.get('new_value'))}"
     if len(removed) == 1 and not added:
         change = removed[0]
-        return f"【删除分组】{site_name} / {change.get('group_name') or '-'}"
-    return f"【分组变化】{site_name}：{len(changes)} 条变化"
+        return f"【{platform} 删除分组】{site_name} / {change.get('group_name') or '-'}"
+    return f"【{platform} 分组变化】{site_name}：{len(changes)} 条变化"
 
 
 def format_change_notification(site: Dict[str, Any], changes: List[Dict[str, Any]], checked_at: str) -> str:
@@ -862,8 +867,9 @@ def format_change_notification(site: Dict[str, Any], changes: List[Dict[str, Any
     ]
 
     lines = [
-        "NewAPI 倍率哨兵",
+        "上游倍率监控提醒",
         f"站点：{site['name']}",
+        f"平台：{platform_label(site)}",
         f"时间：{fmt_local_time_for_message(checked_at)}",
         f"本次共 {len(changes)} 条变化",
     ]
@@ -1417,8 +1423,8 @@ class Handler(BaseHTTPRequestHandler):
                 body = read_json_body(self)
                 if body:
                     update_notification_settings(body)
-                message = "这是一封 NewAPI 分组倍率监控测试邮件。"
-                ok, error_message = send_email_message("NewAPI 邮箱推送测试", message)
+                message = "这是一封上游分组倍率监控测试邮件。"
+                ok, error_message = send_email_message("上游倍率监控邮箱测试", message)
                 return json_response(self, {"success": ok, "message": error_message or "测试邮件已发送"})
 
             self.send_error(HTTPStatus.NOT_FOUND)
