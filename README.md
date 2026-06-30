@@ -8,14 +8,16 @@ QQ群：`259844673`
 
 一个用于监控上游 AI 服务分组倍率变化的轻量级 Web 管理面板。
 
-第一版主要支持 NewAPI 兼容站点，后续可以继续扩展 sub2api 等其他上游类型。项目适合少量上游站点的日常监控，不包含批量注册、账号批量操作等功能。
+当前支持 NewAPI 兼容站点和 sub2api 站点，后续可以继续扩展其他上游类型。项目适合少量上游站点的日常监控，不包含批量注册、账号批量操作等功能。
 
 ## 功能
 
-- 手动添加 NewAPI 站点
-- 定时采集 `GET /api/user/groups`
-- 支持系统访问令牌和 `New-Api-User` 获取认证后可见分组
+- 手动添加 NewAPI / sub2api 站点
+- NewAPI 定时采集 `GET /api/user/groups`
+- sub2api 使用普通用户账号登录后采集用户可见分组
+- 支持 NewAPI 系统访问令牌和 `New-Api-User` 获取认证后可见分组
 - 监控分组倍率变化、新增分组、删除分组、描述变化
+- 监控 sub2api 分组状态、专属属性、订阅类型、RPM 限制变化
 - 展示隐藏分组和认证后新增分组
 - 使用 SQLite 保存快照和变化记录
 - 支持 SMTP 邮箱推送变化提醒
@@ -108,7 +110,8 @@ HOST=0.0.0.0 PORT=8000 python app.py
 在 Web UI 点击“添加站点”，填写：
 
 - 站点名称：自定义名称，方便自己识别。
-- Base URL：NewAPI 站点地址，例如 `https://example.com`，不要带 `/api/user/groups`。
+- 平台类型：选择 NewAPI 或 sub2api。
+- Base URL：上游站点地址，例如 `https://example.com`，不要带具体 API 路径。
 - 监控间隔：单位为分钟，最低 1 分钟。
 - 启用监控：开启后会按设定间隔自动检测。
 
@@ -119,6 +122,32 @@ GET {Base URL}/api/user/groups
 ```
 
 这个接口通常不需要登录，可以看到公开分组和公开倍率。
+
+## sub2api 监控
+
+sub2api 普通用户不能拿到上游管理员 API Key，所以本项目使用普通用户账号登录后读取该账号可见的分组。
+
+添加 sub2api 站点时填写：
+
+- 平台类型：sub2api
+- Base URL：sub2api 站点地址，例如 `https://example.com`
+- 用户邮箱：上游 sub2api 的普通用户邮箱
+- 用户密码：该普通用户密码
+
+检测时会请求：
+
+```text
+POST {Base URL}/api/v1/auth/login
+GET {Base URL}/api/v1/groups/available
+GET {Base URL}/api/v1/groups/rates
+```
+
+其中：
+
+- `/groups/available` 返回该普通用户可以绑定和使用的分组。
+- `/groups/rates` 返回该普通用户的专属分组倍率。
+
+如果某个分组存在用户专属倍率，本项目会优先按用户专属倍率监控。
 
 ## 认证增强监控
 
@@ -225,5 +254,4 @@ New-Api-User: NewAPI 用户 ID
 
 - 默认监控间隔：3 分钟
 - 最低监控间隔：1 分钟
-- 当前适配器：NewAPI 兼容分组倍率监控
-- 后续计划：sub2api 分组倍率监控
+- 当前适配器：NewAPI 兼容分组倍率监控、sub2api 用户可见分组倍率监控

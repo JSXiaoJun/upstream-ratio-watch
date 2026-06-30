@@ -33,7 +33,7 @@
       <header class="topbar">
         <div>
           <div class="page-title">上游分组倍率监控</div>
-          <div class="page-subtitle">定时采集 NewAPI 的 /api/user/groups，发现分组、倍率、描述变化。</div>
+          <div class="page-subtitle">定时采集 NewAPI / sub2api 上游分组倍率，发现分组、倍率、描述变化。</div>
         </div>
         <div class="topbar-actions">
           <button id="refreshBtn" class="btn btn-secondary">刷新</button>
@@ -63,7 +63,7 @@
                   <tr>
                     <th>站点</th>
                     <th>状态</th>
-                    <th>隐藏分组</th>
+                    <th>认证/隐藏</th>
                     <th>分组</th>
                     <th>上次检测</th>
                     <th>操作</th>
@@ -103,7 +103,7 @@
           <div class="panel-head">
             <div>
               <h2>站点列表</h2>
-              <p>少量上游手动维护，每个站点单独设置监控间隔和认证增强。</p>
+              <p>少量上游手动维护，每个站点单独设置平台类型、监控间隔和认证方式。</p>
             </div>
             <div class="toolbar">
               <input id="searchInput" class="input" type="search" placeholder="搜索站点或地址" />
@@ -122,7 +122,7 @@
                 <tr>
                   <th>站点</th>
                   <th>状态</th>
-                  <th>隐藏分组</th>
+                  <th>认证/隐藏</th>
                   <th>分组</th>
                   <th>上次检测</th>
                   <th>操作</th>
@@ -244,6 +244,13 @@
         <input id="siteName" class="input" required maxlength="80" />
       </label>
       <label class="field">
+        <span>平台类型</span>
+        <select id="sitePlatform" class="input">
+          <option value="newapi">NewAPI</option>
+          <option value="sub2api">sub2api</option>
+        </select>
+      </label>
+      <label class="field">
         <span>Base URL</span>
         <input id="siteBaseUrl" class="input" required placeholder="https://example.com" />
       </label>
@@ -251,7 +258,7 @@
         <span>监控间隔（分钟）</span>
         <input id="siteInterval" class="input" type="number" min="1" value="3" />
       </label>
-      <div class="form-section">
+      <div id="newapiAuthSection" class="form-section">
         <label class="field switch-row">
           <span>认证增强监控</span>
           <input id="siteLoginEnabled" type="checkbox" />
@@ -265,6 +272,19 @@
           <label class="field">
             <span>NewAPI 用户 ID</span>
             <input id="siteAccessUserId" class="input" inputmode="numeric" placeholder="例如：4" />
+          </label>
+        </div>
+      </div>
+      <div id="sub2apiAuthSection" class="form-section hidden">
+        <p class="field-help">sub2api 使用普通用户邮箱和密码登录后，监控该账号实际可见的分组倍率和用户专属倍率。</p>
+        <div class="login-fields">
+          <label class="field">
+            <span>用户邮箱</span>
+            <input id="siteLoginUsername" class="input" autocomplete="username" placeholder="user@example.com" />
+          </label>
+          <label class="field">
+            <span>用户密码</span>
+            <input id="siteLoginPassword" class="input" type="password" autocomplete="current-password" placeholder="编辑时留空表示不修改密码" />
           </label>
         </div>
       </div>

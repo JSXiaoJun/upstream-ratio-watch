@@ -309,6 +309,49 @@ def parse_groups_payload(payload: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     return normalized
 
 
+def parse_sub2api_groups(groups_payload: Any, rates_payload: Any = None) -> Dict[str, Dict[str, Any]]:
+    if isinstance(groups_payload, dict) and "data" in groups_payload:
+        groups_payload = groups_payload.get("data")
+    if isinstance(rates_payload, dict) and "data" in rates_payload:
+        rates_payload = rates_payload.get("data")
+    if not isinstance(groups_payload, list):
+        return {}
+    rates: Dict[str, Any] = {}
+    if isinstance(rates_payload, dict):
+        rates = {str(key): value for key, value in rates_payload.items()}
+
+    normalized: Dict[str, Dict[str, Any]] = {}
+    for item in groups_payload:
+        if not isinstance(item, dict):
+            continue
+        group_id = item.get("id")
+        name = str(item.get("name") or group_id or "").strip()
+        if not name:
+            continue
+        base_ratio = item.get("rate_multiplier")
+        effective_ratio = rates.get(str(group_id), base_ratio)
+        try:
+            ratio_value: Any = float(effective_ratio)
+            ratio_type = "number"
+        except (TypeError, ValueError):
+            ratio_value = effective_ratio
+            ratio_type = "text"
+        normalized[name] = {
+            "ratio": ratio_value,
+            "ratio_type": ratio_type,
+            "desc": item.get("description") or "",
+            "id": group_id,
+            "platform": item.get("platform") or "",
+            "base_ratio": base_ratio,
+            "user_ratio": rates.get(str(group_id)),
+            "status": item.get("status") or "",
+            "is_exclusive": bool(item.get("is_exclusive")),
+            "subscription_type": item.get("subscription_type") or "",
+            "rpm_limit": item.get("rpm_limit"),
+        }
+    return normalized
+
+
 def stable_hash(obj: Any) -> str:
     text = json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -343,6 +386,95 @@ def fetch_newapi_groups(base_url: str) -> Tuple[bool, Dict[str, Any], Optional[s
         return False, {"status": exc.code, "raw": raw}, f"HTTP {exc.code}"
     except Exception as exc:
         return False, {"error": str(exc)}, str(exc)
+
+
+def request_json(url: str, headers: Optional[Dict[str, str]] = None, payload: Optional[Dict[str, Any]] = None, method: str = "GET") -> Tuple[bool, Any, Optional[str]]:
+    data = None
+    request_headers = {
+        "Accept": "application/json",
+        "User-Agent": "Upstream-Ratio-Watch/1.0",
+    }
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        request_headers["Content-Type"] = "application/json"
+    if headers:
+        request_headers.update(headers)
+    req = urllib.request.Request(url, data=data, headers=request_headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_SECONDS) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            parsed = json.loads(body) if body else {}
+            return True, parsed, None
+    except urllib.error.HTTPError as exc:
+        try:
+            raw = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            raw = ""
+        return False, {"status": exc.code, "raw": raw}, f"HTTP {exc.code}"
+    except Exception as exc:
+        return False, {"error": str(exc)}, str(exc)
+
+
+def unwrap_sub2api_response(payload: Any) -> Tuple[bool, Any, Optional[str]]:
+    if not isinstance(payload, dict):
+        return False, payload, "响应不是 JSON 对象"
+    if "code" in payload and payload.get("code") != 0:
+        return False, payload, str(payload.get("message") or "code != 0")
+    return True, payload.get("data"), None
+
+
+def sub2api_login(base_url: str, username: str, password: str) -> Tuple[bool, str, Dict[str, Any], Optional[str]]:
+    email = (username or "").strip()
+    password = password or ""
+    if not email or not password:
+        return False, "", {}, "sub2api 需要填写普通用户邮箱和密码"
+    ok, payload, error = request_json(
+        f"{normalize_base_url(base_url)}/api/v1/auth/login",
+        payload={"email": email, "password": password},
+        method="POST",
+    )
+    if not ok:
+        return False, "", payload if isinstance(payload, dict) else {"raw": payload}, error
+    success, data, message = unwrap_sub2api_response(payload)
+    if not success or not isinstance(data, dict):
+        return False, "", payload if isinstance(payload, dict) else {"raw": payload}, message or "登录失败"
+    token = str(data.get("access_token") or "").strip()
+    if not token:
+        return False, "", payload if isinstance(payload, dict) else {"raw": payload}, "登录成功但没有返回 access_token"
+    return True, token, payload if isinstance(payload, dict) else {"raw": payload}, None
+
+
+def fetch_sub2api_user_groups(base_url: str, username: str, password: str) -> Tuple[bool, Dict[str, Any], Optional[str]]:
+    login_ok, token, login_payload, login_error = sub2api_login(base_url, username, password)
+    if not login_ok:
+        return False, {"login": login_payload}, login_error or "登录失败"
+    headers = {"Authorization": f"Bearer {token}"}
+    groups_ok, groups_payload, groups_error = request_json(
+        f"{normalize_base_url(base_url)}/api/v1/groups/available",
+        headers=headers,
+    )
+    if not groups_ok:
+        return False, {"groups": groups_payload}, groups_error or "用户可用分组请求失败"
+    groups_success, groups_data, groups_message = unwrap_sub2api_response(groups_payload)
+    if not groups_success:
+        return False, {"groups": groups_payload}, groups_message or "用户可用分组响应失败"
+
+    rates_ok, rates_payload, rates_error = request_json(
+        f"{normalize_base_url(base_url)}/api/v1/groups/rates",
+        headers=headers,
+    )
+    rates_data: Any = {}
+    if rates_ok:
+        rates_success, parsed_rates, _ = unwrap_sub2api_response(rates_payload)
+        if rates_success and isinstance(parsed_rates, dict):
+            rates_data = parsed_rates
+
+    return True, {
+        "success": True,
+        "data": groups_data,
+        "user_rates": rates_data,
+        "rates_error": None if rates_ok else rates_error,
+    }, None
 
 
 def fetch_newapi_groups_with_access_token(base_url: str, access_token: str, user_id: str = "") -> Tuple[bool, Dict[str, Any], Optional[str]]:
@@ -389,6 +521,25 @@ def probe_newapi_groups(base_url: str) -> Dict[str, Any]:
         }
 
     groups = parse_groups_payload(payload)
+    return {
+        "success": True,
+        "message": "ok",
+        "groups_count": len(groups),
+        "groups": groups,
+    }
+
+
+def probe_sub2api_groups(base_url: str, username: str, password: str) -> Dict[str, Any]:
+    ok, payload, error_message = fetch_sub2api_user_groups(base_url, username, password)
+    if not ok:
+        return {
+            "success": False,
+            "message": error_message or "request failed",
+            "groups_count": 0,
+            "groups": {},
+            "raw": payload,
+        }
+    groups = parse_sub2api_groups(payload.get("data"), payload.get("user_rates"))
     return {
         "success": True,
         "message": "ok",
@@ -467,6 +618,23 @@ def diff_groups(old_groups: Dict[str, Dict[str, Any]], new_groups: Dict[str, Dic
                 "change_percent": None,
                 "message": f"{name} 描述变化",
             })
+        for field, label in (
+            ("status", "状态"),
+            ("is_exclusive", "专属分组"),
+            ("subscription_type", "订阅类型"),
+            ("rpm_limit", "RPM 限制"),
+            ("platform", "平台"),
+        ):
+            if field in old_item or field in new_item:
+                if old_item.get(field) != new_item.get(field):
+                    changes.append({
+                        "change_type": f"{field}_changed",
+                        "group_name": name,
+                        "old_value": old_item.get(field),
+                        "new_value": new_item.get(field),
+                        "change_percent": None,
+                        "message": f"{name} {label}变化：{old_item.get(field)} -> {new_item.get(field)}",
+                    })
 
     return changes
 
@@ -688,6 +856,10 @@ def format_change_notification(site: Dict[str, Any], changes: List[Dict[str, Any
     added = [item for item in changes if item.get("change_type") == "group_added"]
     removed = [item for item in changes if item.get("change_type") == "group_removed"]
     desc_changed = [item for item in changes if item.get("change_type") == "desc_changed"]
+    other_changed = [
+        item for item in changes
+        if item.get("change_type") not in {"ratio_changed", "group_added", "group_removed", "desc_changed"}
+    ]
 
     lines = [
         "NewAPI 倍率哨兵",
@@ -730,6 +902,13 @@ def format_change_notification(site: Dict[str, Any], changes: List[Dict[str, Any
         for change in desc_changed[:6]:
             lines.append(f"- {change.get('group_name') or '-'}")
 
+    if other_changed:
+        lines.extend(["", "其他配置变化："])
+        for change in other_changed[:8]:
+            lines.append(
+                f"- {change.get('group_name') or '-'}：{format_change_value(change.get('old_value'))} -> {format_change_value(change.get('new_value'))}"
+            )
+
     if len(changes) > 8:
         lines.append("")
         lines.append(f"其余 {len(changes) - 8} 条变化请在面板查看")
@@ -742,22 +921,38 @@ def notify_changes(site: Dict[str, Any], changes: List[Dict[str, Any]], checked_
     send_email_message(format_change_subject(site, changes), format_change_notification(site, changes, checked_at))
 
 
+def collect_site_groups(site: Dict[str, Any]) -> Tuple[bool, Dict[str, Dict[str, Any]], Dict[str, Any], str, Optional[str]]:
+    platform = site.get("platform") or "newapi"
+    if platform == "sub2api":
+        ok, payload, error_message = fetch_sub2api_user_groups(
+            site["base_url"],
+            site.get("login_username") or "",
+            site.get("login_password") or "",
+        )
+        groups = parse_sub2api_groups(payload.get("data"), payload.get("user_rates")) if ok else {}
+        return ok, groups, payload, "/api/v1/groups/available", error_message
+
+    ok, payload, error_message = fetch_newapi_groups(site["base_url"])
+    groups = parse_groups_payload(payload) if ok else {}
+    return ok, groups, payload, "/api/user/groups", error_message
+
+
 def detect_site(site_id: int) -> Dict[str, Any]:
     site = db_query_one("SELECT * FROM sites WHERE id = ?", (site_id,))
     if not site:
         return {"success": False, "message": "site not found"}
 
     checked_at = utc_now_iso()
-    ok, payload, error_message = fetch_newapi_groups(site["base_url"])
+    ok, new_groups, payload, source, error_message = collect_site_groups(site)
     latest_success = get_last_success_snapshot(site_id)
 
     if not ok:
         db_execute(
             """
             INSERT INTO snapshots (site_id, status, source, raw_json, error_message, checked_at, hash)
-            VALUES (?, 'failed', '/api/user/groups', ?, ?, ?, NULL)
+            VALUES (?, 'failed', ?, ?, ?, ?, NULL)
             """,
-            (site_id, json.dumps(payload, ensure_ascii=False), error_message, checked_at),
+            (site_id, source, json.dumps(payload, ensure_ascii=False), error_message, checked_at),
         )
 
         consecutive_failures = int(site["consecutive_failures"] or 0) + 1
@@ -773,7 +968,6 @@ def detect_site(site_id: int) -> Dict[str, Any]:
         )
         return {"success": False, "message": error_message, "status": status}
 
-    new_groups = parse_groups_payload(payload)
     groups_json = json.dumps(new_groups, ensure_ascii=False, sort_keys=True)
     hash_value = stable_hash(new_groups)
     login_groups: Dict[str, Dict[str, Any]] = {}
@@ -783,9 +977,9 @@ def detect_site(site_id: int) -> Dict[str, Any]:
     db_execute(
         """
         INSERT INTO snapshots (site_id, status, source, groups_json, raw_json, hash, error_message, checked_at)
-        VALUES (?, 'success', '/api/user/groups', ?, ?, ?, NULL, ?)
+        VALUES (?, 'success', ?, ?, ?, ?, NULL, ?)
         """,
-        (site_id, groups_json, json.dumps(payload, ensure_ascii=False), hash_value, checked_at),
+        (site_id, source, groups_json, json.dumps(payload, ensure_ascii=False), hash_value, checked_at),
     )
 
     changes: List[Dict[str, Any]] = []
@@ -797,7 +991,7 @@ def detect_site(site_id: int) -> Dict[str, Any]:
         except Exception:
             changes = []
 
-    if site.get("login_enabled") and site.get("access_token") and site.get("access_user_id"):
+    if (site.get("platform") or "newapi") == "newapi" and site.get("login_enabled") and site.get("access_token") and site.get("access_user_id"):
         login_ok, login_payload, login_error_message = fetch_newapi_groups_with_access_token(
             site["base_url"],
             site["access_token"],
@@ -899,7 +1093,6 @@ def schedule_worker() -> None:
                 """
                 SELECT * FROM sites
                 WHERE enabled = 1
-                  AND platform = 'newapi'
                   AND (next_check_at IS NULL OR next_check_at <= ?)
                 ORDER BY
                   CASE WHEN next_check_at IS NULL THEN 0 ELSE 1 END,
@@ -986,9 +1179,12 @@ def site_summary(site: Dict[str, Any]) -> Dict[str, Any]:
         "name": site["name"],
         "base_url": site["base_url"],
         "platform": site["platform"],
+        "platform_label": "sub2api" if site["platform"] == "sub2api" else "NewAPI",
         "enabled": bool(site["enabled"]),
         "interval_minutes": site["interval_minutes"],
         "login_enabled": bool(site.get("login_enabled")),
+        "login_username": site.get("login_username") or "",
+        "has_login_password": bool(site.get("login_password")),
         "has_access_token": bool(site.get("access_token")),
         "access_user_id": site.get("access_user_id") or "",
         "login_last_error": site.get("login_last_error"),
@@ -1134,9 +1330,17 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/check-connection":
                 body = read_json_body(self)
                 base_url = normalize_base_url(str(body.get("base_url") or ""))
+                platform = str(body.get("platform") or "newapi").strip().lower()
                 if not base_url:
                     return json_response(self, {"success": False, "message": "base_url required"}, 400)
-                result = probe_newapi_groups(base_url)
+                if platform == "sub2api":
+                    result = probe_sub2api_groups(
+                        base_url,
+                        str(body.get("login_username") or "").strip(),
+                        str(body.get("login_password") or ""),
+                    )
+                else:
+                    result = probe_newapi_groups(base_url)
                 return json_response(self, result)
 
             if path == "/api/check-login":
@@ -1159,17 +1363,23 @@ class Handler(BaseHTTPRequestHandler):
                 body = read_json_body(self)
                 name = str(body.get("name") or "").strip()
                 base_url = normalize_base_url(str(body.get("base_url") or ""))
+                platform = str(body.get("platform") or "newapi").strip().lower()
                 enabled = bool(body.get("enabled", True))
                 interval = int(body.get("interval_minutes") or DEFAULT_INTERVAL_MINUTES)
                 interval = max(MIN_INTERVAL_MINUTES, interval)
                 login_enabled = bool(body.get("login_enabled", False))
+                login_username = str(body.get("login_username") or "").strip()
+                login_password = str(body.get("login_password") or "")
                 access_token = str(body.get("access_token") or "").strip()
                 access_user_id = str(body.get("access_user_id") or "").strip()
-                platform = "newapi"
+                if platform not in {"newapi", "sub2api"}:
+                    return json_response(self, {"success": False, "message": "platform invalid"}, 400)
                 if not name or not base_url:
                     return json_response(self, {"success": False, "message": "name/base_url required"}, 400)
-                if login_enabled and (not access_token or not access_user_id):
+                if platform == "newapi" and login_enabled and (not access_token or not access_user_id):
                     return json_response(self, {"success": False, "message": "使用系统访问令牌时需要填写 NewAPI 用户 ID"}, 400)
+                if platform == "sub2api" and (not login_username or not login_password):
+                    return json_response(self, {"success": False, "message": "sub2api 需要填写普通用户邮箱和密码"}, 400)
                 now = utc_now_iso()
                 site_id = db_execute(
                     """
@@ -1183,11 +1393,11 @@ class Handler(BaseHTTPRequestHandler):
                         platform,
                         1 if enabled else 0,
                         interval,
-                        1 if login_enabled else 0,
-                        "",
-                        "",
-                        access_token if login_enabled else "",
-                        access_user_id if login_enabled else "",
+                        1 if (login_enabled or platform == "sub2api") else 0,
+                        login_username if platform == "sub2api" else "",
+                        login_password if platform == "sub2api" else "",
+                        access_token if platform == "newapi" and login_enabled else "",
+                        access_user_id if platform == "newapi" and login_enabled else "",
                         next_check_iso(interval),
                         now,
                         now,
@@ -1235,6 +1445,12 @@ class Handler(BaseHTTPRequestHandler):
             if "base_url" in body:
                 fields.append("base_url = ?")
                 params.append(normalize_base_url(str(body["base_url"])))
+            target_platform = str(body.get("platform") or site.get("platform") or "newapi").strip().lower()
+            if target_platform not in {"newapi", "sub2api"}:
+                return json_response(self, {"success": False, "message": "platform invalid"}, 400)
+            if "platform" in body:
+                fields.append("platform = ?")
+                params.append(target_platform)
             if "enabled" in body:
                 fields.append("enabled = ?")
                 params.append(1 if body["enabled"] else 0)
@@ -1243,31 +1459,50 @@ class Handler(BaseHTTPRequestHandler):
                 params.append(max(MIN_INTERVAL_MINUTES, int(body["interval_minutes"])))
             if "login_enabled" in body:
                 login_enabled = bool(body["login_enabled"])
+                login_username = str(body.get("login_username") or "").strip()
+                login_password = str(body.get("login_password") or "")
                 access_token = str(body.get("access_token") or "").strip()
                 access_user_id = str(body.get("access_user_id") or "").strip()
                 existing_access_token = site.get("access_token") or ""
                 existing_access_user_id = site.get("access_user_id") or ""
-                has_token_after_update = bool(access_token or existing_access_token)
-                has_user_id_after_update = bool(access_user_id or existing_access_user_id)
-                if login_enabled and (not has_token_after_update or not has_user_id_after_update):
-                    return json_response(self, {"success": False, "message": "使用系统访问令牌时需要填写 NewAPI 用户 ID"}, 400)
+                existing_username = site.get("login_username") or ""
+                existing_password = site.get("login_password") or ""
+                if target_platform == "newapi":
+                    has_token_after_update = bool(access_token or existing_access_token)
+                    has_user_id_after_update = bool(access_user_id or existing_access_user_id)
+                    if login_enabled and (not has_token_after_update or not has_user_id_after_update):
+                        return json_response(self, {"success": False, "message": "使用系统访问令牌时需要填写 NewAPI 用户 ID"}, 400)
+                if target_platform == "sub2api" and (not (login_username or existing_username) or not (login_password or existing_password)):
+                    return json_response(self, {"success": False, "message": "sub2api 需要填写普通用户邮箱和密码"}, 400)
                 fields.append("login_enabled = ?")
-                params.append(1 if login_enabled else 0)
-                fields.append("login_username = ?")
-                params.append("")
-                fields.append("login_password = ?")
-                params.append("")
-                if not login_enabled:
+                params.append(1 if (login_enabled or target_platform == "sub2api") else 0)
+                if target_platform == "sub2api":
+                    if login_username:
+                        fields.append("login_username = ?")
+                        params.append(login_username)
+                    if login_password:
+                        fields.append("login_password = ?")
+                        params.append(login_password)
                     fields.append("access_token = ?")
                     params.append("")
                     fields.append("access_user_id = ?")
                     params.append("")
-                if login_enabled and access_token:
-                    fields.append("access_token = ?")
-                    params.append(access_token)
-                if login_enabled and access_user_id:
-                    fields.append("access_user_id = ?")
-                    params.append(access_user_id)
+                else:
+                    fields.append("login_username = ?")
+                    params.append("")
+                    fields.append("login_password = ?")
+                    params.append("")
+                    if not login_enabled:
+                        fields.append("access_token = ?")
+                        params.append("")
+                        fields.append("access_user_id = ?")
+                        params.append("")
+                    if login_enabled and access_token:
+                        fields.append("access_token = ?")
+                        params.append(access_token)
+                    if login_enabled and access_user_id:
+                        fields.append("access_user_id = ?")
+                        params.append(access_user_id)
             if "status" in body:
                 fields.append("status = ?")
                 params.append(str(body["status"]))

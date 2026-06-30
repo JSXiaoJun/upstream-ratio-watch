@@ -35,12 +35,17 @@ const els = {
   dialogTitle: document.getElementById('dialogTitle'),
   siteId: document.getElementById('siteId'),
   siteName: document.getElementById('siteName'),
+  sitePlatform: document.getElementById('sitePlatform'),
   siteBaseUrl: document.getElementById('siteBaseUrl'),
   siteInterval: document.getElementById('siteInterval'),
   siteLoginEnabled: document.getElementById('siteLoginEnabled'),
+  siteLoginUsername: document.getElementById('siteLoginUsername'),
+  siteLoginPassword: document.getElementById('siteLoginPassword'),
   siteAccessToken: document.getElementById('siteAccessToken'),
   siteAccessUserId: document.getElementById('siteAccessUserId'),
   loginFields: document.getElementById('loginFields'),
+  newapiAuthSection: document.getElementById('newapiAuthSection'),
+  sub2apiAuthSection: document.getElementById('sub2apiAuthSection'),
   siteEnabled: document.getElementById('siteEnabled'),
   dialogMsg: document.getElementById('dialogMsg'),
   testConnBtn: document.getElementById('testConnBtn'),
@@ -94,6 +99,11 @@ function changeTypeLabel(type) {
     group_added: '新增分组',
     group_removed: '删除分组',
     desc_changed: '描述变化',
+    status_changed: '状态变化',
+    is_exclusive_changed: '专属变化',
+    subscription_type_changed: '订阅变化',
+    rpm_limit_changed: 'RPM 变化',
+    platform_changed: '平台变化',
   };
   return labels[type] || type || '-';
 }
@@ -109,6 +119,25 @@ function ratioLabel(item) {
 
 function setLoginFieldsVisible(visible) {
   els.loginFields.classList.toggle('hidden', !visible);
+}
+
+function platformLabel(siteOrValue) {
+  const value = typeof siteOrValue === 'string' ? siteOrValue : (siteOrValue?.platform || 'newapi');
+  return value === 'sub2api' ? 'sub2api' : 'NewAPI';
+}
+
+function updatePlatformFields() {
+  const platform = els.sitePlatform.value || 'newapi';
+  const isSub2api = platform === 'sub2api';
+  els.newapiAuthSection.classList.toggle('hidden', isSub2api);
+  els.sub2apiAuthSection.classList.toggle('hidden', !isSub2api);
+  els.testLoginBtn.textContent = isSub2api ? '测试登录' : '测试认证';
+  if (isSub2api) {
+    els.siteLoginEnabled.checked = true;
+    setLoginFieldsVisible(false);
+  } else {
+    setLoginFieldsVisible(els.siteLoginEnabled.checked);
+  }
 }
 
 function setActiveView(view) {
@@ -203,13 +232,13 @@ function siteRows(sites) {
         <td>
           <button class="link-cell" data-act="view" data-id="${site.id}">
             <strong>${escapeHtml(site.name)}</strong>
-            <span>${escapeHtml(site.base_url)}</span>
+            <span>${escapeHtml(platformLabel(site))} · ${escapeHtml(site.base_url)}</span>
           </button>
         </td>
         <td><span class="badge ${badgeClass(site.status)}">${escapeHtml(site.status)}</span></td>
         <td>
           ${hiddenCount ? `<span class="tag strong">${hiddenCount} 个隐藏</span>` : '<span class="muted">无</span>'}
-          ${site.login_enabled ? '<span class="tag login">认证增强</span>' : ''}
+          ${site.platform === 'sub2api' ? '<span class="tag login">用户登录</span>' : site.login_enabled ? '<span class="tag login">认证增强</span>' : ''}
         </td>
         <td>${site.current_groups_count || 0}</td>
         <td>${fmtTime(site.last_check_at)}</td>
@@ -304,7 +333,7 @@ function renderDetail(site) {
         <div class="group-row">
           <div>
             <strong>${escapeHtml(name)}</strong>
-            <span>${escapeHtml(item.desc || '-')}</span>
+            <span>${escapeHtml([item.platform, item.status, item.is_exclusive ? '专属' : '', item.desc || '-'].filter(Boolean).join(' · '))}</span>
           </div>
           <div class="group-ratio">${escapeHtml(ratioLabel(item))}</div>
         </div>
@@ -329,7 +358,7 @@ function renderDetail(site) {
     <div class="detail-title-row">
       <div>
         <div class="detail-title">${escapeHtml(site.name)}</div>
-        <div class="muted">${escapeHtml(site.base_url)}</div>
+        <div class="muted">${escapeHtml(platformLabel(site))} · ${escapeHtml(site.base_url)}</div>
       </div>
       <span class="badge ${badgeClass(site.status)}">${escapeHtml(site.status)}</span>
     </div>
@@ -342,10 +371,12 @@ function renderDetail(site) {
       <div class="meta-card"><div class="k">下次检测</div><div class="v">${fmtTime(site.next_check_at)}</div></div>
       <div class="meta-card"><div class="k">连续失败</div><div class="v">${site.consecutive_failures || 0}</div></div>
       <div class="meta-card"><div class="k">启用状态</div><div class="v">${site.enabled ? '启用中' : '已停用'}</div></div>
-      <div class="meta-card wide"><div class="k">监控模式</div><div class="v">${site.login_enabled ? `认证增强监控（系统访问令牌 / 用户ID ${escapeHtml(site.access_user_id || '-')}）` : '公开分组监控'}</div></div>
+      <div class="meta-card wide"><div class="k">监控模式</div><div class="v">${site.platform === 'sub2api' ? `sub2api 用户分组监控（${escapeHtml(site.login_username || '-')}）` : site.login_enabled ? `认证增强监控（系统访问令牌 / 用户ID ${escapeHtml(site.access_user_id || '-')}）` : '公开分组监控'}</div></div>
     </div>
     <section class="mode-note ${site.login_enabled ? 'enabled' : ''}">
-      ${site.login_enabled
+      ${site.platform === 'sub2api'
+        ? '当前站点使用 sub2api 普通用户账号登录，检测该账号实际可见的分组倍率和用户专属倍率。'
+        : site.login_enabled
         ? '当前站点已开启认证增强监控，检测时会优先使用系统访问令牌采集该账号可见的隐藏用户分组或专属分组。'
         : '当前站点只监控公开 /api/user/groups。若该站存在特殊分组，可在编辑站点中开启认证增强监控。'}
     </section>
@@ -364,7 +395,7 @@ function renderDetail(site) {
       </section>
     ` : ''}
     <section class="detail-section">
-      <div class="section-title">${site.login_enabled && Object.keys(loginGroupsObj).length ? '认证分组倍率' : '当前公开分组倍率'}</div>
+      <div class="section-title">${site.platform === 'sub2api' ? '用户可见分组倍率' : site.login_enabled && Object.keys(loginGroupsObj).length ? '认证分组倍率' : '当前公开分组倍率'}</div>
       <div class="group-list">${groupRows}</div>
     </section>
     <section class="detail-section">
@@ -380,25 +411,30 @@ function openDialog(site = null) {
     els.dialogTitle.textContent = '编辑站点';
     els.siteId.value = site.id;
     els.siteName.value = site.name;
+    els.sitePlatform.value = site.platform || 'newapi';
     els.siteBaseUrl.value = site.base_url;
     els.siteInterval.value = site.interval_minutes;
     els.siteLoginEnabled.checked = !!site.login_enabled;
+    els.siteLoginUsername.value = site.login_username || '';
+    els.siteLoginPassword.value = '';
     els.siteAccessToken.value = '';
     els.siteAccessUserId.value = site.access_user_id || '';
-    setLoginFieldsVisible(!!site.login_enabled);
     els.siteEnabled.checked = !!site.enabled;
   } else {
     els.dialogTitle.textContent = '添加站点';
     els.siteId.value = '';
     els.siteName.value = '';
+    els.sitePlatform.value = 'newapi';
     els.siteBaseUrl.value = '';
     els.siteInterval.value = 3;
     els.siteLoginEnabled.checked = false;
+    els.siteLoginUsername.value = '';
+    els.siteLoginPassword.value = '';
     els.siteAccessToken.value = '';
     els.siteAccessUserId.value = '';
-    setLoginFieldsVisible(false);
     els.siteEnabled.checked = true;
   }
+  updatePlatformFields();
   els.dialog.showModal();
 }
 
@@ -470,6 +506,7 @@ async function deleteSite(id) {
 els.addSiteBtn.addEventListener('click', () => openDialog());
 els.closeDialogBtn.addEventListener('click', () => els.dialog.close());
 els.siteLoginEnabled.addEventListener('change', () => setLoginFieldsVisible(els.siteLoginEnabled.checked));
+els.sitePlatform.addEventListener('change', updatePlatformFields);
 els.refreshBtn.addEventListener('click', () => refreshAll().catch((err) => alert(err.message)));
 els.searchInput.addEventListener('input', renderSites);
 els.statusFilter.addEventListener('change', renderSites);
@@ -509,9 +546,12 @@ els.form.addEventListener('submit', async (e) => {
   e.preventDefault();
   const payload = {
     name: els.siteName.value.trim(),
+    platform: els.sitePlatform.value,
     base_url: els.siteBaseUrl.value.trim(),
     interval_minutes: Math.max(1, Number(els.siteInterval.value || 3)),
-    login_enabled: els.siteLoginEnabled.checked,
+    login_enabled: els.sitePlatform.value === 'sub2api' ? true : els.siteLoginEnabled.checked,
+    login_username: els.siteLoginUsername.value.trim(),
+    login_password: els.siteLoginPassword.value,
     access_token: els.siteAccessToken.value.trim(),
     access_user_id: els.siteAccessUserId.value.trim(),
     enabled: els.siteEnabled.checked,
@@ -532,15 +572,25 @@ els.form.addEventListener('submit', async (e) => {
 
 els.testConnBtn.addEventListener('click', async () => {
   const baseUrl = els.siteBaseUrl.value.trim().replace(/\/+$/, '');
+  const platform = els.sitePlatform.value;
   if (!baseUrl) {
     els.dialogMsg.textContent = '请先填写 Base URL';
+    return;
+  }
+  if (platform === 'sub2api' && (!els.siteLoginUsername.value.trim() || !els.siteLoginPassword.value)) {
+    els.dialogMsg.textContent = '请填写 sub2api 用户邮箱和密码';
     return;
   }
   els.dialogMsg.textContent = '检测中...';
   try {
     const res = await api('/api/check-connection', {
       method: 'POST',
-      body: JSON.stringify({ base_url: baseUrl }),
+      body: JSON.stringify({
+        platform,
+        base_url: baseUrl,
+        login_username: els.siteLoginUsername.value.trim(),
+        login_password: els.siteLoginPassword.value,
+      }),
     });
     els.dialogMsg.textContent = res.success
       ? `连接成功：${res.groups_count} 个分组`
@@ -552,6 +602,33 @@ els.testConnBtn.addEventListener('click', async () => {
 
 els.testLoginBtn.addEventListener('click', async () => {
   const baseUrl = els.siteBaseUrl.value.trim().replace(/\/+$/, '');
+  const platform = els.sitePlatform.value;
+  if (platform === 'sub2api') {
+    const username = els.siteLoginUsername.value.trim();
+    const password = els.siteLoginPassword.value;
+    if (!baseUrl || !username || !password) {
+      els.dialogMsg.textContent = '请填写 Base URL、用户邮箱和密码';
+      return;
+    }
+    els.dialogMsg.textContent = 'sub2api 登录测试中...';
+    try {
+      const res = await api('/api/check-connection', {
+        method: 'POST',
+        body: JSON.stringify({
+          platform,
+          base_url: baseUrl,
+          login_username: username,
+          login_password: password,
+        }),
+      });
+      els.dialogMsg.textContent = res.success
+        ? `登录成功：当前用户可见 ${res.groups_count} 个分组`
+        : `登录失败：${res.message}`;
+    } catch (err) {
+      els.dialogMsg.textContent = `登录失败：${err.message}`;
+    }
+    return;
+  }
   const accessToken = els.siteAccessToken.value.trim();
   const accessUserId = els.siteAccessUserId.value.trim();
   if (!baseUrl || !accessToken || !accessUserId) {
