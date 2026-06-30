@@ -58,7 +58,12 @@ const els = {
   testLoginBtn: document.getElementById('testLoginBtn'),
   closeDialogBtn: document.getElementById('closeDialogBtn'),
   notifyForm: document.getElementById('notifyForm'),
+  wecomEnabled: document.getElementById('wecomEnabled'),
+  wecomWebhook: document.getElementById('wecomWebhook'),
+  wecomStatus: document.getElementById('wecomStatus'),
+  testWecomBtn: document.getElementById('testWecomBtn'),
   emailEnabled: document.getElementById('emailEnabled'),
+  emailStatus: document.getElementById('emailStatus'),
   smtpHost: document.getElementById('smtpHost'),
   smtpPort: document.getElementById('smtpPort'),
   smtpUsername: document.getElementById('smtpUsername'),
@@ -314,6 +319,16 @@ function renderGlobalChanges() {
 function renderNotificationSettings(options = {}) {
   if (state.notificationDirty && !options.force) return;
   const settings = state.notificationSettings || {};
+  els.wecomEnabled.checked = !!settings.wecom_enabled;
+  els.wecomWebhook.value = settings.wecom_webhook || '';
+  const wecomParts = [];
+  wecomParts.push(settings.wecom_enabled ? '企业微信已启用' : '企业微信未启用');
+  if (settings.wecom_has_webhook) wecomParts.push('Webhook 已保存');
+  if (settings.wecom_last_sent_at) wecomParts.push(`上次发送：${fmtTime(settings.wecom_last_sent_at)}`);
+  if (settings.wecom_last_error) wecomParts.push(`错误：${settings.wecom_last_error}`);
+  els.wecomStatus.textContent = wecomParts.join(' · ');
+  els.wecomStatus.classList.toggle('error', !!settings.wecom_last_error);
+
   els.emailEnabled.checked = !!settings.email_enabled;
   els.smtpHost.value = settings.smtp_host || '';
   els.smtpPort.value = settings.smtp_port || 465;
@@ -327,8 +342,8 @@ function renderNotificationSettings(options = {}) {
   if (settings.has_smtp_password) parts.push('密码已保存');
   if (settings.email_last_sent_at) parts.push(`上次发送：${fmtTime(settings.email_last_sent_at)}`);
   if (settings.email_last_error) parts.push(`错误：${settings.email_last_error}`);
-  els.notifyStatus.textContent = parts.join(' · ');
-  els.notifyStatus.classList.toggle('error', !!settings.email_last_error);
+  els.emailStatus.textContent = parts.join(' · ');
+  els.emailStatus.classList.toggle('error', !!settings.email_last_error);
 }
 
 function renderDetail(site) {
@@ -505,6 +520,8 @@ async function refreshAll(options = {}) {
 
 function notificationPayload() {
   return {
+    wecom_enabled: els.wecomEnabled.checked,
+    wecom_webhook: els.wecomWebhook.value.trim(),
     email_enabled: els.emailEnabled.checked,
     smtp_host: els.smtpHost.value.trim(),
     smtp_port: Math.max(1, Number(els.smtpPort.value || 465)),
@@ -704,8 +721,8 @@ els.testLoginBtn.addEventListener('click', async () => {
 
 els.notifyForm.addEventListener('submit', async (e) => {
   e.preventDefault();
-  els.notifyStatus.textContent = '保存中...';
-  els.notifyStatus.classList.remove('error');
+  els.emailStatus.textContent = '保存中...';
+  els.emailStatus.classList.remove('error');
   try {
     const res = await api('/api/notifications/settings', {
       method: 'PUT',
@@ -715,25 +732,42 @@ els.notifyForm.addEventListener('submit', async (e) => {
     state.notificationDirty = false;
     renderNotificationSettings({ force: true });
   } catch (err) {
-    els.notifyStatus.textContent = `保存失败：${err.message}`;
-    els.notifyStatus.classList.add('error');
+    els.emailStatus.textContent = `保存失败：${err.message}`;
+    els.emailStatus.classList.add('error');
   }
 });
 
 els.testEmailBtn.addEventListener('click', async () => {
-  els.notifyStatus.textContent = '测试邮件发送中...';
-  els.notifyStatus.classList.remove('error');
+  els.emailStatus.textContent = '测试邮件发送中...';
+  els.emailStatus.classList.remove('error');
   try {
     const res = await api('/api/notifications/test-email', {
       method: 'POST',
       body: JSON.stringify(notificationPayload()),
     });
-    els.notifyStatus.textContent = res.message || '测试完成';
+    els.emailStatus.textContent = res.message || '测试完成';
     state.notificationDirty = false;
     await refreshAll();
   } catch (err) {
-    els.notifyStatus.textContent = `测试失败：${err.message}`;
-    els.notifyStatus.classList.add('error');
+    els.emailStatus.textContent = `测试失败：${err.message}`;
+    els.emailStatus.classList.add('error');
+  }
+});
+
+els.testWecomBtn.addEventListener('click', async () => {
+  els.wecomStatus.textContent = '测试企业微信发送中...';
+  els.wecomStatus.classList.remove('error');
+  try {
+    const res = await api('/api/notifications/test-wecom', {
+      method: 'POST',
+      body: JSON.stringify(notificationPayload()),
+    });
+    els.wecomStatus.textContent = res.message || '测试完成';
+    state.notificationDirty = false;
+    await refreshAll();
+  } catch (err) {
+    els.wecomStatus.textContent = `测试失败：${err.message}`;
+    els.wecomStatus.classList.add('error');
   }
 });
 

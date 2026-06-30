@@ -427,6 +427,8 @@ body {
 }
 .notify-form {
   padding: 12px 14px 14px;
+  display: grid;
+  gap: 12px;
 }
 .notify-form .field {
   margin-bottom: 0;
@@ -474,6 +476,12 @@ body {
   border-color: rgba(220,38,38,0.18);
   color: #991b1b;
   background: rgba(220,38,38,0.06);
+}
+.notify-form .form-section {
+  margin: 0;
+}
+.notify-form .dialog-head {
+  margin-bottom: 10px;
 }
 .hidden { display: none !important; }
 .dialog {

@@ -292,6 +292,23 @@ New-Api-User: NewAPI 用户 ID
 
 当检测到倍率或分组变化时，会自动发送邮件提醒。
 
+## 企业微信推送
+
+在 Web UI 的“消息推送”页面配置企业微信群机器人：
+
+- 启用企业微信推送
+- 填写企业微信群机器人 Webhook
+
+消息会以 Markdown 形式发送到对应群聊，不需要服务器回调，也不需要额外公网地址。
+
+常见格式：
+
+```text
+https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxx
+```
+
+如果 Webhook 填写正确，点击“测试企业微信”即可发送测试消息。
+
 ## 说明
 
 - 默认监控间隔：3 分钟

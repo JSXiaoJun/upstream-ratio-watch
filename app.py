@@ -136,6 +136,10 @@ def init_db() -> None:
                 qq_token_expires_at TEXT,
                 qq_last_error TEXT,
                 qq_last_sent_at TEXT,
+                wecom_enabled INTEGER NOT NULL DEFAULT 0,
+                wecom_webhook TEXT,
+                wecom_last_error TEXT,
+                wecom_last_sent_at TEXT,
                 email_enabled INTEGER NOT NULL DEFAULT 0,
                 smtp_host TEXT,
                 smtp_port INTEGER NOT NULL DEFAULT 465,
@@ -200,6 +204,10 @@ def init_db() -> None:
         }
         notification_columns = {
             "email_enabled": "INTEGER NOT NULL DEFAULT 0",
+            "wecom_enabled": "INTEGER NOT NULL DEFAULT 0",
+            "wecom_webhook": "TEXT",
+            "wecom_last_error": "TEXT",
+            "wecom_last_sent_at": "TEXT",
             "smtp_host": "TEXT",
             "smtp_port": "INTEGER NOT NULL DEFAULT 465",
             "smtp_username": "TEXT",
@@ -219,8 +227,8 @@ def init_db() -> None:
             conn.execute(
                 """
                 INSERT INTO notification_settings
-                (id, qq_enabled, qq_app_id, qq_client_secret, qq_group_openid, qq_access_token, qq_token_expires_at, qq_last_error, qq_last_sent_at, email_enabled, smtp_host, smtp_port, smtp_username, smtp_password, smtp_use_ssl, smtp_from, smtp_to, email_last_error, email_last_sent_at, created_at, updated_at)
-                VALUES (1, 0, '', '', '', NULL, NULL, NULL, NULL, 0, '', 465, '', '', 1, '', '', NULL, NULL, ?, ?)
+                (id, qq_enabled, qq_app_id, qq_client_secret, qq_group_openid, qq_access_token, qq_token_expires_at, qq_last_error, qq_last_sent_at, wecom_enabled, wecom_webhook, wecom_last_error, wecom_last_sent_at, email_enabled, smtp_host, smtp_port, smtp_username, smtp_password, smtp_use_ssl, smtp_from, smtp_to, email_last_error, email_last_sent_at, created_at, updated_at)
+                VALUES (1, 0, '', '', '', NULL, NULL, NULL, NULL, 0, '', NULL, NULL, 0, '', 465, '', '', 1, '', '', NULL, NULL, ?, ?)
                 """,
                 (now, now),
             )
@@ -755,6 +763,11 @@ def get_notification_settings() -> Dict[str, Any]:
 def notification_settings_payload() -> Dict[str, Any]:
     settings = get_notification_settings()
     return {
+        "wecom_enabled": bool(settings.get("wecom_enabled")),
+        "wecom_webhook": settings.get("wecom_webhook") or "",
+        "wecom_has_webhook": bool(settings.get("wecom_webhook")),
+        "wecom_last_error": settings.get("wecom_last_error"),
+        "wecom_last_sent_at": settings.get("wecom_last_sent_at"),
         "email_enabled": bool(settings.get("email_enabled")),
         "smtp_host": settings.get("smtp_host") or "",
         "smtp_port": int(settings.get("smtp_port") or 465),
@@ -771,6 +784,8 @@ def notification_settings_payload() -> Dict[str, Any]:
 
 def update_notification_settings(body: Dict[str, Any]) -> None:
     settings = get_notification_settings()
+    wecom_enabled = bool(body.get("wecom_enabled", False))
+    wecom_webhook = str(body.get("wecom_webhook") or "").strip()
     email_enabled = bool(body.get("email_enabled", False))
     smtp_host = str(body.get("smtp_host") or "").strip()
     smtp_port = int(body.get("smtp_port") or 465)
@@ -785,10 +800,14 @@ def update_notification_settings(body: Dict[str, Any]) -> None:
             raise ValueError("启用邮箱推送时需要填写 SMTP 服务器、端口、账号、密码和收件人")
         if not smtp_from:
             smtp_from = smtp_username
+    if wecom_enabled and not (wecom_webhook or settings.get("wecom_webhook")):
+        raise ValueError("启用企业微信推送时需要填写 Webhook 地址")
 
     fields = [
         "qq_enabled = 0",
+        "wecom_enabled = ?",
         "email_enabled = ?",
+        "wecom_webhook = ?",
         "smtp_host = ?",
         "smtp_port = ?",
         "smtp_username = ?",
@@ -798,7 +817,9 @@ def update_notification_settings(body: Dict[str, Any]) -> None:
         "updated_at = ?",
     ]
     params: List[Any] = [
+        1 if wecom_enabled else 0,
         1 if email_enabled else 0,
+        wecom_webhook if wecom_webhook else (settings.get("wecom_webhook") or ""),
         smtp_host,
         smtp_port,
         smtp_username,
@@ -875,6 +896,57 @@ def send_email_message(subject: str, message: str) -> Tuple[bool, Optional[str]]
         (sent_at, sent_at),
     )
     log_notification("email", "success", smtp_to, message, None)
+    return True, None
+
+
+def send_wecom_message(subject: str, message: str) -> Tuple[bool, Optional[str]]:
+    settings = get_notification_settings()
+    if not settings.get("wecom_enabled"):
+        return True, "企业微信推送未启用，未发送消息"
+
+    webhook = str(settings.get("wecom_webhook") or "").strip()
+    if not webhook:
+        return False, "企业微信 Webhook 未配置"
+
+    content = f"**{subject}**\n\n{message}"
+    ok, payload, error = request_json(
+        webhook,
+        payload={
+            "msgtype": "markdown",
+            "markdown": {
+                "content": content,
+            },
+        },
+        method="POST",
+    )
+    if not ok:
+        error_text = error or "企业微信推送失败"
+        db_execute(
+            "UPDATE notification_settings SET wecom_last_error = ?, updated_at = ? WHERE id = 1",
+            (error_text, utc_now_iso()),
+        )
+        log_notification("wecom", "failed", webhook, message, error_text)
+        return False, error_text
+
+    if isinstance(payload, dict) and payload.get("errcode") not in (None, 0):
+        error_text = f"企业微信推送失败：{payload.get('errmsg') or payload.get('errcode')}"
+        db_execute(
+            "UPDATE notification_settings SET wecom_last_error = ?, updated_at = ? WHERE id = 1",
+            (error_text, utc_now_iso()),
+        )
+        log_notification("wecom", "failed", webhook, message, error_text)
+        return False, error_text
+
+    sent_at = utc_now_iso()
+    db_execute(
+        """
+        UPDATE notification_settings
+        SET wecom_last_error = NULL, wecom_last_sent_at = ?, updated_at = ?
+        WHERE id = 1
+        """,
+        (sent_at, sent_at),
+    )
+    log_notification("wecom", "success", webhook, message, None)
     return True, None
 
 
@@ -1021,7 +1093,10 @@ def format_change_notification(site: Dict[str, Any], changes: List[Dict[str, Any
 def notify_changes(site: Dict[str, Any], changes: List[Dict[str, Any]], checked_at: str) -> None:
     if not changes:
         return
-    send_email_message(format_change_subject(site, changes), format_change_notification(site, changes, checked_at))
+    subject = format_change_subject(site, changes)
+    message = format_change_notification(site, changes, checked_at)
+    send_email_message(subject, message)
+    send_wecom_message(subject, message)
 
 
 def collect_site_groups(site: Dict[str, Any]) -> Tuple[bool, Dict[str, Dict[str, Any]], Dict[str, Any], str, Optional[str]]:
@@ -1565,6 +1640,14 @@ class Handler(BaseHTTPRequestHandler):
                 message = "这是一封上游分组倍率监控测试邮件。"
                 ok, error_message = send_email_message("上游倍率监控邮箱测试", message)
                 return json_response(self, {"success": ok, "message": error_message or "测试邮件已发送"})
+
+            if path == "/api/notifications/test-wecom":
+                body = read_json_body(self)
+                if body:
+                    update_notification_settings(body)
+                message = "这是一条上游分组倍率监控测试消息。"
+                ok, error_message = send_wecom_message("上游倍率监控企业微信测试", message)
+                return json_response(self, {"success": ok, "message": error_message or "测试消息已发送"})
 
             self.send_error(HTTPStatus.NOT_FOUND)
         except Exception as exc:

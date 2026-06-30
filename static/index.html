@@ -176,54 +176,81 @@
           <div class="panel-head">
             <div>
               <h2>消息推送</h2>
-              <p>当前先支持邮箱推送，检测到倍率或分组变化后自动发送提醒。</p>
+              <p>支持企业微信和邮箱推送，检测到倍率或分组变化后自动发送提醒。</p>
             </div>
           </div>
           <form id="notifyForm" class="notify-form">
-            <div class="notify-compact-head">
-              <label class="field switch-row">
-                <span>启用邮箱推送</span>
-                <input id="emailEnabled" type="checkbox" />
-              </label>
-              <label class="field switch-row">
-                <span>使用 SSL</span>
-                <input id="smtpUseSsl" type="checkbox" checked />
-              </label>
-            </div>
-            <div class="notify-grid">
-              <label class="field">
-                <span>SMTP 服务器</span>
-                <input id="smtpHost" class="input" autocomplete="off" placeholder="smtp.example.com" />
-              </label>
-              <label class="field">
-                <span>端口</span>
-                <input id="smtpPort" class="input" type="number" min="1" value="465" />
-              </label>
-              <label class="field">
-                <span>邮箱账号</span>
-                <input id="smtpUsername" class="input" autocomplete="username" />
-              </label>
-              <label class="field">
-                <span>邮箱授权码或密码</span>
-                <input id="smtpPassword" class="input" type="password" autocomplete="current-password" placeholder="编辑时留空表示不修改" />
-              </label>
-              <label class="field">
-                <span>发件人</span>
-                <input id="smtpFrom" class="input" autocomplete="email" placeholder="默认使用邮箱账号" />
-              </label>
-              <label class="field">
-                <span>收件人</span>
-                <input id="smtpTo" class="input" autocomplete="email" placeholder="多个邮箱用逗号分隔" />
-              </label>
-            </div>
-            <div class="notify-footer">
-              <div>
-                <p class="field-help">常见配置：SSL 端口 465；STARTTLS 可关闭 SSL 后使用 587。</p>
-                <div class="notify-status" id="notifyStatus">未配置</div>
+            <div class="form-section">
+              <div class="dialog-head">
+                <h3>企业微信</h3>
               </div>
-              <div class="dialog-actions">
-                <button type="submit" class="btn btn-primary">保存配置</button>
-                <button id="testEmailBtn" type="button" class="btn btn-secondary">测试邮件</button>
+              <label class="field switch-row">
+                <span>启用企业微信推送</span>
+                <input id="wecomEnabled" type="checkbox" />
+              </label>
+              <label class="field">
+                <span>Webhook</span>
+                <input id="wecomWebhook" class="input" autocomplete="off" placeholder="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxx" />
+              </label>
+              <div class="notify-footer">
+                <div>
+                  <p class="field-help">填群机器人 Webhook 即可，不需要服务器回调。</p>
+                  <div class="notify-status" id="wecomStatus">未配置</div>
+                </div>
+                <div class="dialog-actions">
+                  <button id="testWecomBtn" type="button" class="btn btn-secondary">测试企业微信</button>
+                </div>
+              </div>
+            </div>
+            <div class="form-section">
+              <div class="dialog-head">
+                <h3>邮箱</h3>
+              </div>
+              <div class="notify-compact-head">
+                <label class="field switch-row">
+                  <span>启用邮箱推送</span>
+                  <input id="emailEnabled" type="checkbox" />
+                </label>
+                <label class="field switch-row">
+                  <span>使用 SSL</span>
+                  <input id="smtpUseSsl" type="checkbox" checked />
+                </label>
+              </div>
+              <div class="notify-grid">
+                <label class="field">
+                  <span>SMTP 服务器</span>
+                  <input id="smtpHost" class="input" autocomplete="off" placeholder="smtp.example.com" />
+                </label>
+                <label class="field">
+                  <span>端口</span>
+                  <input id="smtpPort" class="input" type="number" min="1" value="465" />
+                </label>
+                <label class="field">
+                  <span>邮箱账号</span>
+                  <input id="smtpUsername" class="input" autocomplete="username" />
+                </label>
+                <label class="field">
+                  <span>邮箱授权码或密码</span>
+                  <input id="smtpPassword" class="input" type="password" autocomplete="current-password" placeholder="编辑时留空表示不修改" />
+                </label>
+                <label class="field">
+                  <span>发件人</span>
+                  <input id="smtpFrom" class="input" autocomplete="email" placeholder="默认使用邮箱账号" />
+                </label>
+                <label class="field">
+                  <span>收件人</span>
+                  <input id="smtpTo" class="input" autocomplete="email" placeholder="多个邮箱用逗号分隔" />
+                </label>
+              </div>
+              <div class="notify-footer">
+                <div>
+                  <p class="field-help">常见配置：SSL 端口 465；STARTTLS 可关闭 SSL 后使用 587。</p>
+                  <div class="notify-status" id="emailStatus">未配置</div>
+                </div>
+                <div class="dialog-actions">
+                  <button type="submit" class="btn btn-primary">保存配置</button>
+                  <button id="testEmailBtn" type="button" class="btn btn-secondary">测试邮件</button>
+                </div>
               </div>
             </div>
           </form>
