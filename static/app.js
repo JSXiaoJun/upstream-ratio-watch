@@ -14,6 +14,7 @@ const state = {
 const els = {
   navItems: Array.from(document.querySelectorAll('[data-view-target]')),
   views: Array.from(document.querySelectorAll('[data-view]')),
+  communityBtn: document.getElementById('communityBtn'),
   statsSites: document.getElementById('stat-sites'),
   statsEnabled: document.getElementById('stat-enabled'),
   statsOk: document.getElementById('stat-ok'),
@@ -75,6 +76,8 @@ const els = {
   testEmailBtn: document.getElementById('testEmailBtn'),
 };
 
+const COMMUNITY_GROUP = '259844673';
+
 function fmtTime(value) {
   if (!value) return '-';
   const d = new Date(value);
@@ -130,6 +133,22 @@ function ratioLabel(item) {
 
 function setLoginFieldsVisible(visible) {
   els.loginFields.classList.toggle('hidden', !visible);
+}
+
+async function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const input = document.createElement('input');
+  input.value = text;
+  input.setAttribute('readonly', '');
+  input.style.position = 'fixed';
+  input.style.opacity = '0';
+  document.body.appendChild(input);
+  input.select();
+  document.execCommand('copy');
+  input.remove();
 }
 
 function sub2apiAuthMode() {
@@ -555,6 +574,19 @@ els.searchInput.addEventListener('input', renderSites);
 els.statusFilter.addEventListener('change', renderSites);
 els.notifyForm.addEventListener('input', () => { state.notificationDirty = true; });
 els.notifyForm.addEventListener('focusin', () => { state.notificationDirty = true; });
+els.communityBtn.addEventListener('click', async () => {
+  try {
+    await copyText(COMMUNITY_GROUP);
+    els.communityBtn.classList.add('copied');
+    els.communityBtn.title = 'QQ群号已复制';
+    window.setTimeout(() => {
+      els.communityBtn.classList.remove('copied');
+      els.communityBtn.title = '点击复制QQ群号';
+    }, 1600);
+  } catch {
+    alert(`QQ群：${COMMUNITY_GROUP}`);
+  }
+});
 els.navItems.forEach((item) => {
   item.addEventListener('click', () => setActiveView(item.dataset.viewTarget));
 });
