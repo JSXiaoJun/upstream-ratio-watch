@@ -9,12 +9,15 @@ const state = {
   activeViewEl: null,
   activeNavEl: null,
   refreshInFlight: false,
+  dialogAvailableGroups: [],
+  dialogNotifyAllGroups: true,
 };
 
 const els = {
   navItems: Array.from(document.querySelectorAll('[data-view-target]')),
   views: Array.from(document.querySelectorAll('[data-view]')),
-  communityBtn: document.getElementById('communityBtn'),
+  toastContainer: document.getElementById('toastContainer'),
+  logoutBtn: document.getElementById('logoutBtn'),
   statsSites: document.getElementById('stat-sites'),
   statsEnabled: document.getElementById('stat-enabled'),
   statsOk: document.getElementById('stat-ok'),
@@ -48,6 +51,12 @@ const els = {
   siteRefreshToken: document.getElementById('siteRefreshToken'),
   siteTokenExpiresAt: document.getElementById('siteTokenExpiresAt'),
   siteAccessUserId: document.getElementById('siteAccessUserId'),
+  siteBalanceAlertEnabled: document.getElementById('siteBalanceAlertEnabled'),
+  siteBalanceAlertThreshold: document.getElementById('siteBalanceAlertThreshold'),
+  siteNotifyGroupsSection: document.getElementById('siteNotifyGroupsSection'),
+  siteNotifyGroupsList: document.getElementById('siteNotifyGroupsList'),
+  selectAllNotifyGroupsBtn: document.getElementById('selectAllNotifyGroupsBtn'),
+  clearNotifyGroupsBtn: document.getElementById('clearNotifyGroupsBtn'),
   loginFields: document.getElementById('loginFields'),
   newapiAuthSection: document.getElementById('newapiAuthSection'),
   sub2apiAuthSection: document.getElementById('sub2apiAuthSection'),
@@ -55,6 +64,9 @@ const els = {
   sub2apiTokenFields: document.getElementById('sub2apiTokenFields'),
   siteEnabled: document.getElementById('siteEnabled'),
   dialogMsg: document.getElementById('dialogMsg'),
+  saveSiteBtn: document.getElementById('saveSiteBtn'),
+  siteDialogTabs: Array.from(document.querySelectorAll('[data-site-tab]')),
+  siteDialogPanels: Array.from(document.querySelectorAll('[data-site-tab-panel]')),
   testConnBtn: document.getElementById('testConnBtn'),
   testLoginBtn: document.getElementById('testLoginBtn'),
   closeDialogBtn: document.getElementById('closeDialogBtn'),
@@ -63,6 +75,11 @@ const els = {
   wecomWebhook: document.getElementById('wecomWebhook'),
   wecomStatus: document.getElementById('wecomStatus'),
   testWecomBtn: document.getElementById('testWecomBtn'),
+  feishuEnabled: document.getElementById('feishuEnabled'),
+  feishuWebhook: document.getElementById('feishuWebhook'),
+  feishuSecret: document.getElementById('feishuSecret'),
+  feishuStatus: document.getElementById('feishuStatus'),
+  testFeishuBtn: document.getElementById('testFeishuBtn'),
   emailEnabled: document.getElementById('emailEnabled'),
   emailStatus: document.getElementById('emailStatus'),
   smtpHost: document.getElementById('smtpHost'),
@@ -75,8 +92,6 @@ const els = {
   notifyStatus: document.getElementById('notifyStatus'),
   testEmailBtn: document.getElementById('testEmailBtn'),
 };
-
-const COMMUNITY_GROUP = '259844673';
 
 function fmtTime(value) {
   if (!value) return '-';
@@ -102,6 +117,8 @@ function badgeClass(status) {
 
 function changeClass(change) {
   if (change.change_type === 'group_removed') return 'bad';
+  if (change.change_type === 'balance_low') return 'warn';
+  if (change.change_type === 'balance_recovered') return 'ok';
   if (change.change_type === 'ratio_changed' && Number(change.change_percent) > 0) return 'warn';
   if (change.change_type === 'ratio_changed') return 'ok';
   return 'neutral';
@@ -118,6 +135,8 @@ function changeTypeLabel(type) {
     subscription_type_changed: '订阅变化',
     rpm_limit_changed: 'RPM 变化',
     platform_changed: '平台变化',
+    balance_low: '低余额',
+    balance_recovered: '余额恢复',
   };
   return labels[type] || type || '-';
 }
@@ -131,24 +150,68 @@ function ratioLabel(item) {
   return `${ratio}`;
 }
 
-function setLoginFieldsVisible(visible) {
-  els.loginFields.classList.toggle('hidden', !visible);
+function balanceLabel(site) {
+  if (site.current_balance === null || site.current_balance === undefined) return '-';
+  const value = Number(site.current_balance);
+  if (!Number.isFinite(value)) return '-';
+  return `${site.balance_currency === 'USD' ? '$' : `${site.balance_currency || ''} `}${value.toFixed(2)}`;
 }
 
-async function copyText(text) {
-  if (navigator.clipboard && window.isSecureContext) {
-    await navigator.clipboard.writeText(text);
-    return;
-  }
-  const input = document.createElement('input');
-  input.value = text;
-  input.setAttribute('readonly', '');
-  input.style.position = 'fixed';
-  input.style.opacity = '0';
-  document.body.appendChild(input);
-  input.select();
-  document.execCommand('copy');
-  input.remove();
+function showToast(message, type = 'success') {
+  const toast = document.createElement('div');
+  toast.className = `toast ${type}`;
+  toast.textContent = message;
+  els.toastContainer.appendChild(toast);
+  window.setTimeout(() => toast.classList.add('visible'), 10);
+  window.setTimeout(() => {
+    toast.classList.remove('visible');
+    window.setTimeout(() => toast.remove(), 180);
+  }, 2800);
+}
+
+function setSiteDialogTab(tabName) {
+  state.siteDialogTab = tabName;
+  els.siteDialogTabs.forEach((button) => {
+    const active = button.dataset.siteTab === tabName;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-selected', active ? 'true' : 'false');
+  });
+  els.siteDialogPanels.forEach((panel) => {
+    panel.classList.toggle('active', panel.dataset.siteTabPanel === tabName);
+  });
+  els.testConnBtn.classList.toggle('hidden', tabName !== 'basic');
+  els.testLoginBtn.classList.toggle('hidden', tabName !== 'auth');
+}
+
+function availableGroupsForSite(site) {
+  if (!site) return [];
+  const publicGroups = Object.keys(site.current_groups || {});
+  const loginGroups = Object.keys(site.current_login_groups || {});
+  const activeGroups = site.login_enabled && loginGroups.length ? loginGroups : publicGroups;
+  return [...new Set(activeGroups)].sort((a, b) => a.localeCompare(b, 'zh-CN'));
+}
+
+function selectedNotifyGroups() {
+  return Array.from(els.siteNotifyGroupsList.querySelectorAll('input[type="checkbox"]:checked'))
+    .map((input) => input.value);
+}
+
+function renderNotifyGroupPicker(groups, selectedGroups = [], selectAllByDefault = false) {
+  state.dialogAvailableGroups = [...new Set([...groups, ...selectedGroups])]
+    .sort((a, b) => a.localeCompare(b, 'zh-CN'));
+  const selected = new Set(selectAllByDefault ? state.dialogAvailableGroups : selectedGroups);
+  els.siteNotifyGroupsList.innerHTML = state.dialogAvailableGroups.length
+    ? state.dialogAvailableGroups.map((name) => `
+        <label class="group-picker-item">
+          <input type="checkbox" value="${escapeHtml(name)}" ${selected.has(name) ? 'checked' : ''} />
+          <span>${escapeHtml(name)}</span>
+        </label>
+      `).join('')
+    : '<div class="empty-inline">暂无已采集分组</div>';
+}
+
+function setLoginFieldsVisible(visible) {
+  els.loginFields.classList.toggle('hidden', !visible);
 }
 
 function sub2apiAuthMode() {
@@ -182,17 +245,11 @@ function updatePlatformFields() {
 }
 
 function setActiveView(view) {
-  if (state.activeView === view && state.activeViewEl) {
-    renderActiveView();
-    return;
-  }
   state.activeView = view;
   const nextView = els.views.find((item) => item.dataset.view === view);
   const nextNav = els.navItems.find((item) => item.dataset.viewTarget === view);
-  if (state.activeViewEl && state.activeViewEl !== nextView) state.activeViewEl.classList.remove('active');
-  if (state.activeNavEl && state.activeNavEl !== nextNav) state.activeNavEl.classList.remove('active');
-  if (nextView) nextView.classList.add('active');
-  if (nextNav) nextNav.classList.add('active');
+  els.views.forEach((item) => item.classList.toggle('active', item === nextView));
+  els.navItems.forEach((item) => item.classList.toggle('active', item === nextNav));
   state.activeViewEl = nextView || null;
   state.activeNavEl = nextNav || null;
   requestAnimationFrame(() => {
@@ -209,6 +266,11 @@ async function api(path, options = {}) {
   const text = await res.text();
   let body = null;
   try { body = text ? JSON.parse(text) : null; } catch { body = { raw: text }; }
+  if (res.status === 401) {
+    const next = encodeURIComponent(`${window.location.pathname}${window.location.search}`);
+    window.location.href = `/login?next=${next}`;
+    throw new Error('登录已过期，请重新登录');
+  }
   if (!res.ok) {
     throw new Error(body?.message || body?.error || `HTTP ${res.status}`);
   }
@@ -282,6 +344,7 @@ function siteRows(sites) {
           ${site.platform === 'sub2api' ? '<span class="tag login">用户登录</span>' : site.login_enabled ? '<span class="tag login">认证增强</span>' : ''}
         </td>
         <td>${site.current_groups_count || 0}</td>
+        <td><span class="${site.balance_alert_active ? 'balance-low' : ''}">${escapeHtml(balanceLabel(site))}</span></td>
         <td>${fmtTime(site.last_check_at)}</td>
         <td>
           <div class="action-row">
@@ -348,6 +411,18 @@ function renderNotificationSettings(options = {}) {
   els.wecomStatus.textContent = wecomParts.join(' · ');
   els.wecomStatus.classList.toggle('error', !!settings.wecom_last_error);
 
+  els.feishuEnabled.checked = !!settings.feishu_enabled;
+  els.feishuWebhook.value = settings.feishu_webhook || '';
+  els.feishuSecret.value = '';
+  const feishuParts = [];
+  feishuParts.push(settings.feishu_enabled ? '飞书推送已启用' : '飞书推送未启用');
+  if (settings.feishu_has_webhook) feishuParts.push('Webhook 已保存');
+  if (settings.feishu_has_secret) feishuParts.push('签名密钥已保存');
+  if (settings.feishu_last_sent_at) feishuParts.push(`上次发送：${fmtTime(settings.feishu_last_sent_at)}`);
+  if (settings.feishu_last_error) feishuParts.push(`错误：${settings.feishu_last_error}`);
+  els.feishuStatus.textContent = feishuParts.join(' · ');
+  els.feishuStatus.classList.toggle('error', !!settings.feishu_last_error);
+
   els.emailEnabled.checked = !!settings.email_enabled;
   els.smtpHost.value = settings.smtp_host || '';
   els.smtpPort.value = settings.smtp_port || 465;
@@ -378,6 +453,18 @@ function renderDetail(site) {
   const loginGroupsObj = site.current_login_groups || {};
   const activeGroupsObj = site.login_enabled && Object.keys(loginGroupsObj).length ? loginGroupsObj : publicGroupsObj;
   const groups = Object.entries(activeGroupsObj);
+  const notifyGroupNames = [...new Set([...Object.keys(activeGroupsObj), ...(site.notify_groups || [])])]
+    .sort((a, b) => a.localeCompare(b, 'zh-CN'));
+  const selectedNotifyGroupSet = new Set(site.notify_all_groups ? notifyGroupNames : (site.notify_groups || []));
+  const notifyGroupRows = notifyGroupNames.length
+    ? notifyGroupNames.map((name) => `
+        <label class="group-picker-item">
+          <input type="checkbox" data-detail-notify-group value="${escapeHtml(name)}"
+            ${selectedNotifyGroupSet.has(name) ? 'checked' : ''} />
+          <span>${escapeHtml(name)}</span>
+        </label>
+      `).join('')
+    : '<div class="empty-inline">暂无已采集分组</div>';
   const hiddenGroups = Object.entries(loginGroupsObj).filter(([name]) => !(name in publicGroupsObj));
   const groupRows = groups.length
     ? groups.map(([name, item]) => `
@@ -418,12 +505,34 @@ function renderDetail(site) {
       <div class="meta-card"><div class="k">监控间隔</div><div class="v">${site.interval_minutes} 分钟</div></div>
       <div class="meta-card"><div class="k">公开分组</div><div class="v">${site.current_groups_count || 0}</div></div>
       <div class="meta-card"><div class="k">认证分组</div><div class="v">${site.current_login_groups_count || 0}</div></div>
+      <div class="meta-card"><div class="k">账户余额</div><div class="v ${site.balance_alert_active ? 'balance-low' : ''}">${escapeHtml(balanceLabel(site))}</div></div>
+      <div class="meta-card"><div class="k">余额预警</div><div class="v">${site.balance_alert_enabled ? `低于 $${Number(site.balance_alert_threshold || 0).toFixed(2)}` : '未启用'}</div></div>
+      <div class="meta-card"><div class="k">余额检测</div><div class="v">${fmtTime(site.balance_last_check_at)}</div></div>
       <div class="meta-card"><div class="k">上次检测</div><div class="v">${fmtTime(site.last_check_at)}</div></div>
       <div class="meta-card"><div class="k">下次检测</div><div class="v">${fmtTime(site.next_check_at)}</div></div>
       <div class="meta-card"><div class="k">连续失败</div><div class="v">${site.consecutive_failures || 0}</div></div>
       <div class="meta-card"><div class="k">启用状态</div><div class="v">${site.enabled ? '启用中' : '已停用'}</div></div>
+      <div class="meta-card wide"><div class="k">变化通知范围</div><div class="v">${site.notify_all_groups ? '全部分组' : escapeHtml((site.notify_groups || []).join('、') || '-')}</div></div>
       <div class="meta-card wide"><div class="k">监控模式</div><div class="v">${site.platform === 'sub2api' ? `sub2api ${site.auth_mode === 'token' ? `导入登录态（refresh ${site.has_refresh_token ? '已配置' : '未配置'}）` : `账号登录（${escapeHtml(site.login_username || '-')}）`}` : site.login_enabled ? `认证增强监控（系统访问令牌 / 用户ID ${escapeHtml(site.access_user_id || '-')}）` : '公开分组监控'}</div></div>
     </div>
+    ${site.balance_last_error ? `<div class="error-box">余额采集：${escapeHtml(site.balance_last_error)}</div>` : ''}
+    <section class="detail-section notify-scope-editor">
+      <div class="group-picker-head notify-scope-head">
+        <div>
+          <div class="section-title">分组变化通知</div>
+          <div id="detailNotifyStatus" class="muted">${site.notify_all_groups ? '当前通知全部分组' : `已选择 ${(site.notify_groups || []).length} 个分组`}</div>
+        </div>
+        <button class="btn btn-primary" type="button" data-detail-notify-action="save">保存通知范围</button>
+      </div>
+      <div class="group-picker-head">
+        <span>通知分组</span>
+        <div class="action-row">
+          <button class="btn btn-secondary btn-small" type="button" data-detail-notify-action="select-all">全选</button>
+          <button class="btn btn-secondary btn-small" type="button" data-detail-notify-action="clear">清空</button>
+        </div>
+      </div>
+      <div class="group-picker" data-detail-notify-list>${notifyGroupRows}</div>
+    </section>
     <section class="mode-note ${site.login_enabled ? 'enabled' : ''}">
       ${site.platform === 'sub2api'
         ? (site.auth_mode === 'token' ? '当前站点使用导入登录态检测该账号实际可见的分组倍率；适合开启 Turnstile 的上游。' : '当前站点使用 sub2api 普通用户账号登录，检测该账号实际可见的分组倍率和用户专属倍率。')
@@ -458,6 +567,10 @@ function renderDetail(site) {
 
 function openDialog(site = null) {
   els.dialogMsg.textContent = '';
+  els.dialogMsg.classList.remove('error');
+  els.saveSiteBtn.disabled = false;
+  els.saveSiteBtn.textContent = '保存配置';
+  setSiteDialogTab('basic');
   if (site) {
     els.dialogTitle.textContent = '编辑站点';
     els.siteId.value = site.id;
@@ -474,6 +587,10 @@ function openDialog(site = null) {
     els.siteRefreshToken.value = '';
     els.siteTokenExpiresAt.value = site.token_expires_at || '';
     els.siteAccessUserId.value = site.access_user_id || '';
+    els.siteBalanceAlertEnabled.checked = !!site.balance_alert_enabled;
+    els.siteBalanceAlertThreshold.value = site.balance_alert_threshold ?? 10;
+    state.dialogNotifyAllGroups = site.notify_all_groups !== false;
+    renderNotifyGroupPicker(availableGroupsForSite(site), site.notify_groups || [], state.dialogNotifyAllGroups);
     els.siteEnabled.checked = !!site.enabled;
   } else {
     els.dialogTitle.textContent = '添加站点';
@@ -491,6 +608,10 @@ function openDialog(site = null) {
     els.siteRefreshToken.value = '';
     els.siteTokenExpiresAt.value = '';
     els.siteAccessUserId.value = '';
+    els.siteBalanceAlertEnabled.checked = false;
+    els.siteBalanceAlertThreshold.value = 10;
+    state.dialogNotifyAllGroups = true;
+    renderNotifyGroupPicker([], [], true);
     els.siteEnabled.checked = true;
   }
   updatePlatformFields();
@@ -541,6 +662,9 @@ function notificationPayload() {
   return {
     wecom_enabled: els.wecomEnabled.checked,
     wecom_webhook: els.wecomWebhook.value.trim(),
+    feishu_enabled: els.feishuEnabled.checked,
+    feishu_webhook: els.feishuWebhook.value.trim(),
+    feishu_secret: els.feishuSecret.value.trim(),
     email_enabled: els.emailEnabled.checked,
     smtp_host: els.smtpHost.value.trim(),
     smtp_port: Math.max(1, Number(els.smtpPort.value || 465)),
@@ -566,29 +690,91 @@ async function deleteSite(id) {
 
 els.addSiteBtn.addEventListener('click', () => openDialog());
 els.closeDialogBtn.addEventListener('click', () => els.dialog.close());
+els.logoutBtn.addEventListener('click', async () => {
+  try {
+    await api('/api/auth/logout', { method: 'POST', body: '{}' });
+  } finally {
+    window.location.href = '/login';
+  }
+});
+els.siteDialogTabs.forEach((button) => {
+  button.addEventListener('click', () => setSiteDialogTab(button.dataset.siteTab));
+});
 els.siteLoginEnabled.addEventListener('change', () => setLoginFieldsVisible(els.siteLoginEnabled.checked));
 els.sitePlatform.addEventListener('change', updatePlatformFields);
 els.siteAuthMode.addEventListener('change', updatePlatformFields);
+els.siteNotifyGroupsList.addEventListener('change', () => {
+  state.dialogNotifyAllGroups = state.dialogAvailableGroups.length > 0
+    && selectedNotifyGroups().length === state.dialogAvailableGroups.length;
+});
+els.selectAllNotifyGroupsBtn.addEventListener('click', () => {
+  els.siteNotifyGroupsList.querySelectorAll('input[type="checkbox"]').forEach((input) => { input.checked = true; });
+  state.dialogNotifyAllGroups = true;
+});
+els.clearNotifyGroupsBtn.addEventListener('click', () => {
+  els.siteNotifyGroupsList.querySelectorAll('input[type="checkbox"]').forEach((input) => { input.checked = false; });
+  state.dialogNotifyAllGroups = false;
+});
 els.refreshBtn.addEventListener('click', () => refreshAll().catch((err) => alert(err.message)));
 els.searchInput.addEventListener('input', renderSites);
 els.statusFilter.addEventListener('change', renderSites);
 els.notifyForm.addEventListener('input', () => { state.notificationDirty = true; });
 els.notifyForm.addEventListener('focusin', () => { state.notificationDirty = true; });
-els.communityBtn.addEventListener('click', async () => {
-  try {
-    await copyText(COMMUNITY_GROUP);
-    els.communityBtn.classList.add('copied');
-    els.communityBtn.title = 'QQ群号已复制';
-    window.setTimeout(() => {
-      els.communityBtn.classList.remove('copied');
-      els.communityBtn.title = '点击复制QQ群号';
-    }, 1600);
-  } catch {
-    alert(`QQ群：${COMMUNITY_GROUP}`);
-  }
-});
 els.navItems.forEach((item) => {
   item.addEventListener('click', () => setActiveView(item.dataset.viewTarget));
+});
+
+els.detailPane.addEventListener('click', async (event) => {
+  const button = event.target.closest('[data-detail-notify-action]');
+  if (!button || button.disabled) return;
+  const action = button.dataset.detailNotifyAction;
+  const groupInputs = Array.from(els.detailPane.querySelectorAll('[data-detail-notify-group]'));
+  if (action === 'select-all') {
+    groupInputs.forEach((input) => { input.checked = true; });
+    return;
+  }
+  if (action === 'clear') {
+    groupInputs.forEach((input) => { input.checked = false; });
+    return;
+  }
+  if (action !== 'save') return;
+
+  const notifyGroups = groupInputs.filter((input) => input.checked).map((input) => input.value);
+  const notifyAll = groupInputs.length === 0 || notifyGroups.length === groupInputs.length;
+  const status = els.detailPane.querySelector('#detailNotifyStatus');
+  if (!notifyGroups.length && groupInputs.length) {
+    if (status) {
+      status.textContent = '请至少选择一个通知分组';
+      status.classList.add('error');
+    }
+    showToast('请至少选择一个通知分组', 'error');
+    return;
+  }
+
+  button.disabled = true;
+  button.textContent = '保存中...';
+  if (status) {
+    status.textContent = '保存中...';
+    status.classList.remove('error');
+  }
+  try {
+    await api(`/api/sites/${state.selectedSiteId}`, {
+      method: 'PUT',
+      body: JSON.stringify({ notify_all_groups: notifyAll, notify_groups: notifyGroups }),
+    });
+    await refreshAll({ loadDetail: true });
+    const refreshedStatus = els.detailPane.querySelector('#detailNotifyStatus');
+    if (refreshedStatus) refreshedStatus.textContent = notifyAll ? '已保存：通知全部分组' : `已保存：通知 ${notifyGroups.length} 个分组`;
+    showToast('通知范围保存成功');
+  } catch (err) {
+    button.disabled = false;
+    button.textContent = '保存通知范围';
+    if (status) {
+      status.textContent = `保存失败：${err.message}`;
+      status.classList.add('error');
+    }
+    showToast(`通知范围保存失败：${err.message}`, 'error');
+  }
 });
 
 async function handleSiteTableClick(e) {
@@ -635,8 +821,31 @@ els.form.addEventListener('submit', async (e) => {
     token_expires_at: authMode === 'token' ? els.siteTokenExpiresAt.value.trim() : '',
     access_user_id: els.siteAccessUserId.value.trim(),
     enabled: els.siteEnabled.checked,
+    balance_alert_enabled: els.siteBalanceAlertEnabled.checked,
+    balance_alert_threshold: Math.max(0, Number(els.siteBalanceAlertThreshold.value || 0)),
+    notify_all_groups: state.dialogAvailableGroups.length === 0
+      || selectedNotifyGroups().length === state.dialogAvailableGroups.length,
+    notify_groups: selectedNotifyGroups(),
   };
   const id = els.siteId.value;
+  if (!payload.name || !payload.base_url) {
+    setSiteDialogTab('basic');
+    els.dialogMsg.textContent = '请填写站点名称和 Base URL';
+    els.dialogMsg.classList.add('error');
+    showToast('站点名称和 Base URL 不能为空', 'error');
+    return;
+  }
+  if (!payload.notify_all_groups && !payload.notify_groups.length) {
+    setSiteDialogTab('notify');
+    els.dialogMsg.textContent = '请至少选择一个通知分组';
+    els.dialogMsg.classList.add('error');
+    showToast('请至少选择一个通知分组', 'error');
+    return;
+  }
+  els.saveSiteBtn.disabled = true;
+  els.saveSiteBtn.textContent = '保存中...';
+  els.dialogMsg.textContent = '正在保存配置...';
+  els.dialogMsg.classList.remove('error');
   try {
     if (id) {
       await api(`/api/sites/${id}`, { method: 'PUT', body: JSON.stringify(payload) });
@@ -645,8 +854,14 @@ els.form.addEventListener('submit', async (e) => {
     }
     els.dialog.close();
     await refreshAll();
+    showToast(id ? '站点配置保存成功' : '站点添加成功');
   } catch (err) {
+    els.saveSiteBtn.disabled = false;
+    els.saveSiteBtn.textContent = '保存配置';
     els.dialogMsg.textContent = err.message;
+    els.dialogMsg.classList.add('error');
+    if (/登录|令牌|用户 ID|auth_token/.test(err.message)) setSiteDialogTab('auth');
+    showToast(`保存失败：${err.message}`, 'error');
   }
 });
 
@@ -683,6 +898,9 @@ els.testConnBtn.addEventListener('click', async () => {
     els.dialogMsg.textContent = res.success
       ? `连接成功：${res.groups_count} 个分组`
       : `失败：${res.message}`;
+    if (res.success && res.groups) {
+      renderNotifyGroupPicker(Object.keys(res.groups), selectedNotifyGroups(), state.dialogNotifyAllGroups);
+    }
   } catch (err) {
     els.dialogMsg.textContent = `失败：${err.message}`;
   }
@@ -722,6 +940,9 @@ els.testLoginBtn.addEventListener('click', async () => {
       els.dialogMsg.textContent = res.success
         ? `${authMode === 'token' ? '登录态可用' : '登录成功'}：当前用户可见 ${res.groups_count} 个分组`
         : `${authMode === 'token' ? '登录态失败' : '登录失败'}：${res.message}`;
+      if (res.success && res.groups) {
+        renderNotifyGroupPicker(Object.keys(res.groups), selectedNotifyGroups(), state.dialogNotifyAllGroups);
+      }
     } catch (err) {
       els.dialogMsg.textContent = `${authMode === 'token' ? '登录态失败' : '登录失败'}：${err.message}`;
     }
@@ -746,6 +967,9 @@ els.testLoginBtn.addEventListener('click', async () => {
     els.dialogMsg.textContent = res.success
       ? `验证成功：认证后可见 ${res.groups_count} 个分组`
       : `验证失败：${res.message}`;
+    if (res.success && res.groups) {
+      renderNotifyGroupPicker(Object.keys(res.groups), selectedNotifyGroups(), state.dialogNotifyAllGroups);
+    }
   } catch (err) {
     els.dialogMsg.textContent = `验证失败：${err.message}`;
   }
@@ -800,6 +1024,23 @@ els.testWecomBtn.addEventListener('click', async () => {
   } catch (err) {
     els.wecomStatus.textContent = `测试失败：${err.message}`;
     els.wecomStatus.classList.add('error');
+  }
+});
+
+els.testFeishuBtn.addEventListener('click', async () => {
+  els.feishuStatus.textContent = '测试飞书发送中...';
+  els.feishuStatus.classList.remove('error');
+  try {
+    const res = await api('/api/notifications/test-feishu', {
+      method: 'POST',
+      body: JSON.stringify(notificationPayload()),
+    });
+    els.feishuStatus.textContent = res.message || '测试完成';
+    state.notificationDirty = false;
+    await refreshAll();
+  } catch (err) {
+    els.feishuStatus.textContent = `测试失败：${err.message}`;
+    els.feishuStatus.classList.add('error');
   }
 });
 

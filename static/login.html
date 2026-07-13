@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>登录 · Upstream Ratio Watch</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body class="login-page">
+  <main class="login-shell">
+    <section class="login-panel">
+      <div class="login-brand">
+        <div class="brand-mark">N</div>
+        <div>
+          <h1>Upstream Ratio Watch</h1>
+          <p>上游倍率监控中心</p>
+        </div>
+      </div>
+      <form id="loginForm" class="login-form">
+        <label class="field">
+          <span>用户名</span>
+          <input id="loginUsername" class="input" autocomplete="username" autofocus />
+        </label>
+        <label class="field">
+          <span>密码</span>
+          <input id="loginPassword" class="input" type="password" autocomplete="current-password" />
+        </label>
+        <button id="loginSubmit" class="btn btn-primary login-submit" type="submit">登录</button>
+        <div id="loginMessage" class="login-message" role="status"></div>
+      </form>
+    </section>
+  </main>
+  <script src="/login.js"></script>
+</body>
+</html>

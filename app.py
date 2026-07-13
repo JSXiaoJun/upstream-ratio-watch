@@ -1,21 +1,27 @@
 from __future__ import annotations
 
 import hashlib
+import base64
+import hmac
 import json
+import math
 import os
+import secrets
 import smtplib
 import sqlite3
 import threading
+import time
 import traceback
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from http import HTTPStatus
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
@@ -23,6 +29,11 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 STATIC_DIR = APP_DIR / "static"
 DB_PATH = DATA_DIR / "app.db"
+AUTH_CONFIG_PATH = Path(os.getenv("AUTH_CONFIG_PATH") or (DATA_DIR / "auth.json"))
+AUTH_COOKIE_NAME = "upstream_watch_session"
+DEFAULT_SESSION_DAYS = 30
+MAX_LOGIN_FAILURES = 5
+LOGIN_FAILURE_WINDOW_SECONDS = 10 * 60
 DEFAULT_INTERVAL_MINUTES = 3
 MIN_INTERVAL_MINUTES = 1
 HTTP_TIMEOUT_SECONDS = 15
@@ -37,6 +48,8 @@ except ZoneInfoNotFoundError:
     APP_TIMEZONE = timezone(timedelta(hours=8), APP_TIMEZONE_NAME)
 
 DB_LOCK = threading.RLock()
+AUTH_LOCK = threading.RLock()
+AUTH_FAILURES: Dict[str, List[float]] = {}
 STOP_EVENT = threading.Event()
 
 
@@ -69,6 +82,165 @@ def ensure_dirs() -> None:
     STATIC_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def write_auth_config(config: Dict[str, Any]) -> None:
+    AUTH_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = AUTH_CONFIG_PATH.with_suffix(AUTH_CONFIG_PATH.suffix + ".tmp")
+    temp_path.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temp_path.replace(AUTH_CONFIG_PATH)
+    try:
+        os.chmod(AUTH_CONFIG_PATH, 0o600)
+    except OSError:
+        pass
+
+
+def ensure_auth_config() -> Dict[str, Any]:
+    created = False
+    with AUTH_LOCK:
+        if AUTH_CONFIG_PATH.exists():
+            try:
+                config = json.loads(AUTH_CONFIG_PATH.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeError(f"登录配置读取失败：{exc}") from exc
+        else:
+            config = {
+                "username": "admin",
+                "password": secrets.token_urlsafe(18),
+                "session_days": DEFAULT_SESSION_DAYS,
+                "session_secret": secrets.token_urlsafe(32),
+            }
+            created = True
+
+        changed = False
+        if not str(config.get("session_secret") or "").strip():
+            config["session_secret"] = secrets.token_urlsafe(32)
+            changed = True
+        if "session_days" not in config:
+            config["session_days"] = DEFAULT_SESSION_DAYS
+            changed = True
+        if created or changed:
+            write_auth_config(config)
+
+    username = str(config.get("username") or "").strip()
+    password = str(config.get("password") or "")
+    try:
+        session_days = int(config.get("session_days") or DEFAULT_SESSION_DAYS)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("登录配置 session_days 必须是整数") from exc
+    if not username or not password:
+        raise RuntimeError("登录配置 username/password 不能为空")
+    if session_days < 1 or session_days > 365:
+        raise RuntimeError("登录配置 session_days 必须在 1 到 365 之间")
+    config["username"] = username
+    config["password"] = password
+    config["session_days"] = session_days
+    if created:
+        print(f"Generated login config: {AUTH_CONFIG_PATH}")
+        print(f"Initial login username: {username}")
+        print("Initial login password is stored in the config file.")
+    return config
+
+
+def load_auth_config() -> Dict[str, Any]:
+    return ensure_auth_config()
+
+
+def auth_credential_version(config: Dict[str, Any]) -> str:
+    text = f"{config['username']}\n{config['password']}"
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:24]
+
+
+def urlsafe_b64encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def urlsafe_b64decode(value: str) -> bytes:
+    padding = "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode(value + padding)
+
+
+def create_session_token(config: Dict[str, Any]) -> Tuple[str, int]:
+    expires_at = int(time.time()) + int(config["session_days"]) * 86400
+    payload = {
+        "username": config["username"],
+        "expires_at": expires_at,
+        "version": auth_credential_version(config),
+    }
+    encoded_payload = urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    signature = hmac.new(
+        str(config["session_secret"]).encode("utf-8"),
+        encoded_payload.encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+    return f"{encoded_payload}.{urlsafe_b64encode(signature)}", expires_at
+
+
+def validate_session_token(token: str, config: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    try:
+        config = config or load_auth_config()
+        payload_part, signature_part = str(token or "").split(".", 1)
+        expected_signature = hmac.new(
+            str(config["session_secret"]).encode("utf-8"),
+            payload_part.encode("ascii"),
+            hashlib.sha256,
+        ).digest()
+        supplied_signature = urlsafe_b64decode(signature_part)
+        if not hmac.compare_digest(expected_signature, supplied_signature):
+            return None
+        payload = json.loads(urlsafe_b64decode(payload_part).decode("utf-8"))
+        if int(payload.get("expires_at") or 0) <= int(time.time()):
+            return None
+        if payload.get("username") != config["username"]:
+            return None
+        if payload.get("version") != auth_credential_version(config):
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+def session_from_cookie_header(cookie_header: str) -> Optional[Dict[str, Any]]:
+    if not cookie_header:
+        return None
+    try:
+        cookie = SimpleCookie()
+        cookie.load(cookie_header)
+        morsel = cookie.get(AUTH_COOKIE_NAME)
+        return validate_session_token(morsel.value if morsel else "")
+    except Exception:
+        return None
+
+
+def request_client_ip(handler: BaseHTTPRequestHandler) -> str:
+    forwarded = str(handler.headers.get("X-Forwarded-For") or "").split(",", 1)[0].strip()
+    return forwarded or str(handler.client_address[0])
+
+
+def login_rate_limited(client_ip: str) -> bool:
+    cutoff = time.monotonic() - LOGIN_FAILURE_WINDOW_SECONDS
+    with AUTH_LOCK:
+        attempts = [value for value in AUTH_FAILURES.get(client_ip, []) if value >= cutoff]
+        AUTH_FAILURES[client_ip] = attempts
+        return len(attempts) >= MAX_LOGIN_FAILURES
+
+
+def record_login_failure(client_ip: str) -> None:
+    with AUTH_LOCK:
+        AUTH_FAILURES.setdefault(client_ip, []).append(time.monotonic())
+
+
+def clear_login_failures(client_ip: str) -> None:
+    with AUTH_LOCK:
+        AUTH_FAILURES.pop(client_ip, None)
+
+
+def session_cookie_header(handler: BaseHTTPRequestHandler, token: str, max_age: int) -> str:
+    cookie = f"{AUTH_COOKIE_NAME}={token}; Path=/; Max-Age={max_age}; HttpOnly; SameSite=Strict"
+    forwarded_proto = str(handler.headers.get("X-Forwarded-Proto") or "").split(",", 1)[0].strip().lower()
+    if forwarded_proto == "https":
+        cookie += "; Secure"
+    return cookie
+
+
 def connect_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -89,6 +261,7 @@ def init_db() -> None:
                 enabled INTEGER NOT NULL DEFAULT 1,
                 interval_minutes INTEGER NOT NULL DEFAULT 3,
                 focus_keywords TEXT,
+                notify_groups_json TEXT,
                 login_enabled INTEGER NOT NULL DEFAULT 0,
                 auth_mode TEXT NOT NULL DEFAULT 'password',
                 login_username TEXT,
@@ -106,6 +279,13 @@ def init_db() -> None:
                 current_login_groups_json TEXT,
                 login_last_error TEXT,
                 login_last_check_at TEXT,
+                balance_alert_enabled INTEGER NOT NULL DEFAULT 0,
+                balance_alert_threshold REAL NOT NULL DEFAULT 10,
+                current_balance REAL,
+                balance_currency TEXT NOT NULL DEFAULT 'USD',
+                balance_last_error TEXT,
+                balance_last_check_at TEXT,
+                balance_alert_active INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -137,20 +317,29 @@ def init_db() -> None:
                 FOREIGN KEY(site_id) REFERENCES sites(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS balance_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                site_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                balance REAL,
+                currency TEXT NOT NULL DEFAULT 'USD',
+                raw_json TEXT,
+                error_message TEXT,
+                checked_at TEXT NOT NULL,
+                FOREIGN KEY(site_id) REFERENCES sites(id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS notification_settings (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
-                qq_enabled INTEGER NOT NULL DEFAULT 0,
-                qq_app_id TEXT,
-                qq_client_secret TEXT,
-                qq_group_openid TEXT,
-                qq_access_token TEXT,
-                qq_token_expires_at TEXT,
-                qq_last_error TEXT,
-                qq_last_sent_at TEXT,
                 wecom_enabled INTEGER NOT NULL DEFAULT 0,
                 wecom_webhook TEXT,
                 wecom_last_error TEXT,
                 wecom_last_sent_at TEXT,
+                feishu_enabled INTEGER NOT NULL DEFAULT 0,
+                feishu_webhook TEXT,
+                feishu_secret TEXT,
+                feishu_last_error TEXT,
+                feishu_last_sent_at TEXT,
                 email_enabled INTEGER NOT NULL DEFAULT 0,
                 smtp_host TEXT,
                 smtp_port INTEGER NOT NULL DEFAULT 465,
@@ -178,6 +367,7 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_sites_enabled_next_check ON sites(enabled, next_check_at);
             CREATE INDEX IF NOT EXISTS idx_snapshots_site_checked ON snapshots(site_id, checked_at DESC);
             CREATE INDEX IF NOT EXISTS idx_changes_site_created ON changes(site_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_balance_snapshots_site_checked ON balance_snapshots(site_id, checked_at DESC);
             CREATE INDEX IF NOT EXISTS idx_notification_logs_created ON notification_logs(created_at DESC);
             """
         )
@@ -187,6 +377,8 @@ def init_db() -> None:
         }
         if "focus_keywords" not in columns:
             conn.execute("ALTER TABLE sites ADD COLUMN focus_keywords TEXT")
+        if "notify_groups_json" not in columns:
+            conn.execute("ALTER TABLE sites ADD COLUMN notify_groups_json TEXT")
         if "login_enabled" not in columns:
             conn.execute("ALTER TABLE sites ADD COLUMN login_enabled INTEGER NOT NULL DEFAULT 0")
         if "auth_mode" not in columns:
@@ -209,6 +401,18 @@ def init_db() -> None:
             conn.execute("ALTER TABLE sites ADD COLUMN login_last_error TEXT")
         if "login_last_check_at" not in columns:
             conn.execute("ALTER TABLE sites ADD COLUMN login_last_check_at TEXT")
+        site_columns = {
+            "balance_alert_enabled": "INTEGER NOT NULL DEFAULT 0",
+            "balance_alert_threshold": "REAL NOT NULL DEFAULT 10",
+            "current_balance": "REAL",
+            "balance_currency": "TEXT NOT NULL DEFAULT 'USD'",
+            "balance_last_error": "TEXT",
+            "balance_last_check_at": "TEXT",
+            "balance_alert_active": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for column_name, column_type in site_columns.items():
+            if column_name not in columns:
+                conn.execute(f"ALTER TABLE sites ADD COLUMN {column_name} {column_type}")
         setting_columns = {
             row["name"]
             for row in conn.execute("PRAGMA table_info(notification_settings)").fetchall()
@@ -219,6 +423,11 @@ def init_db() -> None:
             "wecom_webhook": "TEXT",
             "wecom_last_error": "TEXT",
             "wecom_last_sent_at": "TEXT",
+            "feishu_enabled": "INTEGER NOT NULL DEFAULT 0",
+            "feishu_webhook": "TEXT",
+            "feishu_secret": "TEXT",
+            "feishu_last_error": "TEXT",
+            "feishu_last_sent_at": "TEXT",
             "smtp_host": "TEXT",
             "smtp_port": "INTEGER NOT NULL DEFAULT 465",
             "smtp_username": "TEXT",
@@ -238,12 +447,11 @@ def init_db() -> None:
             conn.execute(
                 """
                 INSERT INTO notification_settings
-                (id, qq_enabled, qq_app_id, qq_client_secret, qq_group_openid, qq_access_token, qq_token_expires_at, qq_last_error, qq_last_sent_at, wecom_enabled, wecom_webhook, wecom_last_error, wecom_last_sent_at, email_enabled, smtp_host, smtp_port, smtp_username, smtp_password, smtp_use_ssl, smtp_from, smtp_to, email_last_error, email_last_sent_at, created_at, updated_at)
-                VALUES (1, 0, '', '', '', NULL, NULL, NULL, NULL, 0, '', NULL, NULL, 0, '', 465, '', '', 1, '', '', NULL, NULL, ?, ?)
+                (id, wecom_enabled, wecom_webhook, wecom_last_error, wecom_last_sent_at, feishu_enabled, feishu_webhook, feishu_secret, feishu_last_error, feishu_last_sent_at, email_enabled, smtp_host, smtp_port, smtp_username, smtp_password, smtp_use_ssl, smtp_from, smtp_to, email_last_error, email_last_sent_at, created_at, updated_at)
+                VALUES (1, 0, '', NULL, NULL, 0, '', '', NULL, NULL, 0, '', 465, '', '', 1, '', '', NULL, NULL, ?, ?)
                 """,
                 (now, now),
             )
-        conn.execute("UPDATE notification_settings SET qq_enabled = 0, qq_last_error = NULL")
 
 
 def dict_from_row(row: sqlite3.Row) -> Dict[str, Any]:
@@ -512,6 +720,79 @@ def sub2api_token_headers(access_token: str) -> Dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
+def normalized_balance(amount: Any, source: str, **extra: Any) -> Optional[Dict[str, Any]]:
+    try:
+        value = float(amount)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value):
+        return None
+    result = {"amount": round(value, 6), "currency": "USD", "source": source}
+    result.update({key: value for key, value in extra.items() if value is not None})
+    return result
+
+
+def find_quota_per_unit(payload: Any) -> Optional[float]:
+    if not isinstance(payload, dict):
+        return None
+    for key in ("quota_per_unit", "QuotaPerUnit"):
+        if key in payload:
+            try:
+                value = float(payload[key])
+                if value > 0 and math.isfinite(value):
+                    return value
+            except (TypeError, ValueError):
+                pass
+    for key in ("data", "config", "status"):
+        nested = find_quota_per_unit(payload.get(key))
+        if nested:
+            return nested
+    return None
+
+
+def fetch_newapi_balance(base_url: str, access_token: str, user_id: str = "") -> Tuple[bool, Dict[str, Any], Optional[str]]:
+    token = (access_token or "").strip()
+    if not token:
+        return False, {}, "余额采集需要系统访问令牌"
+    headers = {
+        "Authorization": token.removeprefix("Bearer ").removeprefix("bearer ").strip(),
+    }
+    if str(user_id or "").strip():
+        headers["New-Api-User"] = str(user_id).strip()
+    ok, payload, error = request_json(
+        f"{normalize_base_url(base_url)}/api/user/self",
+        headers=headers,
+    )
+    if not ok or not isinstance(payload, dict):
+        return False, payload if isinstance(payload, dict) else {"raw": payload}, error or "余额请求失败"
+    if payload.get("success") is False:
+        return False, payload, str(payload.get("message") or "余额响应 success=false")
+    user_data = payload.get("data")
+    if not isinstance(user_data, dict):
+        return False, payload, "余额响应缺少 data"
+    raw_quota = user_data.get("quota")
+    try:
+        quota_value = float(raw_quota)
+    except (TypeError, ValueError):
+        return False, payload, "余额响应缺少有效 quota"
+
+    quota_per_unit = 500000.0
+    status_ok, status_payload, _ = request_json(f"{normalize_base_url(base_url)}/api/status")
+    detected_unit = find_quota_per_unit(status_payload) if status_ok else None
+    if detected_unit:
+        quota_per_unit = detected_unit
+    balance = normalized_balance(
+        quota_value / quota_per_unit,
+        "/api/user/self",
+        raw_quota=raw_quota,
+        quota_per_unit=quota_per_unit,
+        used_quota=user_data.get("used_quota"),
+    )
+    if not balance:
+        return False, payload, "余额换算失败"
+    return True, balance, None
+
+
 def fetch_sub2api_groups_by_token(base_url: str, access_token: str) -> Tuple[bool, Dict[str, Any], Optional[str]]:
     token = (access_token or "").strip()
     if not token:
@@ -537,11 +818,34 @@ def fetch_sub2api_groups_by_token(base_url: str, access_token: str) -> Tuple[boo
         if rates_success and isinstance(parsed_rates, dict):
             rates_data = parsed_rates
 
+    profile_ok, profile_payload, profile_error = request_json(
+        f"{normalize_base_url(base_url)}/api/v1/user/profile",
+        headers=headers,
+    )
+    balance: Optional[Dict[str, Any]] = None
+    balance_error: Optional[str] = None
+    if profile_ok:
+        profile_success, profile_data, profile_message = unwrap_sub2api_response(profile_payload)
+        if profile_success and isinstance(profile_data, dict):
+            balance = normalized_balance(
+                profile_data.get("balance"),
+                "/api/v1/user/profile",
+                frozen_amount=profile_data.get("frozen_balance"),
+            )
+            if not balance:
+                balance_error = "用户资料响应缺少有效 balance"
+        else:
+            balance_error = profile_message or "用户资料响应失败"
+    else:
+        balance_error = profile_error or "用户资料请求失败"
+
     return True, {
         "success": True,
         "data": groups_data,
         "user_rates": rates_data,
         "rates_error": None if rates_ok else rates_error,
+        "balance": balance,
+        "balance_error": balance_error,
     }, None
 
 
@@ -763,8 +1067,8 @@ def get_notification_settings() -> Dict[str, Any]:
     db_execute(
         """
         INSERT OR IGNORE INTO notification_settings
-        (id, qq_enabled, qq_app_id, qq_client_secret, qq_group_openid, email_enabled, smtp_host, smtp_port, smtp_username, smtp_password, smtp_use_ssl, smtp_from, smtp_to, created_at, updated_at)
-        VALUES (1, 0, '', '', '', 0, '', 465, '', '', 1, '', '', ?, ?)
+        (id, email_enabled, smtp_host, smtp_port, smtp_username, smtp_password, smtp_use_ssl, smtp_from, smtp_to, created_at, updated_at)
+        VALUES (1, 0, '', 465, '', '', 1, '', '', ?, ?)
         """,
         (now, now),
     )
@@ -779,6 +1083,12 @@ def notification_settings_payload() -> Dict[str, Any]:
         "wecom_has_webhook": bool(settings.get("wecom_webhook")),
         "wecom_last_error": settings.get("wecom_last_error"),
         "wecom_last_sent_at": settings.get("wecom_last_sent_at"),
+        "feishu_enabled": bool(settings.get("feishu_enabled")),
+        "feishu_webhook": settings.get("feishu_webhook") or "",
+        "feishu_has_webhook": bool(settings.get("feishu_webhook")),
+        "feishu_has_secret": bool(settings.get("feishu_secret")),
+        "feishu_last_error": settings.get("feishu_last_error"),
+        "feishu_last_sent_at": settings.get("feishu_last_sent_at"),
         "email_enabled": bool(settings.get("email_enabled")),
         "smtp_host": settings.get("smtp_host") or "",
         "smtp_port": int(settings.get("smtp_port") or 465),
@@ -797,6 +1107,9 @@ def update_notification_settings(body: Dict[str, Any]) -> None:
     settings = get_notification_settings()
     wecom_enabled = bool(body.get("wecom_enabled", False))
     wecom_webhook = str(body.get("wecom_webhook") or "").strip()
+    feishu_enabled = bool(body.get("feishu_enabled", False))
+    feishu_webhook = str(body.get("feishu_webhook") or "").strip()
+    feishu_secret = str(body.get("feishu_secret") or "").strip()
     email_enabled = bool(body.get("email_enabled", False))
     smtp_host = str(body.get("smtp_host") or "").strip()
     smtp_port = int(body.get("smtp_port") or 465)
@@ -813,12 +1126,15 @@ def update_notification_settings(body: Dict[str, Any]) -> None:
             smtp_from = smtp_username
     if wecom_enabled and not (wecom_webhook or settings.get("wecom_webhook")):
         raise ValueError("启用企业微信推送时需要填写 Webhook 地址")
+    if feishu_enabled and not (feishu_webhook or settings.get("feishu_webhook")):
+        raise ValueError("启用飞书推送时需要填写 Webhook 地址")
 
     fields = [
-        "qq_enabled = 0",
         "wecom_enabled = ?",
+        "feishu_enabled = ?",
         "email_enabled = ?",
         "wecom_webhook = ?",
+        "feishu_webhook = ?",
         "smtp_host = ?",
         "smtp_port = ?",
         "smtp_username = ?",
@@ -829,8 +1145,10 @@ def update_notification_settings(body: Dict[str, Any]) -> None:
     ]
     params: List[Any] = [
         1 if wecom_enabled else 0,
+        1 if feishu_enabled else 0,
         1 if email_enabled else 0,
         wecom_webhook if wecom_webhook else (settings.get("wecom_webhook") or ""),
+        feishu_webhook if feishu_webhook else (settings.get("feishu_webhook") or ""),
         smtp_host,
         smtp_port,
         smtp_username,
@@ -842,6 +1160,9 @@ def update_notification_settings(body: Dict[str, Any]) -> None:
     if smtp_password:
         fields.append("smtp_password = ?")
         params.append(smtp_password)
+    if feishu_secret:
+        fields.append("feishu_secret = ?")
+        params.append(feishu_secret)
     params.append(1)
     db_execute(f"UPDATE notification_settings SET {', '.join(fields)} WHERE id = ?", params)
 
@@ -958,6 +1279,52 @@ def send_wecom_message(subject: str, message: str) -> Tuple[bool, Optional[str]]
         (sent_at, sent_at),
     )
     log_notification("wecom", "success", webhook, message, None)
+    return True, None
+
+
+def send_feishu_message(subject: str, message: str) -> Tuple[bool, Optional[str]]:
+    settings = get_notification_settings()
+    if not settings.get("feishu_enabled"):
+        return True, "飞书推送未启用，未发送消息"
+
+    webhook = str(settings.get("feishu_webhook") or "").strip()
+    if not webhook:
+        return False, "飞书 Webhook 未配置"
+    payload: Dict[str, Any] = {
+        "msg_type": "text",
+        "content": {"text": f"{subject}\n\n{message}"},
+    }
+    secret = str(settings.get("feishu_secret") or "").strip()
+    if secret:
+        timestamp = str(int(time.time()))
+        string_to_sign = f"{timestamp}\n{secret}".encode("utf-8")
+        signature = hmac.new(string_to_sign, digestmod=hashlib.sha256).digest()
+        payload["timestamp"] = timestamp
+        payload["sign"] = base64.b64encode(signature).decode("ascii")
+
+    ok, response_payload, error = request_json(webhook, payload=payload, method="POST")
+    error_text: Optional[str] = None
+    if not ok:
+        error_text = error or "飞书推送失败"
+    elif isinstance(response_payload, dict):
+        code = response_payload.get("code", response_payload.get("StatusCode"))
+        if code not in (None, 0, "0"):
+            error_text = f"飞书推送失败：{response_payload.get('msg') or response_payload.get('StatusMessage') or code}"
+
+    if error_text:
+        db_execute(
+            "UPDATE notification_settings SET feishu_last_error = ?, updated_at = ? WHERE id = 1",
+            (error_text, utc_now_iso()),
+        )
+        log_notification("feishu", "failed", webhook, message, error_text)
+        return False, error_text
+
+    sent_at = utc_now_iso()
+    db_execute(
+        "UPDATE notification_settings SET feishu_last_error = NULL, feishu_last_sent_at = ?, updated_at = ? WHERE id = 1",
+        (sent_at, sent_at),
+    )
+    log_notification("feishu", "success", webhook, message, None)
     return True, None
 
 
@@ -1106,6 +1473,39 @@ def format_change_notification(site: Dict[str, Any], changes: List[Dict[str, Any
     return "\n".join(lines)
 
 
+def normalize_notify_groups(raw: Any) -> List[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            raw = parsed if isinstance(parsed, list) else []
+        except (TypeError, ValueError):
+            raw = []
+    if not isinstance(raw, (list, tuple, set)):
+        return []
+    groups: List[str] = []
+    seen = set()
+    for item in raw:
+        name = str(item or "").strip()
+        if name and name not in seen:
+            seen.add(name)
+            groups.append(name)
+    return groups
+
+
+def notification_groups_for_site(site: Dict[str, Any]) -> List[str]:
+    return normalize_notify_groups(site.get("notify_groups_json"))
+
+
+def filter_notification_changes(site: Dict[str, Any], changes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    selected_groups = notification_groups_for_site(site)
+    if not selected_groups:
+        return changes
+    selected = set(selected_groups)
+    return [change for change in changes if str(change.get("group_name") or "") in selected]
+
+
 def notify_changes(site: Dict[str, Any], changes: List[Dict[str, Any]], checked_at: str) -> None:
     if not changes:
         return
@@ -1113,6 +1513,43 @@ def notify_changes(site: Dict[str, Any], changes: List[Dict[str, Any]], checked_
     message = format_change_notification(site, changes, checked_at)
     send_email_message(subject, message)
     send_wecom_message(subject, message)
+    send_feishu_message(subject, message)
+
+
+def format_balance_amount(amount: float, currency: str = "USD") -> str:
+    symbol = "$" if currency == "USD" else f"{currency} "
+    return f"{symbol}{amount:.2f}"
+
+
+def record_balance_event(site: Dict[str, Any], event_type: str, amount: float, threshold: float, checked_at: str) -> None:
+    recovered = event_type == "balance_recovered"
+    message = (
+        f"余额已恢复至 {format_balance_amount(amount)}，高于预警阈值 {format_balance_amount(threshold)}"
+        if recovered
+        else f"余额仅剩 {format_balance_amount(amount)}，已低于预警阈值 {format_balance_amount(threshold)}"
+    )
+    db_execute(
+        """
+        INSERT INTO changes
+        (site_id, change_type, group_name, old_value, new_value, change_percent, message, created_at, acknowledged)
+        VALUES (?, ?, NULL, ?, ?, NULL, ?, ?, 0)
+        """,
+        (site["id"], event_type, json.dumps(threshold), json.dumps(amount), message, checked_at),
+    )
+    label = "余额恢复" if recovered else "低余额预警"
+    subject = f"【{platform_label(site)} {label}】{site['name']}：{format_balance_amount(amount)}"
+    body = "\n".join([
+        "上游余额监控提醒",
+        f"站点：{site['name']}",
+        f"平台：{platform_label(site)}",
+        f"当前余额：{format_balance_amount(amount)}",
+        f"预警阈值：{format_balance_amount(threshold)}",
+        f"状态：{'余额已恢复' if recovered else '余额不足，请及时充值'}",
+        f"时间：{fmt_local_time_for_message(checked_at)}",
+    ])
+    send_email_message(subject, body)
+    send_wecom_message(subject, body)
+    send_feishu_message(subject, body)
 
 
 def collect_site_groups(site: Dict[str, Any]) -> Tuple[bool, Dict[str, Dict[str, Any]], Dict[str, Any], str, Optional[str]]:
@@ -1244,10 +1681,57 @@ def detect_site(site_id: int) -> Dict[str, Any]:
         )
         change["severity"] = severity
 
-    notify_changes(site, changes, checked_at)
+    notify_changes(site, filter_notification_changes(site, changes), checked_at)
+
+    balance_attempted = False
+    balance_info: Optional[Dict[str, Any]] = None
+    balance_error: Optional[str] = None
+    if (site.get("platform") or "newapi") == "sub2api":
+        balance_attempted = True
+        if isinstance(payload, dict) and isinstance(payload.get("balance"), dict):
+            balance_info = payload.get("balance")
+        else:
+            balance_error = str(payload.get("balance_error") or "sub2api 未返回余额") if isinstance(payload, dict) else "sub2api 未返回余额"
+    elif site.get("login_enabled") and site.get("access_token"):
+        balance_attempted = True
+        balance_ok, fetched_balance, balance_error = fetch_newapi_balance(
+            site["base_url"], site.get("access_token") or "", site.get("access_user_id") or ""
+        )
+        if balance_ok:
+            balance_info = fetched_balance
+
+    if balance_attempted:
+        db_execute(
+            """
+            INSERT INTO balance_snapshots (site_id, status, balance, currency, raw_json, error_message, checked_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                site_id,
+                "success" if balance_info else "failed",
+                balance_info.get("amount") if balance_info else None,
+                balance_info.get("currency", "USD") if balance_info else "USD",
+                json.dumps(balance_info, ensure_ascii=False) if balance_info else None,
+                balance_error,
+                checked_at,
+            ),
+        )
+
+    alert_active = bool(site.get("balance_alert_active"))
+    if not site.get("balance_alert_enabled"):
+        alert_active = False
+    if balance_info and site.get("balance_alert_enabled"):
+        amount = float(balance_info["amount"])
+        threshold = float(site.get("balance_alert_threshold") or 0)
+        if amount <= threshold and not alert_active:
+            alert_active = True
+            record_balance_event(site, "balance_low", amount, threshold, checked_at)
+        elif amount > threshold and alert_active:
+            alert_active = False
+            record_balance_event(site, "balance_recovered", amount, threshold, checked_at)
 
     next_check_at = next_check_iso(int(site["interval_minutes"] or DEFAULT_INTERVAL_MINUTES))
-    effective_status = "warning" if login_error else "ok"
+    effective_status = "warning" if login_error or alert_active or (site.get("balance_alert_enabled") and balance_error) else "ok"
     refreshed_access_token = ""
     refreshed_refresh_token = ""
     refreshed_expires_at = None
@@ -1276,6 +1760,11 @@ def detect_site(site_id: int) -> Dict[str, Any]:
             access_token = COALESCE(NULLIF(?, ''), access_token),
             refresh_token = COALESCE(NULLIF(?, ''), refresh_token),
             token_expires_at = COALESCE(?, token_expires_at),
+            current_balance = COALESCE(?, current_balance),
+            balance_currency = COALESCE(?, balance_currency),
+            balance_last_error = CASE WHEN ? = 1 THEN ? ELSE balance_last_error END,
+            balance_last_check_at = CASE WHEN ? = 1 THEN ? ELSE balance_last_check_at END,
+            balance_alert_active = ?,
             updated_at = ?
         WHERE id = ?
         """,
@@ -1290,6 +1779,13 @@ def detect_site(site_id: int) -> Dict[str, Any]:
             refreshed_access_token,
             refreshed_refresh_token,
             refreshed_expires_at,
+            balance_info.get("amount") if balance_info else None,
+            balance_info.get("currency") if balance_info else None,
+            1 if balance_attempted else 0,
+            balance_error,
+            1 if balance_attempted else 0,
+            checked_at if balance_attempted else None,
+            1 if alert_active else 0,
             checked_at,
             site_id,
         ),
@@ -1302,6 +1798,8 @@ def detect_site(site_id: int) -> Dict[str, Any]:
         "groups": new_groups,
         "login_groups": login_groups,
         "changes": changes,
+        "balance": balance_info,
+        "balance_error": balance_error,
     }
 
 
@@ -1357,14 +1855,29 @@ def schedule_worker() -> None:
         STOP_EVENT.wait(SCAN_INTERVAL_SECONDS)
 
 
-def json_response(handler: BaseHTTPRequestHandler, payload: Any, status: int = 200) -> None:
+def json_response(
+    handler: BaseHTTPRequestHandler,
+    payload: Any,
+    status: int = 200,
+    headers: Optional[Dict[str, str]] = None,
+) -> None:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(body)))
     handler.send_header("Cache-Control", "no-store")
+    for name, value in (headers or {}).items():
+        handler.send_header(name, value)
     handler.end_headers()
     handler.wfile.write(body)
+
+
+def redirect_response(handler: BaseHTTPRequestHandler, location: str, status: int = 302) -> None:
+    handler.send_response(status)
+    handler.send_header("Location", location)
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Content-Length", "0")
+    handler.end_headers()
 
 
 def read_json_body(handler: BaseHTTPRequestHandler) -> Any:
@@ -1386,6 +1899,7 @@ def site_summary(site: Dict[str, Any]) -> Dict[str, Any]:
             login_groups = json.loads(site["current_login_groups_json"]) or {}
         except Exception:
             login_groups = {}
+    notify_groups = notification_groups_for_site(site)
     latest_snapshot = db_query_one(
         "SELECT checked_at, status, error_message FROM snapshots WHERE site_id = ? ORDER BY id DESC LIMIT 1",
         (site["id"],),
@@ -1402,6 +1916,8 @@ def site_summary(site: Dict[str, Any]) -> Dict[str, Any]:
         "platform_label": "sub2api" if site["platform"] == "sub2api" else "NewAPI",
         "enabled": bool(site["enabled"]),
         "interval_minutes": site["interval_minutes"],
+        "notify_all_groups": not bool(notify_groups),
+        "notify_groups": notify_groups,
         "login_enabled": bool(site.get("login_enabled")),
         "auth_mode": site.get("auth_mode") or "password",
         "login_username": site.get("login_username") or "",
@@ -1412,6 +1928,13 @@ def site_summary(site: Dict[str, Any]) -> Dict[str, Any]:
         "access_user_id": site.get("access_user_id") or "",
         "login_last_error": site.get("login_last_error"),
         "login_last_check_at": site.get("login_last_check_at"),
+        "balance_alert_enabled": bool(site.get("balance_alert_enabled")),
+        "balance_alert_threshold": float(site.get("balance_alert_threshold") or 0),
+        "current_balance": site.get("current_balance"),
+        "balance_currency": site.get("balance_currency") or "USD",
+        "balance_last_error": site.get("balance_last_error"),
+        "balance_last_check_at": site.get("balance_last_check_at"),
+        "balance_alert_active": bool(site.get("balance_alert_active")),
         "status": site["status"],
         "last_error": site["last_error"],
         "last_check_at": site["last_check_at"],
@@ -1494,6 +2017,20 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:
         return
 
+    def _auth_session(self) -> Optional[Dict[str, Any]]:
+        return session_from_cookie_header(str(self.headers.get("Cookie") or ""))
+
+    def _require_auth(self, api_request: bool = True) -> Optional[Dict[str, Any]]:
+        session = self._auth_session()
+        if session:
+            return session
+        if api_request:
+            json_response(self, {"success": False, "message": "登录已过期，请重新登录"}, 401)
+        else:
+            next_path = quote(self.path or "/", safe="")
+            redirect_response(self, f"/login?next={next_path}")
+        return None
+
     def _serve_file(self, path: Path, content_type: str) -> None:
         if not path.exists():
             self.send_error(HTTPStatus.NOT_FOUND)
@@ -1502,6 +2039,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(data)
 
@@ -1509,13 +2047,29 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
 
+        if path == "/api/auth/status":
+            session = self._auth_session()
+            return json_response(self, {
+                "authenticated": bool(session),
+                "username": session.get("username") if session else None,
+                "expires_at": session.get("expires_at") if session else None,
+            })
+        if path in {"/login", "/login.html"}:
+            if self._auth_session():
+                return redirect_response(self, "/")
+            return self._serve_file(STATIC_DIR / "login.html", "text/html; charset=utf-8")
+        if path == "/login.js":
+            return self._serve_file(STATIC_DIR / "login.js", "application/javascript; charset=utf-8")
+        if path == "/styles.css":
+            return self._serve_file(STATIC_DIR / "styles.css", "text/css; charset=utf-8")
+
+        if not self._require_auth(api_request=path.startswith("/api/")):
+            return
+
         if path == "/":
             return self._serve_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
         if path == "/app.js":
             return self._serve_file(STATIC_DIR / "app.js", "application/javascript; charset=utf-8")
-        if path == "/styles.css":
-            return self._serve_file(STATIC_DIR / "styles.css", "text/css; charset=utf-8")
-
         if path == "/api/overview":
             return json_response(self, overview_payload())
         if path == "/api/sites":
@@ -1550,6 +2104,38 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
 
         try:
+            if path == "/api/auth/login":
+                client_ip = request_client_ip(self)
+                if login_rate_limited(client_ip):
+                    return json_response(self, {"success": False, "message": "登录失败次数过多，请稍后再试"}, 429)
+                body = read_json_body(self)
+                username = str(body.get("username") or "")
+                password = str(body.get("password") or "")
+                config = load_auth_config()
+                valid_username = hmac.compare_digest(username.encode("utf-8"), str(config["username"]).encode("utf-8"))
+                valid_password = hmac.compare_digest(password.encode("utf-8"), str(config["password"]).encode("utf-8"))
+                if not valid_username or not valid_password:
+                    record_login_failure(client_ip)
+                    return json_response(self, {"success": False, "message": "用户名或密码错误"}, 401)
+                clear_login_failures(client_ip)
+                token, expires_at = create_session_token(config)
+                max_age = int(config["session_days"]) * 86400
+                return json_response(
+                    self,
+                    {"success": True, "username": config["username"], "expires_at": expires_at},
+                    headers={"Set-Cookie": session_cookie_header(self, token, max_age)},
+                )
+
+            if path == "/api/auth/logout":
+                return json_response(
+                    self,
+                    {"success": True},
+                    headers={"Set-Cookie": session_cookie_header(self, "", 0)},
+                )
+
+            if not self._require_auth(api_request=True):
+                return
+
             if path == "/api/check-connection":
                 body = read_json_body(self)
                 base_url = normalize_base_url(str(body.get("base_url") or ""))
@@ -1601,6 +2187,10 @@ class Handler(BaseHTTPRequestHandler):
                 refresh_token = str(body.get("refresh_token") or "").strip()
                 token_expires_at = str(body.get("token_expires_at") or "").strip()
                 auth_mode = str(body.get("auth_mode") or "password").strip().lower()
+                balance_alert_enabled = bool(body.get("balance_alert_enabled", False))
+                balance_alert_threshold = float(body.get("balance_alert_threshold") or 0)
+                notify_all_groups = bool(body.get("notify_all_groups", True))
+                notify_groups = normalize_notify_groups(body.get("notify_groups"))
                 if platform not in {"newapi", "sub2api"}:
                     return json_response(self, {"success": False, "message": "platform invalid"}, 400)
                 if auth_mode not in {"password", "token"}:
@@ -1613,12 +2203,18 @@ class Handler(BaseHTTPRequestHandler):
                     return json_response(self, {"success": False, "message": "sub2api 需要填写普通用户邮箱和密码"}, 400)
                 if platform == "sub2api" and auth_mode == "token" and not access_token:
                     return json_response(self, {"success": False, "message": "导入登录态时需要填写 auth_token"}, 400)
+                if balance_alert_enabled and balance_alert_threshold < 0:
+                    return json_response(self, {"success": False, "message": "余额预警阈值不能小于 0"}, 400)
+                if platform == "newapi" and balance_alert_enabled and not login_enabled:
+                    return json_response(self, {"success": False, "message": "NewAPI 余额监控需要开启认证增强监控"}, 400)
+                if not notify_all_groups and not notify_groups:
+                    return json_response(self, {"success": False, "message": "指定分组通知模式至少需要选择一个分组"}, 400)
                 now = utc_now_iso()
                 site_id = db_execute(
                     """
                     INSERT INTO sites
-                    (name, base_url, platform, enabled, interval_minutes, login_enabled, auth_mode, login_username, login_password, access_token, access_user_id, refresh_token, token_expires_at, status, last_error, last_check_at, next_check_at, consecutive_failures, current_groups_json, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', NULL, NULL, ?, 0, NULL, ?, ?)
+                    (name, base_url, platform, enabled, interval_minutes, notify_groups_json, login_enabled, auth_mode, login_username, login_password, access_token, access_user_id, refresh_token, token_expires_at, balance_alert_enabled, balance_alert_threshold, status, last_error, last_check_at, next_check_at, consecutive_failures, current_groups_json, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', NULL, NULL, ?, 0, NULL, ?, ?)
                     """,
                     (
                         name,
@@ -1626,6 +2222,7 @@ class Handler(BaseHTTPRequestHandler):
                         platform,
                         1 if enabled else 0,
                         interval,
+                        None if notify_all_groups else json.dumps(notify_groups, ensure_ascii=False),
                         1 if (login_enabled or platform == "sub2api") else 0,
                         auth_mode if platform == "sub2api" else "password",
                         login_username if platform == "sub2api" and auth_mode == "password" else "",
@@ -1634,6 +2231,8 @@ class Handler(BaseHTTPRequestHandler):
                         access_user_id if platform == "newapi" and login_enabled else "",
                         refresh_token if platform == "sub2api" and auth_mode == "token" else "",
                         token_expires_at if platform == "sub2api" and auth_mode == "token" else "",
+                        1 if balance_alert_enabled else 0,
+                        balance_alert_threshold,
                         next_check_iso(interval),
                         now,
                         now,
@@ -1665,12 +2264,22 @@ class Handler(BaseHTTPRequestHandler):
                 ok, error_message = send_wecom_message("上游倍率监控企业微信测试", message)
                 return json_response(self, {"success": ok, "message": error_message or "测试消息已发送"})
 
+            if path == "/api/notifications/test-feishu":
+                body = read_json_body(self)
+                if body:
+                    update_notification_settings(body)
+                message = "这是一条上游倍率与余额监控测试消息。"
+                ok, error_message = send_feishu_message("上游监控飞书测试", message)
+                return json_response(self, {"success": ok, "message": error_message or "测试消息已发送"})
+
             self.send_error(HTTPStatus.NOT_FOUND)
         except Exception as exc:
             return json_response(self, {"success": False, "message": str(exc)}, 500)
 
     def do_PUT(self) -> None:
         path = urlparse(self.path).path
+        if not self._require_auth(api_request=True):
+            return
         if path.startswith("/api/sites/"):
             try:
                 site_id = int(path.split("/")[3])
@@ -1701,6 +2310,27 @@ class Handler(BaseHTTPRequestHandler):
             if "interval_minutes" in body:
                 fields.append("interval_minutes = ?")
                 params.append(max(MIN_INTERVAL_MINUTES, int(body["interval_minutes"])))
+            if "notify_all_groups" in body or "notify_groups" in body:
+                notify_all_groups = bool(body.get("notify_all_groups", not bool(notification_groups_for_site(site))))
+                notify_groups = normalize_notify_groups(body.get("notify_groups", notification_groups_for_site(site)))
+                if not notify_all_groups and not notify_groups:
+                    return json_response(self, {"success": False, "message": "指定分组通知模式至少需要选择一个分组"}, 400)
+                fields.append("notify_groups_json = ?")
+                params.append(None if notify_all_groups else json.dumps(notify_groups, ensure_ascii=False))
+            if "balance_alert_enabled" in body:
+                balance_alert_enabled = bool(body["balance_alert_enabled"])
+                if target_platform == "newapi" and balance_alert_enabled and not bool(body.get("login_enabled", site.get("login_enabled"))):
+                    return json_response(self, {"success": False, "message": "NewAPI 余额监控需要开启认证增强监控"}, 400)
+                fields.append("balance_alert_enabled = ?")
+                params.append(1 if balance_alert_enabled else 0)
+                if not balance_alert_enabled:
+                    fields.append("balance_alert_active = 0")
+            if "balance_alert_threshold" in body:
+                threshold = float(body["balance_alert_threshold"] or 0)
+                if threshold < 0:
+                    return json_response(self, {"success": False, "message": "余额预警阈值不能小于 0"}, 400)
+                fields.append("balance_alert_threshold = ?")
+                params.append(threshold)
             if "login_enabled" in body:
                 login_enabled = bool(body["login_enabled"])
                 login_username = str(body.get("login_username") or "").strip()
@@ -1805,6 +2435,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self) -> None:
         path = urlparse(self.path).path
+        if not self._require_auth(api_request=True):
+            return
         if path.startswith("/api/sites/"):
             try:
                 site_id = int(path.split("/")[3])
@@ -1838,6 +2470,7 @@ def bootstrap_demo_data() -> None:
 
 def main() -> None:
     ensure_dirs()
+    ensure_auth_config()
     init_db()
     bootstrap_demo_data()
 

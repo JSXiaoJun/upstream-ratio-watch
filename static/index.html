@@ -18,14 +18,11 @@
       </div>
       <nav class="nav">
         <button class="nav-item active" type="button" data-view-target="overview">总览</button>
-        <button id="communityBtn" class="nav-item nav-community" type="button" title="点击复制QQ群号">
-          <span>交流群</span>
-          <strong>259844673</strong>
-        </button>
         <button class="nav-item" type="button" data-view-target="sites">站点监控</button>
         <button class="nav-item" type="button" data-view-target="detail">站点详情</button>
         <button class="nav-item" type="button" data-view-target="changes">变化记录</button>
         <button class="nav-item" type="button" data-view-target="notifications">消息推送</button>
+        <button id="logoutBtn" class="nav-item nav-logout" type="button">退出登录</button>
       </nav>
       <div class="sidebar-foot">
         <div class="muted">监控对象</div>
@@ -37,7 +34,7 @@
       <header class="topbar">
         <div>
           <div class="page-title">上游分组倍率监控</div>
-          <div class="page-subtitle">定时采集 NewAPI / sub2api 上游分组倍率，发现分组、倍率、描述变化。</div>
+          <div class="page-subtitle">定时采集 NewAPI / sub2api 上游倍率与账户余额，发现改价并预警低余额。</div>
         </div>
         <div class="topbar-actions">
           <button id="refreshBtn" class="btn btn-secondary">刷新</button>
@@ -69,6 +66,7 @@
                     <th>状态</th>
                     <th>认证/隐藏</th>
                     <th>分组</th>
+                    <th>余额</th>
                     <th>上次检测</th>
                     <th>操作</th>
                   </tr>
@@ -128,6 +126,7 @@
                   <th>状态</th>
                   <th>认证/隐藏</th>
                   <th>分组</th>
+                  <th>余额</th>
                   <th>上次检测</th>
                   <th>操作</th>
                 </tr>
@@ -180,10 +179,36 @@
           <div class="panel-head">
             <div>
               <h2>消息推送</h2>
-              <p>支持企业微信和邮箱推送，检测到倍率或分组变化后自动发送提醒。</p>
+              <p>支持飞书、企业微信和邮箱推送，检测到改价、分组变化或低余额后自动提醒。</p>
             </div>
           </div>
           <form id="notifyForm" class="notify-form">
+            <div class="form-section">
+              <div class="dialog-head">
+                <h3>飞书</h3>
+              </div>
+              <label class="field switch-row">
+                <span>启用飞书推送</span>
+                <input id="feishuEnabled" type="checkbox" />
+              </label>
+              <label class="field">
+                <span>机器人 Webhook</span>
+                <input id="feishuWebhook" class="input" autocomplete="off" placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/xxx" />
+              </label>
+              <label class="field">
+                <span>签名密钥（可选）</span>
+                <input id="feishuSecret" class="input" type="password" autocomplete="off" placeholder="编辑时留空表示不修改" />
+              </label>
+              <div class="notify-footer">
+                <div>
+                  <p class="field-help">在飞书群添加自定义机器人后填写 Webhook；机器人启用签名校验时再填写密钥。</p>
+                  <div class="notify-status" id="feishuStatus">未配置</div>
+                </div>
+                <div class="dialog-actions">
+                  <button id="testFeishuBtn" type="button" class="btn btn-secondary">测试飞书</button>
+                </div>
+              </div>
+            </div>
             <div class="form-section">
               <div class="dialog-head">
                 <h3>企业微信</h3>
@@ -263,6 +288,8 @@
     </main>
   </div>
 
+  <div id="toastContainer" class="toast-container" aria-live="polite"></div>
+
   <dialog id="siteDialog" class="dialog">
     <form id="siteForm" method="dialog" class="dialog-card">
       <div class="dialog-head">
@@ -270,87 +297,128 @@
         <button id="closeDialogBtn" class="icon-btn" type="button" aria-label="关闭">×</button>
       </div>
       <input type="hidden" id="siteId" />
-      <label class="field">
-        <span>站点名称</span>
-        <input id="siteName" class="input" required maxlength="80" />
-      </label>
-      <label class="field">
-        <span>平台类型</span>
-        <select id="sitePlatform" class="input">
-          <option value="newapi">NewAPI</option>
-          <option value="sub2api">sub2api</option>
-        </select>
-      </label>
-      <label class="field">
-        <span>Base URL</span>
-        <input id="siteBaseUrl" class="input" required placeholder="https://example.com" />
-      </label>
-      <label class="field">
-        <span>监控间隔（分钟）</span>
-        <input id="siteInterval" class="input" type="number" min="1" value="3" />
-      </label>
-      <div id="newapiAuthSection" class="form-section">
-        <label class="field switch-row">
-          <span>认证增强监控</span>
-          <input id="siteLoginEnabled" type="checkbox" />
-        </label>
-        <p class="field-help">填写系统访问令牌和 NewAPI 用户 ID 后，可查看该账号可见的隐藏用户分组或专属分组。</p>
-        <div id="loginFields" class="login-fields hidden">
-          <label class="field">
-            <span>系统访问令牌</span>
-            <input id="siteAccessToken" class="input" type="password" autocomplete="off" placeholder="编辑时留空表示不修改令牌" />
-          </label>
-          <label class="field">
-            <span>NewAPI 用户 ID</span>
-            <input id="siteAccessUserId" class="input" inputmode="numeric" placeholder="例如：4" />
-          </label>
-        </div>
+      <div class="site-dialog-tabs" role="tablist" aria-label="站点配置">
+        <button type="button" class="site-dialog-tab active" data-site-tab="basic">基础信息</button>
+        <button type="button" class="site-dialog-tab" data-site-tab="auth">认证配置</button>
+        <button type="button" class="site-dialog-tab" data-site-tab="notify">通知设置</button>
       </div>
-      <div id="sub2apiAuthSection" class="form-section hidden">
-        <p class="field-help">sub2api 支持普通账号登录，也支持导入浏览器已登录状态。开启 Turnstile 的站点建议先在浏览器正常登录，再导入登录态。</p>
-        <label class="field">
-          <span>认证方式</span>
-          <select id="siteAuthMode" class="input">
-            <option value="password">账号密码登录</option>
-            <option value="token">导入登录态</option>
-          </select>
-        </label>
-        <div id="sub2apiPasswordFields" class="login-fields">
-          <label class="field">
-            <span>用户邮箱</span>
-            <input id="siteLoginUsername" class="input" autocomplete="username" placeholder="user@example.com" />
-          </label>
-          <label class="field">
-            <span>用户密码</span>
-            <input id="siteLoginPassword" class="input" type="password" autocomplete="current-password" placeholder="编辑时留空表示不修改密码" />
-          </label>
-        </div>
-        <div id="sub2apiTokenFields" class="login-fields hidden">
-          <p class="field-help">浏览器登录 sub2api 后，打开开发者工具，在 localStorage（本地存储）里复制 auth_token、refresh_token、token_expires_at。</p>
-          <label class="field">
-            <span>auth_token</span>
-            <input id="siteSub2apiAccessToken" class="input" type="password" autocomplete="off" placeholder="编辑时留空表示不修改 auth_token" />
-          </label>
-          <label class="field">
-            <span>refresh_token</span>
-            <input id="siteRefreshToken" class="input" type="password" autocomplete="off" placeholder="可选，填写后 token 过期可自动刷新" />
-          </label>
-          <label class="field">
-            <span>token_expires_at</span>
-            <input id="siteTokenExpiresAt" class="input" autocomplete="off" placeholder="可选，例如 localStorage（本地存储）里的原始值" />
-          </label>
-        </div>
+      <div class="site-dialog-body">
+        <section class="site-dialog-panel active" data-site-tab-panel="basic">
+          <div class="dialog-grid">
+            <label class="field">
+              <span>站点名称</span>
+              <input id="siteName" class="input" maxlength="80" />
+            </label>
+            <label class="field">
+              <span>平台类型</span>
+              <select id="sitePlatform" class="input">
+                <option value="newapi">NewAPI</option>
+                <option value="sub2api">sub2api</option>
+              </select>
+            </label>
+            <label class="field span-2">
+              <span>Base URL</span>
+              <input id="siteBaseUrl" class="input" placeholder="https://example.com" />
+            </label>
+            <label class="field">
+              <span>监控间隔（分钟）</span>
+              <input id="siteInterval" class="input" type="number" min="1" value="3" />
+            </label>
+            <label class="field switch-field">
+              <span>启用监控</span>
+              <input id="siteEnabled" type="checkbox" checked />
+            </label>
+          </div>
+        </section>
+
+        <section class="site-dialog-panel" data-site-tab-panel="auth">
+          <div id="newapiAuthSection">
+            <label class="field switch-field">
+              <span>认证增强监控</span>
+              <input id="siteLoginEnabled" type="checkbox" />
+            </label>
+            <p class="field-help">填写系统访问令牌和 NewAPI 用户 ID 后，可查看隐藏或专属分组。</p>
+            <div id="loginFields" class="dialog-grid hidden">
+              <label class="field span-2">
+                <span>系统访问令牌</span>
+                <input id="siteAccessToken" class="input" type="password" autocomplete="off" placeholder="编辑时留空表示不修改令牌" />
+              </label>
+              <label class="field">
+                <span>NewAPI 用户 ID</span>
+                <input id="siteAccessUserId" class="input" inputmode="numeric" placeholder="例如：4" />
+              </label>
+            </div>
+          </div>
+          <div id="sub2apiAuthSection" class="hidden">
+            <div class="dialog-grid">
+              <label class="field span-2">
+                <span>认证方式</span>
+                <select id="siteAuthMode" class="input">
+                  <option value="password">账号密码登录</option>
+                  <option value="token">导入登录态</option>
+                </select>
+              </label>
+              <div id="sub2apiPasswordFields" class="dialog-grid span-2">
+                <label class="field">
+                  <span>用户邮箱</span>
+                  <input id="siteLoginUsername" class="input" autocomplete="username" placeholder="user@example.com" />
+                </label>
+                <label class="field">
+                  <span>用户密码</span>
+                  <input id="siteLoginPassword" class="input" type="password" autocomplete="current-password" placeholder="编辑时留空表示不修改密码" />
+                </label>
+              </div>
+              <div id="sub2apiTokenFields" class="dialog-grid span-2 hidden">
+                <label class="field span-2">
+                  <span>auth_token</span>
+                  <input id="siteSub2apiAccessToken" class="input" type="password" autocomplete="off" placeholder="编辑时留空表示不修改 auth_token" />
+                </label>
+                <label class="field">
+                  <span>refresh_token</span>
+                  <input id="siteRefreshToken" class="input" type="password" autocomplete="off" placeholder="可选" />
+                </label>
+                <label class="field">
+                  <span>token_expires_at</span>
+                  <input id="siteTokenExpiresAt" class="input" autocomplete="off" placeholder="可选" />
+                </label>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="site-dialog-panel" data-site-tab-panel="notify">
+          <div class="dialog-section">
+            <div id="siteNotifyGroupsSection">
+              <div class="group-picker-head">
+                <span>变化通知分组</span>
+                <div class="action-row">
+                  <button id="selectAllNotifyGroupsBtn" class="btn btn-secondary btn-small" type="button">全选</button>
+                  <button id="clearNotifyGroupsBtn" class="btn btn-secondary btn-small" type="button">清空</button>
+                </div>
+              </div>
+              <div id="siteNotifyGroupsList" class="group-picker"></div>
+            </div>
+          </div>
+          <div class="dialog-section balance-dialog-section">
+            <label class="field switch-field">
+              <span>启用低余额预警</span>
+              <input id="siteBalanceAlertEnabled" type="checkbox" />
+            </label>
+            <label class="field balance-threshold-field">
+              <span>预警阈值（美元）</span>
+              <input id="siteBalanceAlertThreshold" class="input" type="number" min="0" step="0.01" value="10" />
+            </label>
+          </div>
+        </section>
       </div>
-      <label class="field switch-row">
-        <span>启用监控</span>
-        <input id="siteEnabled" type="checkbox" checked />
-      </label>
-      <div class="dialog-actions">
-        <button id="testConnBtn" type="button" class="btn btn-secondary">测试连接</button>
-        <button id="testLoginBtn" type="button" class="btn btn-secondary">测试认证</button>
-        <button type="submit" class="btn btn-primary">保存</button>
-      </div>
-      <div id="dialogMsg" class="dialog-msg"></div>
+      <footer class="dialog-footer">
+        <div id="dialogMsg" class="dialog-msg"></div>
+        <div class="dialog-actions">
+          <button id="testConnBtn" type="button" class="btn btn-secondary">测试连接</button>
+          <button id="testLoginBtn" type="button" class="btn btn-secondary">测试认证</button>
+          <button id="saveSiteBtn" type="submit" class="btn btn-primary">保存配置</button>
+        </div>
+      </footer>
     </form>
   </dialog>
 
