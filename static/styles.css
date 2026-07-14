@@ -496,6 +496,12 @@ body {
 .notify-grid .field:nth-child(6) {
   grid-column: span 1;
 }
+.qq-notify-grid {
+  grid-template-columns: minmax(0, 1fr) minmax(150px, 0.35fr);
+}
+.qq-notify-grid .qq-token-field {
+  grid-column: 1 / -1;
+}
 .notify-footer {
   display: grid;
   grid-template-columns: 1fr auto;
@@ -722,6 +728,9 @@ body {
   .site-dialog-tabs { overflow-x: auto; padding: 0 12px; }
   .site-dialog-panel { padding: 14px; }
   .dialog-grid, .balance-dialog-section { grid-template-columns: 1fr; }
+  .notify-grid, .qq-notify-grid { grid-template-columns: 1fr; }
+  .notify-grid .field, .qq-notify-grid .qq-token-field { grid-column: auto; }
+  .notify-footer { grid-template-columns: 1fr; align-items: stretch; }
   .dialog-grid .span-2, .span-2 { grid-column: auto; }
   .dialog-footer { align-items: stretch; flex-direction: column; padding: 10px 14px; }
   .dialog-actions { width: 100%; }

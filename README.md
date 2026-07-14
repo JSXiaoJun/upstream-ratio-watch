@@ -17,7 +17,7 @@
 - 支持每站点设置低余额阈值，跌破与恢复时分别通知一次
 - 展示隐藏分组和认证后新增分组
 - 使用 SQLite 保存倍率、余额快照和变化记录
-- 支持飞书、企业微信、SMTP 邮箱推送改价与余额提醒
+- 支持 QQ 群、飞书、企业微信、SMTP 邮箱推送改价与余额提醒
 - 内置登录保护，页面和业务 API 均需登录，会话默认有效 30 天
 - Python 标准库后端，静态 HTML/CSS/JS 前端
 
@@ -30,6 +30,7 @@
 ```bash
 git clone https://github.com/Regert888/upstream-ratio-watch.git
 cd upstream-ratio-watch
+docker network create qq-notify
 docker compose up -d
 ```
 
@@ -334,6 +335,38 @@ New-Api-User: NewAPI 用户 ID
 在“站点详情”或编辑站点弹窗中勾选实际接入的分组并保存。首次配置时默认勾选当前全部分组；你只需取消不需要通知的分组。程序仍会采集并记录全部分组变化，但飞书、企业微信和邮件只会推送所选分组的倍率、删除、状态等变化。余额预警不受该范围影响。
 
 旧站点和未修改通知范围的站点默认通知全部分组。分组使用完整名称精确匹配。
+
+## QQ 群推送
+
+QQ 推送复用 `qq-monitor-bot` 的 NapCatQQ 登录态，并将查询群和通知群分开控制：
+
+- `qq-monitor-bot` 的 `QUERY_GROUP_ID`：唯一允许触发“查监控”的群。
+- `qq-monitor-bot` 的 `NOTIFY_GROUP_ID`：唯一允许接收自动通知的群。
+- 本项目“消息推送”页面中的“通知群号”：必须与 `NOTIFY_GROUP_ID` 完全一致。
+
+两个 Compose 项目通过外部 Docker 网络 `qq-notify` 通信。服务器上只需创建一次：
+
+```bash
+docker network create qq-notify
+```
+
+在 `qq-monitor-bot/.env` 设置：
+
+```dotenv
+QUERY_GROUP_ID=查询群号
+NOTIFY_GROUP_ID=通知群号
+NOTIFY_API_TOKEN=使用openssl生成的强随机Token
+```
+
+然后在本项目的“消息推送”页面填写：
+
+```text
+机器人通知接口：http://qq-monitor-bot:3100/api/notify
+通知群号：与 NOTIFY_GROUP_ID 相同
+通知接口 Token：与 NOTIFY_API_TOKEN 相同
+```
+
+保存后点击“测试 QQ”。机器人只会向配置的通知群发送消息；请求其他群号会被拒绝。
 
 ## 飞书推送
 

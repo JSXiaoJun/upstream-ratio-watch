@@ -77,6 +77,21 @@ def normalize_base_url(value: str) -> str:
     return value
 
 
+def normalize_qq_group_id(value: Any) -> str:
+    text = str(value or "").strip()
+    return text if text.isdigit() and 5 <= len(text) <= 20 else ""
+
+
+def normalize_qq_api_url(value: Any) -> str:
+    text = str(value or "").strip().rstrip("/")
+    if not text:
+        return ""
+    parsed = urlparse(text)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("QQ 通知接口地址必须是有效的 HTTP 或 HTTPS URL")
+    return text
+
+
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     STATIC_DIR.mkdir(parents=True, exist_ok=True)
@@ -340,6 +355,12 @@ def init_db() -> None:
                 feishu_secret TEXT,
                 feishu_last_error TEXT,
                 feishu_last_sent_at TEXT,
+                qq_enabled INTEGER NOT NULL DEFAULT 0,
+                qq_api_url TEXT,
+                qq_api_token TEXT,
+                qq_group_id TEXT,
+                qq_last_error TEXT,
+                qq_last_sent_at TEXT,
                 email_enabled INTEGER NOT NULL DEFAULT 0,
                 smtp_host TEXT,
                 smtp_port INTEGER NOT NULL DEFAULT 465,
@@ -428,6 +449,12 @@ def init_db() -> None:
             "feishu_secret": "TEXT",
             "feishu_last_error": "TEXT",
             "feishu_last_sent_at": "TEXT",
+            "qq_enabled": "INTEGER NOT NULL DEFAULT 0",
+            "qq_api_url": "TEXT",
+            "qq_api_token": "TEXT",
+            "qq_group_id": "TEXT",
+            "qq_last_error": "TEXT",
+            "qq_last_sent_at": "TEXT",
             "smtp_host": "TEXT",
             "smtp_port": "INTEGER NOT NULL DEFAULT 465",
             "smtp_username": "TEXT",
@@ -447,8 +474,8 @@ def init_db() -> None:
             conn.execute(
                 """
                 INSERT INTO notification_settings
-                (id, wecom_enabled, wecom_webhook, wecom_last_error, wecom_last_sent_at, feishu_enabled, feishu_webhook, feishu_secret, feishu_last_error, feishu_last_sent_at, email_enabled, smtp_host, smtp_port, smtp_username, smtp_password, smtp_use_ssl, smtp_from, smtp_to, email_last_error, email_last_sent_at, created_at, updated_at)
-                VALUES (1, 0, '', NULL, NULL, 0, '', '', NULL, NULL, 0, '', 465, '', '', 1, '', '', NULL, NULL, ?, ?)
+                (id, wecom_enabled, wecom_webhook, wecom_last_error, wecom_last_sent_at, feishu_enabled, feishu_webhook, feishu_secret, feishu_last_error, feishu_last_sent_at, qq_enabled, qq_api_url, qq_api_token, qq_group_id, qq_last_error, qq_last_sent_at, email_enabled, smtp_host, smtp_port, smtp_username, smtp_password, smtp_use_ssl, smtp_from, smtp_to, email_last_error, email_last_sent_at, created_at, updated_at)
+                VALUES (1, 0, '', NULL, NULL, 0, '', '', NULL, NULL, 0, '', '', '', NULL, NULL, 0, '', 465, '', '', 1, '', '', NULL, NULL, ?, ?)
                 """,
                 (now, now),
             )
@@ -1089,6 +1116,12 @@ def notification_settings_payload() -> Dict[str, Any]:
         "feishu_has_secret": bool(settings.get("feishu_secret")),
         "feishu_last_error": settings.get("feishu_last_error"),
         "feishu_last_sent_at": settings.get("feishu_last_sent_at"),
+        "qq_enabled": bool(settings.get("qq_enabled")),
+        "qq_api_url": settings.get("qq_api_url") or "",
+        "qq_has_api_token": bool(settings.get("qq_api_token")),
+        "qq_group_id": settings.get("qq_group_id") or "",
+        "qq_last_error": settings.get("qq_last_error"),
+        "qq_last_sent_at": settings.get("qq_last_sent_at"),
         "email_enabled": bool(settings.get("email_enabled")),
         "smtp_host": settings.get("smtp_host") or "",
         "smtp_port": int(settings.get("smtp_port") or 465),
@@ -1110,6 +1143,11 @@ def update_notification_settings(body: Dict[str, Any]) -> None:
     feishu_enabled = bool(body.get("feishu_enabled", False))
     feishu_webhook = str(body.get("feishu_webhook") or "").strip()
     feishu_secret = str(body.get("feishu_secret") or "").strip()
+    qq_enabled = bool(body.get("qq_enabled", False))
+    qq_api_url = normalize_qq_api_url(body.get("qq_api_url"))
+    qq_api_token = str(body.get("qq_api_token") or "").strip()
+    qq_group_id_raw = str(body.get("qq_group_id") or "").strip()
+    qq_group_id = normalize_qq_group_id(qq_group_id_raw)
     email_enabled = bool(body.get("email_enabled", False))
     smtp_host = str(body.get("smtp_host") or "").strip()
     smtp_port = int(body.get("smtp_port") or 465)
@@ -1128,13 +1166,25 @@ def update_notification_settings(body: Dict[str, Any]) -> None:
         raise ValueError("启用企业微信推送时需要填写 Webhook 地址")
     if feishu_enabled and not (feishu_webhook or settings.get("feishu_webhook")):
         raise ValueError("启用飞书推送时需要填写 Webhook 地址")
+    if qq_enabled:
+        if not (qq_api_url or settings.get("qq_api_url")):
+            raise ValueError("启用 QQ 推送时需要填写机器人通知接口地址")
+        if not (qq_api_token or settings.get("qq_api_token")):
+            raise ValueError("启用 QQ 推送时需要填写通知接口 Token")
+        if not qq_group_id:
+            raise ValueError("启用 QQ 推送时需要填写有效的 QQ 群号")
+    elif qq_group_id_raw and not qq_group_id:
+        raise ValueError("QQ 群号格式无效")
 
     fields = [
         "wecom_enabled = ?",
         "feishu_enabled = ?",
+        "qq_enabled = ?",
         "email_enabled = ?",
         "wecom_webhook = ?",
         "feishu_webhook = ?",
+        "qq_api_url = ?",
+        "qq_group_id = ?",
         "smtp_host = ?",
         "smtp_port = ?",
         "smtp_username = ?",
@@ -1146,9 +1196,12 @@ def update_notification_settings(body: Dict[str, Any]) -> None:
     params: List[Any] = [
         1 if wecom_enabled else 0,
         1 if feishu_enabled else 0,
+        1 if qq_enabled else 0,
         1 if email_enabled else 0,
         wecom_webhook if wecom_webhook else (settings.get("wecom_webhook") or ""),
         feishu_webhook if feishu_webhook else (settings.get("feishu_webhook") or ""),
+        qq_api_url if qq_api_url else (settings.get("qq_api_url") or ""),
+        qq_group_id,
         smtp_host,
         smtp_port,
         smtp_username,
@@ -1163,6 +1216,9 @@ def update_notification_settings(body: Dict[str, Any]) -> None:
     if feishu_secret:
         fields.append("feishu_secret = ?")
         params.append(feishu_secret)
+    if qq_api_token:
+        fields.append("qq_api_token = ?")
+        params.append(qq_api_token)
     params.append(1)
     db_execute(f"UPDATE notification_settings SET {', '.join(fields)} WHERE id = ?", params)
 
@@ -1175,6 +1231,60 @@ def log_notification(channel: str, status: str, target: str, message: str, error
         """,
         (channel, status, target, message, error_message, utc_now_iso()),
     )
+
+
+def qq_notification_error(payload: Any, fallback: str) -> str:
+    if isinstance(payload, dict):
+        if payload.get("message"):
+            return str(payload["message"])
+        raw = str(payload.get("raw") or "").strip()
+        if raw:
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict) and parsed.get("message"):
+                    return str(parsed["message"])
+            except (TypeError, ValueError):
+                pass
+    return fallback
+
+
+def send_qq_message(subject: str, message: str) -> Tuple[bool, Optional[str]]:
+    settings = get_notification_settings()
+    if not settings.get("qq_enabled"):
+        return True, "QQ 推送未启用，未发送消息"
+
+    api_url = str(settings.get("qq_api_url") or "").strip()
+    api_token = str(settings.get("qq_api_token") or "").strip()
+    group_id = normalize_qq_group_id(settings.get("qq_group_id"))
+    if not api_url or not api_token or not group_id:
+        return False, "QQ 推送配置不完整"
+
+    ok, response_payload, error = request_json(
+        api_url,
+        headers={"Authorization": f"Bearer {api_token}"},
+        payload={"group_id": group_id, "subject": subject, "message": message},
+        method="POST",
+    )
+    if not ok or not isinstance(response_payload, dict) or not response_payload.get("success"):
+        error_text = qq_notification_error(response_payload, error or "QQ 推送失败")
+        db_execute(
+            "UPDATE notification_settings SET qq_last_error = ?, updated_at = ? WHERE id = 1",
+            (error_text, utc_now_iso()),
+        )
+        log_notification("qq", "failed", group_id, message, error_text)
+        return False, error_text
+
+    sent_at = utc_now_iso()
+    db_execute(
+        """
+        UPDATE notification_settings
+        SET qq_last_error = NULL, qq_last_sent_at = ?, updated_at = ?
+        WHERE id = 1
+        """,
+        (sent_at, sent_at),
+    )
+    log_notification("qq", "success", group_id, message, None)
+    return True, None
 
 
 def send_email_message(subject: str, message: str) -> Tuple[bool, Optional[str]]:
@@ -1514,6 +1624,7 @@ def notify_changes(site: Dict[str, Any], changes: List[Dict[str, Any]], checked_
     send_email_message(subject, message)
     send_wecom_message(subject, message)
     send_feishu_message(subject, message)
+    send_qq_message(subject, message)
 
 
 def format_balance_amount(amount: float, currency: str = "USD") -> str:
@@ -1550,6 +1661,7 @@ def record_balance_event(site: Dict[str, Any], event_type: str, amount: float, t
     send_email_message(subject, body)
     send_wecom_message(subject, body)
     send_feishu_message(subject, body)
+    send_qq_message(subject, body)
 
 
 def collect_site_groups(site: Dict[str, Any]) -> Tuple[bool, Dict[str, Dict[str, Any]], Dict[str, Any], str, Optional[str]]:
@@ -2271,6 +2383,14 @@ class Handler(BaseHTTPRequestHandler):
                 message = "这是一条上游倍率与余额监控测试消息。"
                 ok, error_message = send_feishu_message("上游监控飞书测试", message)
                 return json_response(self, {"success": ok, "message": error_message or "测试消息已发送"})
+
+            if path == "/api/notifications/test-qq":
+                body = read_json_body(self)
+                if body:
+                    update_notification_settings(body)
+                message = "这是一条上游倍率与余额监控测试消息。"
+                ok, error_message = send_qq_message("上游监控 QQ 测试", message)
+                return json_response(self, {"success": ok, "message": error_message or "测试消息已发送到 QQ 群"})
 
             self.send_error(HTTPStatus.NOT_FOUND)
         except Exception as exc:

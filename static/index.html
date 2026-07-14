@@ -179,10 +179,42 @@
           <div class="panel-head">
             <div>
               <h2>消息推送</h2>
-              <p>支持飞书、企业微信和邮箱推送，检测到改价、分组变化或低余额后自动提醒。</p>
+              <p>支持 QQ 群、飞书、企业微信和邮箱推送，检测到改价、分组变化或低余额后自动提醒。</p>
             </div>
           </div>
           <form id="notifyForm" class="notify-form">
+            <div class="form-section">
+              <div class="dialog-head">
+                <h3>QQ 群</h3>
+              </div>
+              <label class="field switch-row">
+                <span>启用 QQ 群推送</span>
+                <input id="qqEnabled" type="checkbox" />
+              </label>
+              <div class="notify-grid qq-notify-grid">
+                <label class="field">
+                  <span>机器人通知接口</span>
+                  <input id="qqApiUrl" class="input" autocomplete="off" placeholder="http://qq-monitor-bot:3100/api/notify" />
+                </label>
+                <label class="field">
+                  <span>通知群号</span>
+                  <input id="qqGroupId" class="input" inputmode="numeric" autocomplete="off" placeholder="123456789" />
+                </label>
+                <label class="field qq-token-field">
+                  <span>通知接口 Token</span>
+                  <input id="qqApiToken" class="input" type="password" autocomplete="off" placeholder="编辑时留空表示不修改" />
+                </label>
+              </div>
+              <div class="notify-footer">
+                <div>
+                  <p class="field-help">群号必须与机器人 NOTIFY_GROUP_ID 一致；“查监控”使用机器人独立配置的 QUERY_GROUP_ID。</p>
+                  <div class="notify-status" id="qqStatus">未配置</div>
+                </div>
+                <div class="dialog-actions">
+                  <button id="testQqBtn" type="button" class="btn btn-secondary">测试 QQ</button>
+                </div>
+              </div>
+            </div>
             <div class="form-section">
               <div class="dialog-head">
                 <h3>飞书</h3>

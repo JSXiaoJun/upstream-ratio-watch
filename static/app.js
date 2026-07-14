@@ -80,6 +80,12 @@ const els = {
   feishuSecret: document.getElementById('feishuSecret'),
   feishuStatus: document.getElementById('feishuStatus'),
   testFeishuBtn: document.getElementById('testFeishuBtn'),
+  qqEnabled: document.getElementById('qqEnabled'),
+  qqApiUrl: document.getElementById('qqApiUrl'),
+  qqApiToken: document.getElementById('qqApiToken'),
+  qqGroupId: document.getElementById('qqGroupId'),
+  qqStatus: document.getElementById('qqStatus'),
+  testQqBtn: document.getElementById('testQqBtn'),
   emailEnabled: document.getElementById('emailEnabled'),
   emailStatus: document.getElementById('emailStatus'),
   smtpHost: document.getElementById('smtpHost'),
@@ -423,6 +429,19 @@ function renderNotificationSettings(options = {}) {
   els.feishuStatus.textContent = feishuParts.join(' · ');
   els.feishuStatus.classList.toggle('error', !!settings.feishu_last_error);
 
+  els.qqEnabled.checked = !!settings.qq_enabled;
+  els.qqApiUrl.value = settings.qq_api_url || '';
+  els.qqApiToken.value = '';
+  els.qqGroupId.value = settings.qq_group_id || '';
+  const qqParts = [];
+  qqParts.push(settings.qq_enabled ? 'QQ 群推送已启用' : 'QQ 群推送未启用');
+  if (settings.qq_has_api_token) qqParts.push('接口 Token 已保存');
+  if (settings.qq_group_id) qqParts.push(`通知群：${settings.qq_group_id}`);
+  if (settings.qq_last_sent_at) qqParts.push(`上次发送：${fmtTime(settings.qq_last_sent_at)}`);
+  if (settings.qq_last_error) qqParts.push(`错误：${settings.qq_last_error}`);
+  els.qqStatus.textContent = qqParts.join(' · ');
+  els.qqStatus.classList.toggle('error', !!settings.qq_last_error);
+
   els.emailEnabled.checked = !!settings.email_enabled;
   els.smtpHost.value = settings.smtp_host || '';
   els.smtpPort.value = settings.smtp_port || 465;
@@ -665,6 +684,10 @@ function notificationPayload() {
     feishu_enabled: els.feishuEnabled.checked,
     feishu_webhook: els.feishuWebhook.value.trim(),
     feishu_secret: els.feishuSecret.value.trim(),
+    qq_enabled: els.qqEnabled.checked,
+    qq_api_url: els.qqApiUrl.value.trim(),
+    qq_api_token: els.qqApiToken.value.trim(),
+    qq_group_id: els.qqGroupId.value.trim(),
     email_enabled: els.emailEnabled.checked,
     smtp_host: els.smtpHost.value.trim(),
     smtp_port: Math.max(1, Number(els.smtpPort.value || 465)),
@@ -1041,6 +1064,23 @@ els.testFeishuBtn.addEventListener('click', async () => {
   } catch (err) {
     els.feishuStatus.textContent = `测试失败：${err.message}`;
     els.feishuStatus.classList.add('error');
+  }
+});
+
+els.testQqBtn.addEventListener('click', async () => {
+  els.qqStatus.textContent = '测试 QQ 群发送中...';
+  els.qqStatus.classList.remove('error');
+  try {
+    const res = await api('/api/notifications/test-qq', {
+      method: 'POST',
+      body: JSON.stringify(notificationPayload()),
+    });
+    els.qqStatus.textContent = res.message || '测试完成';
+    state.notificationDirty = false;
+    await refreshAll();
+  } catch (err) {
+    els.qqStatus.textContent = `测试失败：${err.message}`;
+    els.qqStatus.classList.add('error');
   }
 });
 

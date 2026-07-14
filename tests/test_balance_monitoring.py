@@ -1,5 +1,6 @@
 import json
 import gc
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -15,6 +16,8 @@ class MockUpstreamHandler(BaseHTTPRequestHandler):
     newapi_quota = 4_000_000
     sub2api_balance = 3.5
     last_feishu_payload = None
+    last_qq_payload = None
+    last_qq_authorization = None
 
     def log_message(self, *_args):
         pass
@@ -55,6 +58,11 @@ class MockUpstreamHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
             self.__class__.last_feishu_payload = json.loads(self.rfile.read(length))
             self.send_json({"code": 0, "msg": "success"})
+        elif self.path == "/qq-notify":
+            length = int(self.headers.get("Content-Length", "0"))
+            self.__class__.last_qq_payload = json.loads(self.rfile.read(length))
+            self.__class__.last_qq_authorization = self.headers.get("Authorization")
+            self.send_json({"success": True, "group_id": self.__class__.last_qq_payload.get("group_id"), "message_id": 42})
         else:
             self.send_json({"code": 404})
 
@@ -64,6 +72,8 @@ class BalanceMonitoringTest(unittest.TestCase):
         MockUpstreamHandler.newapi_quota = 4_000_000
         MockUpstreamHandler.sub2api_balance = 3.5
         MockUpstreamHandler.last_feishu_payload = None
+        MockUpstreamHandler.last_qq_payload = None
+        MockUpstreamHandler.last_qq_authorization = None
         self.temp_dir = tempfile.TemporaryDirectory()
         self.original_db_path = app.DB_PATH
         self.original_auth_config_path = app.AUTH_CONFIG_PATH
@@ -240,6 +250,64 @@ class BalanceMonitoringTest(unittest.TestCase):
         self.assertIn("test subject", payload["content"]["text"])
         self.assertTrue(payload["timestamp"])
         self.assertTrue(payload["sign"])
+
+    def test_qq_notification_uses_fixed_group_and_bearer_token(self):
+        app.update_notification_settings({
+            "qq_enabled": True,
+            "qq_api_url": f"{self.base_url}/qq-notify",
+            "qq_api_token": "notify-secret",
+            "qq_group_id": "123456789",
+        })
+        ok, error = app.send_qq_message("test subject", "test body")
+        self.assertTrue(ok, error)
+        self.assertEqual("Bearer notify-secret", MockUpstreamHandler.last_qq_authorization)
+        self.assertEqual({
+            "group_id": "123456789",
+            "subject": "test subject",
+            "message": "test body",
+        }, MockUpstreamHandler.last_qq_payload)
+        settings = app.notification_settings_payload()
+        self.assertTrue(settings["qq_has_api_token"])
+        self.assertNotIn("qq_api_token", settings)
+        self.assertEqual("123456789", settings["qq_group_id"])
+
+    def test_qq_notification_configuration_rejects_invalid_group(self):
+        with self.assertRaisesRegex(ValueError, "有效的 QQ 群号"):
+            app.update_notification_settings({
+                "qq_enabled": True,
+                "qq_api_url": f"{self.base_url}/qq-notify",
+                "qq_api_token": "notify-secret",
+                "qq_group_id": "not-a-group",
+            })
+
+    def test_existing_notification_database_is_migrated_for_qq(self):
+        connection = sqlite3.connect(app.DB_PATH)
+        try:
+            connection.execute("DROP TABLE notification_settings")
+            connection.execute(
+                """
+                CREATE TABLE notification_settings (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    email_enabled INTEGER NOT NULL DEFAULT 0,
+                    smtp_host TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "INSERT INTO notification_settings (id, email_enabled, smtp_host, created_at, updated_at) VALUES (1, 1, 'smtp.example.com', ?, ?)",
+                (app.utc_now_iso(), app.utc_now_iso()),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        app.init_db()
+        migrated = app.get_notification_settings()
+        self.assertEqual("smtp.example.com", migrated["smtp_host"])
+        self.assertEqual(0, migrated["qq_enabled"])
+        self.assertIn("qq_api_token", migrated)
 
 
 if __name__ == "__main__":

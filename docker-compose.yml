@@ -12,3 +12,11 @@ services:
       - "8000:8000"
     volumes:
       - ./data:/app/data
+    networks:
+      - default
+      - qq-notify
+
+networks:
+  qq-notify:
+    external: true
+    name: qq-notify
