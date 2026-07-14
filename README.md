@@ -60,6 +60,14 @@ git pull
 docker compose up -d --build
 ```
 
+更新后可在服务器核对当前运行版本：
+
+```bash
+curl http://127.0.0.1:8000/api/version
+```
+
+页面左上角产品名称下方也会显示相同版本号。
+
 如果服务器已经占用 8000 端口，可以修改 `docker-compose.yml`，把：
 
 ```yaml

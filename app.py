@@ -29,6 +29,7 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 STATIC_DIR = APP_DIR / "static"
 DB_PATH = DATA_DIR / "app.db"
+APP_VERSION = "1.2.0"
 AUTH_CONFIG_PATH = Path(os.getenv("AUTH_CONFIG_PATH") or (DATA_DIR / "auth.json"))
 AUTH_COOKIE_NAME = "upstream_watch_session"
 DEFAULT_SESSION_DAYS = 30
@@ -2187,6 +2188,7 @@ def overview_payload() -> Dict[str, Any]:
         ) or {"count": 0},
     }
     return {
+        "version": APP_VERSION,
         "stats": {
             "sites_total": totals["sites_total"],
             "sites_enabled": totals["sites_enabled"],
@@ -2278,6 +2280,8 @@ class Handler(BaseHTTPRequestHandler):
                 "username": session.get("username") if session else None,
                 "expires_at": session.get("expires_at") if session else None,
             })
+        if path == "/api/version":
+            return json_response(self, {"name": "Upstream Ratio Watch", "version": APP_VERSION})
         if path in {"/login", "/login.html"}:
             if self._auth_session():
                 return redirect_response(self, "/")

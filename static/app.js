@@ -4,6 +4,7 @@ const state = {
   siteChanges: [],
   notificationSettings: null,
   notificationDirty: false,
+  appVersion: null,
   selectedSiteId: null,
   activeView: 'overview',
   activeViewEl: null,
@@ -24,6 +25,7 @@ const els = {
   statsFailed: document.getElementById('stat-failed'),
   statsChanges: document.getElementById('stat-changes'),
   sidebarCount: document.getElementById('sidebar-count'),
+  appVersion: document.getElementById('appVersion'),
   overviewSitesBody: document.getElementById('overviewSitesBody'),
   overviewChangesBody: document.getElementById('overviewChangesBody'),
   sitesBody: document.getElementById('sitesBody'),
@@ -664,6 +666,8 @@ async function refreshAll(options = {}) {
   state.sites = sitesResp.data || [];
   state.changes = changesResp.data || [];
   state.notificationSettings = notifyResp.data || {};
+  state.appVersion = overview.version || null;
+  els.appVersion.textContent = state.appVersion ? `v${state.appVersion}` : 'v-';
   if (!state.selectedSiteId && state.sites.length) {
     state.selectedSiteId = state.sites[0].id;
   }

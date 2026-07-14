@@ -202,6 +202,10 @@ class BalanceMonitoringTest(unittest.TestCase):
         self.assertEqual(7.25, updated["balance_alert_threshold"])
 
     def test_api_requires_login_and_session_cookie_lasts_30_days(self):
+        with urllib.request.urlopen(f"{self.api_url}/api/version") as response:
+            version_payload = json.loads(response.read())
+        self.assertEqual(app.APP_VERSION, version_payload["version"])
+
         request = urllib.request.Request(f"{self.api_url}/api/sites")
         with self.assertRaises(urllib.error.HTTPError) as context:
             urllib.request.urlopen(request)
