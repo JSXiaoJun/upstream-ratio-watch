@@ -135,6 +135,7 @@ function changeTypeLabel(type) {
     ratio_changed: '倍率变化',
     group_added: '新增分组',
     group_removed: '删除分组',
+    group_renamed: '分组更名',
     desc_changed: '描述变化',
     status_changed: '状态变化',
     is_exclusive_changed: '专属变化',

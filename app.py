@@ -1007,12 +1007,113 @@ def get_last_success_snapshot(site_id: int) -> Optional[Dict[str, Any]]:
     )
 
 
+def unique_group_ids(groups: Dict[str, Dict[str, Any]]) -> Dict[str, str]:
+    result: Dict[str, str] = {}
+    duplicates = set()
+    for name, item in groups.items():
+        group_id = item.get("id") if isinstance(item, dict) else None
+        if group_id is None or not str(group_id).strip():
+            continue
+        key = str(group_id)
+        if key in result:
+            duplicates.add(key)
+        else:
+            result[key] = name
+    for key in duplicates:
+        result.pop(key, None)
+    return result
+
+
+def append_group_item_changes(
+    changes: List[Dict[str, Any]],
+    old_name: str,
+    new_name: str,
+    old_item: Dict[str, Any],
+    new_item: Dict[str, Any],
+) -> None:
+    name_changed = old_name != new_name
+    name_metadata = {
+        "old_group_name": old_name,
+        "new_group_name": new_name,
+    } if name_changed else {}
+    old_ratio = old_item.get("ratio")
+    new_ratio = new_item.get("ratio")
+
+    if old_ratio != new_ratio:
+        change_percent = None
+        if isinstance(old_ratio, (int, float)) and isinstance(new_ratio, (int, float)) and old_ratio != 0:
+            change_percent = round((float(new_ratio) - float(old_ratio)) / float(old_ratio) * 100, 2)
+        changes.append({
+            "change_type": "ratio_changed",
+            "group_name": new_name,
+            "old_value": old_item,
+            "new_value": new_item,
+            "change_percent": change_percent,
+            "message": f"{new_name} 倍率 {old_ratio} -> {new_ratio}",
+            **name_metadata,
+        })
+    elif name_changed:
+        changes.append({
+            "change_type": "group_renamed",
+            "group_name": new_name,
+            "old_value": old_name,
+            "new_value": new_name,
+            "change_percent": None,
+            "message": f"分组更名 {old_name} -> {new_name}",
+            **name_metadata,
+        })
+
+    if old_item.get("desc") != new_item.get("desc"):
+        changes.append({
+            "change_type": "desc_changed",
+            "group_name": new_name,
+            "old_value": old_item.get("desc"),
+            "new_value": new_item.get("desc"),
+            "change_percent": None,
+            "message": f"{new_name} 描述变化",
+            **name_metadata,
+        })
+    for field, label in (
+        ("status", "状态"),
+        ("is_exclusive", "专属分组"),
+        ("subscription_type", "订阅类型"),
+        ("rpm_limit", "RPM 限制"),
+        ("platform", "平台"),
+    ):
+        if field in old_item or field in new_item:
+            if old_item.get(field) != new_item.get(field):
+                changes.append({
+                    "change_type": f"{field}_changed",
+                    "group_name": new_name,
+                    "old_value": old_item.get(field),
+                    "new_value": new_item.get(field),
+                    "change_percent": None,
+                    "message": f"{new_name} {label}变化：{old_item.get(field)} -> {new_item.get(field)}",
+                    **name_metadata,
+                })
+
+
 def diff_groups(old_groups: Dict[str, Dict[str, Any]], new_groups: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
     changes: List[Dict[str, Any]] = []
-    old_names = set(old_groups.keys())
-    new_names = set(new_groups.keys())
+    old_unmatched = set(old_groups.keys())
+    new_unmatched = set(new_groups.keys())
+    matched: List[Tuple[str, str]] = []
 
-    for name in sorted(new_names - old_names):
+    old_ids = unique_group_ids(old_groups)
+    new_ids = unique_group_ids(new_groups)
+    for group_id in sorted(set(old_ids) & set(new_ids)):
+        old_name = old_ids[group_id]
+        new_name = new_ids[group_id]
+        matched.append((old_name, new_name))
+        old_unmatched.discard(old_name)
+        new_unmatched.discard(new_name)
+
+    for name in sorted(old_unmatched & new_unmatched):
+        matched.append((name, name))
+        old_unmatched.discard(name)
+        new_unmatched.discard(name)
+
+    for name in sorted(new_unmatched):
         changes.append({
             "change_type": "group_added",
             "group_name": name,
@@ -1022,7 +1123,7 @@ def diff_groups(old_groups: Dict[str, Dict[str, Any]], new_groups: Dict[str, Dic
             "message": f"新增分组 {name}",
         })
 
-    for name in sorted(old_names - new_names):
+    for name in sorted(old_unmatched):
         changes.append({
             "change_type": "group_removed",
             "group_name": name,
@@ -1032,56 +1133,14 @@ def diff_groups(old_groups: Dict[str, Dict[str, Any]], new_groups: Dict[str, Dic
             "message": f"删除分组 {name}",
         })
 
-    for name in sorted(old_names & new_names):
-        old_item = old_groups[name]
-        new_item = new_groups[name]
-        if old_item.get("ratio") != new_item.get("ratio"):
-            old_ratio = old_item.get("ratio")
-            new_ratio = new_item.get("ratio")
-            change_percent = None
-            if isinstance(old_ratio, (int, float)) and isinstance(new_ratio, (int, float)) and old_ratio != 0:
-                change_percent = round((float(new_ratio) - float(old_ratio)) / float(old_ratio) * 100, 2)
-
-            if isinstance(old_ratio, (int, float)) and isinstance(new_ratio, (int, float)):
-                message = f"{name} 倍率 {old_ratio} -> {new_ratio}"
-            else:
-                message = f"{name} 倍率 {old_ratio} -> {new_ratio}"
-
-            changes.append({
-                "change_type": "ratio_changed",
-                "group_name": name,
-                "old_value": old_item,
-                "new_value": new_item,
-                "change_percent": change_percent,
-                "message": message,
-            })
-
-        if old_item.get("desc") != new_item.get("desc"):
-            changes.append({
-                "change_type": "desc_changed",
-                "group_name": name,
-                "old_value": old_item.get("desc"),
-                "new_value": new_item.get("desc"),
-                "change_percent": None,
-                "message": f"{name} 描述变化",
-            })
-        for field, label in (
-            ("status", "状态"),
-            ("is_exclusive", "专属分组"),
-            ("subscription_type", "订阅类型"),
-            ("rpm_limit", "RPM 限制"),
-            ("platform", "平台"),
-        ):
-            if field in old_item or field in new_item:
-                if old_item.get(field) != new_item.get(field):
-                    changes.append({
-                        "change_type": f"{field}_changed",
-                        "group_name": name,
-                        "old_value": old_item.get(field),
-                        "new_value": new_item.get(field),
-                        "change_percent": None,
-                        "message": f"{name} {label}变化：{old_item.get(field)} -> {new_item.get(field)}",
-                    })
+    for old_name, new_name in sorted(matched, key=lambda pair: pair[1]):
+        append_group_item_changes(
+            changes,
+            old_name,
+            new_name,
+            old_groups[old_name],
+            new_groups[new_name],
+        )
 
     return changes
 
@@ -1507,12 +1566,16 @@ def format_change_subject(site: Dict[str, Any], changes: List[Dict[str, Any]]) -
 
     added = [item for item in changes if item.get("change_type") == "group_added"]
     removed = [item for item in changes if item.get("change_type") == "group_removed"]
+    renamed = [item for item in changes if item.get("change_type") == "group_renamed"]
     if len(added) == 1 and not removed:
         change = added[0]
         return f"【{platform} 新增分组】{site_name} / {change.get('group_name') or '-'}：{format_change_value(change.get('new_value'))}"
     if len(removed) == 1 and not added:
         change = removed[0]
         return f"【{platform} 删除分组】{site_name} / {change.get('group_name') or '-'}"
+    if len(renamed) == 1 and not added and not removed:
+        change = renamed[0]
+        return f"【{platform} 分组更名】{site_name}：{change.get('old_value')} -> {change.get('new_value')}"
     return f"【{platform} 分组变化】{site_name}：{len(changes)} 条变化"
 
 
@@ -1522,10 +1585,11 @@ def format_change_notification(site: Dict[str, Any], changes: List[Dict[str, Any
     changed_ratio = [item for item in changes if item.get("change_type") == "ratio_changed" and ratio_direction(item) == "changed"]
     added = [item for item in changes if item.get("change_type") == "group_added"]
     removed = [item for item in changes if item.get("change_type") == "group_removed"]
+    renamed = [item for item in changes if item.get("change_type") == "group_renamed"]
     desc_changed = [item for item in changes if item.get("change_type") == "desc_changed"]
     other_changed = [
         item for item in changes
-        if item.get("change_type") not in {"ratio_changed", "group_added", "group_removed", "desc_changed"}
+        if item.get("change_type") not in {"ratio_changed", "group_added", "group_removed", "group_renamed", "desc_changed"}
     ]
 
     lines = [
@@ -1564,6 +1628,11 @@ def format_change_notification(site: Dict[str, Any], changes: List[Dict[str, Any
         lines.extend(["", "分组下线了："])
         for change in removed[:6]:
             lines.append(f"- {change.get('group_name') or '-'}：原倍率 {format_change_value(change.get('old_value'))}")
+
+    if renamed:
+        lines.extend(["", "分组更名："])
+        for change in renamed[:6]:
+            lines.append(f"- {change.get('old_value')} -> {change.get('new_value')}")
 
     if desc_changed:
         lines.extend(["", "描述有变化："])
@@ -1613,7 +1682,49 @@ def filter_notification_changes(site: Dict[str, Any], changes: List[Dict[str, An
     if not selected_groups:
         return changes
     selected = set(selected_groups)
-    return [change for change in changes if str(change.get("group_name") or "") in selected]
+    filtered = []
+    for change in changes:
+        change_names = {
+            str(change.get("group_name") or ""),
+            str(change.get("old_group_name") or ""),
+            str(change.get("new_group_name") or ""),
+        }
+        if selected & change_names:
+            filtered.append(change)
+    return filtered
+
+
+def remap_notification_group_names(site: Dict[str, Any], changes: List[Dict[str, Any]]) -> Dict[str, Any]:
+    selected_groups = notification_groups_for_site(site)
+    if not selected_groups:
+        return site
+    rename_map = {
+        str(change.get("old_group_name")): str(change.get("new_group_name"))
+        for change in changes
+        if change.get("old_group_name") and change.get("new_group_name")
+        and change.get("old_group_name") != change.get("new_group_name")
+    }
+    if not rename_map:
+        return site
+
+    updated_groups: List[str] = []
+    seen = set()
+    for name in selected_groups:
+        updated_name = rename_map.get(name, name)
+        if updated_name not in seen:
+            seen.add(updated_name)
+            updated_groups.append(updated_name)
+    if updated_groups == selected_groups:
+        return site
+
+    encoded = json.dumps(updated_groups, ensure_ascii=False)
+    db_execute(
+        "UPDATE sites SET notify_groups_json = ?, updated_at = ? WHERE id = ?",
+        (encoded, utc_now_iso(), site["id"]),
+    )
+    updated_site = dict(site)
+    updated_site["notify_groups_json"] = encoded
+    return updated_site
 
 
 def notify_changes(site: Dict[str, Any], changes: List[Dict[str, Any]], checked_at: str) -> None:
@@ -1793,7 +1904,8 @@ def detect_site(site_id: int) -> Dict[str, Any]:
         )
         change["severity"] = severity
 
-    notify_changes(site, filter_notification_changes(site, changes), checked_at)
+    notification_site = remap_notification_group_names(site, changes)
+    notify_changes(notification_site, filter_notification_changes(notification_site, changes), checked_at)
 
     balance_attempted = False
     balance_info: Optional[Dict[str, Any]] = None

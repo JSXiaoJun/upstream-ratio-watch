@@ -237,6 +237,56 @@ class BalanceMonitoringTest(unittest.TestCase):
         self.assertEqual([changes[0], changes[2]], filtered)
         self.assertEqual(changes, app.filter_notification_changes({"notify_groups_json": None}, changes))
 
+    def test_sub2api_group_name_ratio_change_is_matched_by_stable_id(self):
+        old_groups = {
+            "Codex - 0.02x（福利低价）": {
+                "id": 7,
+                "ratio": 0.02,
+                "ratio_type": "number",
+                "desc": "",
+            },
+        }
+        new_groups = {
+            "Codex - 0.015x（福利低价）": {
+                "id": 7,
+                "ratio": 0.015,
+                "ratio_type": "number",
+                "desc": "",
+            },
+        }
+        changes = app.diff_groups(old_groups, new_groups)
+        self.assertEqual(1, len(changes))
+        self.assertEqual("ratio_changed", changes[0]["change_type"])
+        self.assertEqual("Codex - 0.015x（福利低价）", changes[0]["group_name"])
+        self.assertEqual("Codex - 0.02x（福利低价）", changes[0]["old_group_name"])
+        self.assertEqual(-25.0, changes[0]["change_percent"])
+
+    def test_sub2api_group_pure_rename_is_not_add_and_remove(self):
+        old_groups = {"旧名称": {"id": 9, "ratio": 1, "desc": ""}}
+        new_groups = {"新名称": {"id": 9, "ratio": 1, "desc": ""}}
+        changes = app.diff_groups(old_groups, new_groups)
+        self.assertEqual(["group_renamed"], [change["change_type"] for change in changes])
+        self.assertEqual("旧名称", changes[0]["old_value"])
+        self.assertEqual("新名称", changes[0]["new_value"])
+
+    def test_group_rename_keeps_selected_notification_scope(self):
+        site_id = self.add_site("sub2api", 5)
+        app.db_execute(
+            "UPDATE sites SET notify_groups_json = ? WHERE id = ?",
+            (json.dumps(["Codex - 0.02x（福利低价）"]), site_id),
+        )
+        site = app.db_query_one("SELECT * FROM sites WHERE id = ?", (site_id,))
+        changes = [{
+            "change_type": "ratio_changed",
+            "group_name": "Codex - 0.015x（福利低价）",
+            "old_group_name": "Codex - 0.02x（福利低价）",
+            "new_group_name": "Codex - 0.015x（福利低价）",
+        }]
+        updated_site = app.remap_notification_group_names(site, changes)
+        self.assertEqual(changes, app.filter_notification_changes(updated_site, changes))
+        stored = app.db_query_one("SELECT notify_groups_json FROM sites WHERE id = ?", (site_id,))
+        self.assertEqual(["Codex - 0.015x（福利低价）"], json.loads(stored["notify_groups_json"]))
+
     def test_feishu_webhook_supports_signature(self):
         app.update_notification_settings({
             "feishu_enabled": True,
