@@ -68,6 +68,15 @@ curl http://127.0.0.1:8000/api/version
 
 页面左上角产品名称下方也会显示相同版本号。
 
+QQ 机器人可通过共享 Docker 网络查询全部站点的最近余额：
+
+```text
+GET http://upstream-ratio-watch:8000/api/bot/balances
+Authorization: Bearer <QQ通知接口Token>
+```
+
+接口只返回监控面板已经采集并保存的余额，不会主动触发站点检测。
+
 如果服务器已经占用 8000 端口，可以修改 `docker-compose.yml`，把：
 
 ```yaml

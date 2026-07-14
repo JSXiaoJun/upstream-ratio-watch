@@ -334,6 +334,35 @@ class BalanceMonitoringTest(unittest.TestCase):
                 "qq_group_id": "not-a-group",
             })
 
+    def test_bot_balance_api_requires_notification_token(self):
+        site_id = self.add_site("sub2api", 5)
+        app.db_execute(
+            "UPDATE sites SET name = ?, current_balance = ?, balance_currency = ?, balance_last_check_at = ? WHERE id = ?",
+            ("余额测试站", 12.34, "USD", app.utc_now_iso(), site_id),
+        )
+        app.update_notification_settings({
+            "qq_enabled": True,
+            "qq_api_url": f"{self.base_url}/qq-notify",
+            "qq_api_token": "balance-secret",
+            "qq_group_id": "123456789",
+        })
+
+        unauthorized = urllib.request.Request(f"{self.api_url}/api/bot/balances")
+        with self.assertRaises(urllib.error.HTTPError) as context:
+            urllib.request.urlopen(unauthorized)
+        self.assertEqual(401, context.exception.code)
+
+        authorized = urllib.request.Request(
+            f"{self.api_url}/api/bot/balances",
+            headers={"Authorization": "Bearer balance-secret"},
+        )
+        with urllib.request.urlopen(authorized) as response:
+            payload = json.loads(response.read())
+        self.assertTrue(payload["success"])
+        balance_site = next(item for item in payload["data"] if item["name"] == "余额测试站")
+        self.assertEqual(12.34, balance_site["current_balance"])
+        self.assertEqual("USD", balance_site["balance_currency"])
+
     def test_existing_notification_database_is_migrated_for_qq(self):
         connection = sqlite3.connect(app.DB_PATH)
         try:

@@ -29,7 +29,7 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 STATIC_DIR = APP_DIR / "static"
 DB_PATH = DATA_DIR / "app.db"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 AUTH_CONFIG_PATH = Path(os.getenv("AUTH_CONFIG_PATH") or (DATA_DIR / "auth.json"))
 AUTH_COOKIE_NAME = "upstream_watch_session"
 DEFAULT_SESSION_DAYS = 30
@@ -1196,6 +1196,25 @@ def notification_settings_payload() -> Dict[str, Any]:
     }
 
 
+def notification_bearer_token_matches(authorization: Any) -> bool:
+    settings = get_notification_settings()
+    expected = str(settings.get("qq_api_token") or "").strip()
+    header = str(authorization or "").strip()
+    supplied = header[7:].strip() if header.startswith("Bearer ") else ""
+    return bool(expected and supplied and hmac.compare_digest(expected, supplied))
+
+
+def bot_balance_payload() -> List[Dict[str, Any]]:
+    return db_query_all(
+        """
+        SELECT name, current_balance, balance_currency, balance_last_error,
+               balance_last_check_at, enabled, status
+        FROM sites
+        ORDER BY id ASC
+        """
+    )
+
+
 def update_notification_settings(body: Dict[str, Any]) -> None:
     settings = get_notification_settings()
     wecom_enabled = bool(body.get("wecom_enabled", False))
@@ -2282,6 +2301,10 @@ class Handler(BaseHTTPRequestHandler):
             })
         if path == "/api/version":
             return json_response(self, {"name": "Upstream Ratio Watch", "version": APP_VERSION})
+        if path == "/api/bot/balances":
+            if not notification_bearer_token_matches(self.headers.get("Authorization")):
+                return json_response(self, {"success": False, "message": "机器人接口鉴权失败"}, 401)
+            return json_response(self, {"success": True, "data": bot_balance_payload()})
         if path in {"/login", "/login.html"}:
             if self._auth_session():
                 return redirect_response(self, "/")
