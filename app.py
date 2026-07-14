@@ -29,7 +29,7 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 STATIC_DIR = APP_DIR / "static"
 DB_PATH = DATA_DIR / "app.db"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 AUTH_CONFIG_PATH = Path(os.getenv("AUTH_CONFIG_PATH") or (DATA_DIR / "auth.json"))
 AUTH_COOKIE_NAME = "upstream_watch_session"
 DEFAULT_SESSION_DAYS = 30
@@ -1523,7 +1523,8 @@ def format_change_value(raw: Any) -> str:
     if isinstance(raw, dict) and "ratio" in raw:
         ratio = raw.get("ratio")
         try:
-            return f"{float(ratio):.2f}x"
+            text = f"{float(ratio):.8f}".rstrip("0").rstrip(".")
+            return f"{text or '0'}x"
         except Exception:
             return str(ratio)
     return str(raw)

@@ -264,6 +264,8 @@ class BalanceMonitoringTest(unittest.TestCase):
         self.assertEqual("Codex - 0.015x（福利低价）", changes[0]["group_name"])
         self.assertEqual("Codex - 0.02x（福利低价）", changes[0]["old_group_name"])
         self.assertEqual(-25.0, changes[0]["change_percent"])
+        self.assertEqual("0.02x", app.format_change_value(changes[0]["old_value"]))
+        self.assertEqual("0.015x", app.format_change_value(changes[0]["new_value"]))
 
     def test_sub2api_group_pure_rename_is_not_add_and_remove(self):
         old_groups = {"旧名称": {"id": 9, "ratio": 1, "desc": ""}}

@@ -155,7 +155,10 @@ function ratioLabel(item) {
   const ratio = item.ratio;
   if (item.ratio_type === 'text') return `${ratio}`;
   const n = Number(ratio);
-  if (Number.isFinite(n)) return `${n.toFixed(2)}x`;
+  if (Number.isFinite(n)) {
+    const text = n.toFixed(8).replace(/0+$/, '').replace(/\.$/, '');
+    return `${text || '0'}x`;
+  }
   return `${ratio}`;
 }
 
