@@ -30,7 +30,7 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 STATIC_DIR = APP_DIR / "static"
 DB_PATH = DATA_DIR / "app.db"
-APP_VERSION = "1.6.1"
+APP_VERSION = "1.7.0"
 AUTH_CONFIG_PATH = Path(os.getenv("AUTH_CONFIG_PATH") or (DATA_DIR / "auth.json"))
 AUTH_COOKIE_NAME = "upstream_watch_session"
 DEFAULT_SESSION_DAYS = 30
@@ -876,6 +876,132 @@ def fetch_newapi_balance(base_url: str, access_token: str, user_id: str = "") ->
     return True, balance, None
 
 
+def fetch_newapi_today_usage(
+    base_url: str,
+    access_token: str,
+    user_id: str,
+    start_timestamp: int,
+    end_timestamp: int,
+) -> Tuple[bool, Dict[str, Any], Optional[str]]:
+    token = (access_token or "").strip()
+    user_id = str(user_id or "").strip()
+    if not token or not user_id:
+        return False, {}, "今日消耗查询需要系统访问令牌和用户 ID"
+    headers = {
+        "Authorization": token,
+        "New-Api-User": user_id,
+    }
+    url = (
+        f"{normalize_base_url(base_url)}/api/log/self/stat"
+        f"?start_timestamp={int(start_timestamp)}&end_timestamp={int(end_timestamp)}"
+    )
+    ok, payload, error = request_json(url, headers=headers)
+    if not ok or not isinstance(payload, dict):
+        return False, payload if isinstance(payload, dict) else {"raw": payload}, error or "今日消耗请求失败"
+    if payload.get("success") is False:
+        return False, payload, str(payload.get("message") or "今日消耗响应 success=false")
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return False, payload, "今日消耗响应缺少 data"
+    try:
+        quota = float(data.get("quota"))
+    except (TypeError, ValueError):
+        return False, payload, "今日消耗响应缺少有效 quota"
+
+    quota_per_unit = 500000.0
+    status_ok, status_payload, _ = request_json(f"{normalize_base_url(base_url)}/api/status")
+    detected_unit = find_quota_per_unit(status_payload) if status_ok else None
+    if detected_unit:
+        quota_per_unit = detected_unit
+    amount = quota / quota_per_unit
+    if not math.isfinite(amount):
+        return False, payload, "今日消耗换算失败"
+    return True, {
+        "amount": amount,
+        "currency": "USD",
+        "source": "/api/log/self/stat",
+        "raw_quota": quota,
+        "quota_per_unit": quota_per_unit,
+    }, None
+
+
+def fetch_sub2api_today_usage_by_token(base_url: str, access_token: str) -> Tuple[bool, Dict[str, Any], Optional[str]]:
+    token = (access_token or "").strip()
+    if not token:
+        return False, {}, "sub2api 访问令牌为空"
+    ok, payload, error = request_json(
+        f"{normalize_base_url(base_url)}/api/v1/usage/dashboard/stats",
+        headers=sub2api_token_headers(token),
+    )
+    if not ok:
+        return False, payload if isinstance(payload, dict) else {"raw": payload}, error or "今日消耗请求失败"
+    success, data, message = unwrap_sub2api_response(payload)
+    if not success or not isinstance(data, dict):
+        return False, payload if isinstance(payload, dict) else {"raw": payload}, message or "今日消耗响应无效"
+    try:
+        amount = float(data.get("today_actual_cost"))
+    except (TypeError, ValueError):
+        return False, payload, "今日消耗响应缺少有效 today_actual_cost"
+    if not math.isfinite(amount):
+        return False, payload, "今日消耗响应无效"
+    return True, {
+        "amount": amount,
+        "currency": "USD",
+        "source": "/api/v1/usage/dashboard/stats",
+    }, None
+
+
+def fetch_sub2api_today_usage(site: Dict[str, Any]) -> Tuple[bool, Dict[str, Any], Optional[str]]:
+    mode = str(site.get("auth_mode") or "password").strip().lower()
+    if mode != "token":
+        login_ok, token, login_payload, login_error = sub2api_login(
+            site["base_url"],
+            site.get("login_username") or "",
+            site.get("login_password") or "",
+        )
+        if not login_ok:
+            return False, {"login": login_payload}, login_error or "登录失败"
+        return fetch_sub2api_today_usage_by_token(site["base_url"], token)
+
+    access_token = str(site.get("access_token") or "").strip()
+    refresh_token = str(site.get("refresh_token") or "").strip()
+    should_refresh = bool(refresh_token and sub2api_token_refresh_due(site.get("token_expires_at")))
+    refresh_ok = False
+    refreshed: Dict[str, Any] = {}
+    refresh_error: Optional[str] = None
+    if should_refresh:
+        refresh_ok, refreshed, refresh_error = sub2api_refresh_token(site["base_url"], refresh_token)
+        if not refresh_ok:
+            ok, payload, error = fetch_sub2api_today_usage_by_token(site["base_url"], access_token)
+            if ok:
+                return ok, payload, error
+            return False, {"usage": payload, "refresh": refreshed}, refresh_error or error or "登录态刷新失败"
+    else:
+        ok, payload, error = fetch_sub2api_today_usage_by_token(site["base_url"], access_token)
+        if ok or not refresh_token or not is_sub2api_auth_error(payload, error):
+            return ok, payload, error
+        refresh_ok, refreshed, refresh_error = sub2api_refresh_token(site["base_url"], refresh_token)
+
+    if not refresh_ok:
+        return False, {"refresh": refreshed}, refresh_error or "登录态刷新失败"
+    new_access_token = str(refreshed.get("access_token") or "").strip()
+    if not new_access_token:
+        return False, {"refresh": refreshed}, "刷新成功但没有返回 access_token"
+    auth = refreshed_auth_payload(refreshed, refresh_token)
+    db_execute(
+        """
+        UPDATE sites
+        SET access_token = ?, refresh_token = ?, token_expires_at = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (
+            auth["access_token"], auth["refresh_token"], auth["token_expires_at"],
+            utc_now_iso(), site["id"],
+        ),
+    )
+    return fetch_sub2api_today_usage_by_token(site["base_url"], new_access_token)
+
+
 def fetch_sub2api_groups_by_token(base_url: str, access_token: str) -> Tuple[bool, Dict[str, Any], Optional[str]]:
     token = (access_token or "").strip()
     if not token:
@@ -1293,6 +1419,61 @@ def bot_balance_payload() -> List[Dict[str, Any]]:
         ORDER BY id ASC
         """
     )
+
+
+def bot_today_usage_payload() -> List[Dict[str, Any]]:
+    sites = db_query_all("SELECT * FROM sites WHERE enabled = 1 ORDER BY id ASC")
+    if not sites:
+        return []
+    now = app_now()
+    start_timestamp = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    end_timestamp = int(now.timestamp())
+
+    def inspect_site(site: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            if not site.get("login_enabled"):
+                return {
+                    "id": site["id"],
+                    "name": site["name"],
+                    "success": False,
+                    "amount": None,
+                    "currency": "USD",
+                    "error": "未启用登录检测，无法查询今日消耗",
+                }
+            if (site.get("platform") or "newapi") == "sub2api":
+                ok, usage, error = fetch_sub2api_today_usage(site)
+            else:
+                ok, usage, error = fetch_newapi_today_usage(
+                    site["base_url"],
+                    site.get("access_token") or "",
+                    site.get("access_user_id") or "",
+                    start_timestamp,
+                    end_timestamp,
+                )
+            return {
+                "id": site["id"],
+                "name": site["name"],
+                "success": ok,
+                "amount": usage.get("amount") if ok else None,
+                "currency": usage.get("currency", "USD") if ok else "USD",
+                "error": None if ok else str(error or "查询失败"),
+            }
+        except Exception as exc:
+            return {
+                "id": site["id"],
+                "name": site["name"],
+                "success": False,
+                "amount": None,
+                "currency": "USD",
+                "error": str(exc),
+            }
+
+    results: Dict[int, Dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=min(4, len(sites))) as executor:
+        futures = {executor.submit(inspect_site, site): int(site["id"]) for site in sites}
+        for future in as_completed(futures):
+            results[futures[future]] = future.result()
+    return [results[int(site["id"])] for site in sites]
 
 
 def site_detection_lock(site_id: int) -> threading.Lock:
@@ -2564,6 +2745,11 @@ class Handler(BaseHTTPRequestHandler):
                 if not notification_bearer_token_matches(self.headers.get("Authorization")):
                     return json_response(self, {"success": False, "message": "机器人接口鉴权失败"}, 401)
                 return json_response(self, {"success": True, "data": bot_live_ratio_payload()})
+
+            if path == "/api/bot/usages/today":
+                if not notification_bearer_token_matches(self.headers.get("Authorization")):
+                    return json_response(self, {"success": False, "message": "机器人接口鉴权失败"}, 401)
+                return json_response(self, {"success": True, "data": bot_today_usage_payload()})
 
             if not self._require_auth(api_request=True):
                 return

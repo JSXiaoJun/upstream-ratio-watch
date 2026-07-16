@@ -86,6 +86,15 @@ Authorization: Bearer <QQ通知接口Token>
 
 接口会立即并发检测全部启用站点，并只返回各站点在“变化通知分组”中勾选的分组；站点配置为通知全部分组时返回当前全部分组。
 
+通知群发送 `查利润` 时，机器人会调用今日消耗接口：
+
+```text
+POST http://upstream-ratio-watch:8000/api/bot/usages/today
+Authorization: Bearer <QQ通知接口Token>
+```
+
+接口会并发查询全部启用站点的今日实际消耗。NewAPI 站点使用 `/api/log/self/stat` 并按站点的 `quota_per_unit` 换算金额，sub2api 站点使用 `/api/v1/usage/dashboard/stats` 的 `today_actual_cost`。所有参与计算的站点都必须启用登录检测并配置有效登录凭据；任一站点失败时，QQ 机器人将拒绝计算不完整的利润。
+
 如果服务器已经占用 8000 端口，可以修改 `docker-compose.yml`，把：
 
 ```yaml

@@ -15,7 +15,9 @@ import app
 
 class MockUpstreamHandler(BaseHTTPRequestHandler):
     newapi_quota = 4_000_000
+    newapi_today_quota = 1_250_000
     sub2api_balance = 3.5
+    sub2api_today_cost = 1.75
     last_feishu_payload = None
     last_qq_payload = None
     last_qq_authorization = None
@@ -32,6 +34,10 @@ class MockUpstreamHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        api_index = path.find("/api/")
+        if api_index > 0:
+            path = path[api_index:]
         routes = {
             "/api/user/groups": {"success": True, "data": {"default": {"ratio": 1}}},
             "/api/user/self/groups": {"success": True, "data": {"default": {"ratio": 1}}},
@@ -40,6 +46,10 @@ class MockUpstreamHandler(BaseHTTPRequestHandler):
                 "data": {"quota": self.newapi_quota, "used_quota": 500_000},
             },
             "/api/status": {"success": True, "data": {"quota_per_unit": 500_000}},
+            "/api/log/self/stat": {
+                "success": True,
+                "data": {"quota": self.newapi_today_quota},
+            },
             "/api/v1/groups/available": {
                 "code": 0,
                 "data": [{"id": 1, "name": "default", "rate_multiplier": 1}],
@@ -49,17 +59,25 @@ class MockUpstreamHandler(BaseHTTPRequestHandler):
                 "code": 0,
                 "data": {"balance": self.sub2api_balance, "frozen_balance": 0.5},
             },
+            "/api/v1/usage/dashboard/stats": {
+                "code": 0,
+                "data": {"today_actual_cost": self.sub2api_today_cost},
+            },
         }
-        self.send_json(routes.get(self.path, {"code": 404}))
+        self.send_json(routes.get(path, {"code": 404}))
 
     def do_POST(self):
-        if self.path == "/api/v1/auth/login":
+        path = self.path
+        api_index = path.find("/api/")
+        if api_index > 0:
+            path = path[api_index:]
+        if path == "/api/v1/auth/login":
             self.send_json({"code": 0, "data": {"access_token": "mock-token"}})
-        elif self.path == "/feishu":
+        elif path == "/feishu":
             length = int(self.headers.get("Content-Length", "0"))
             self.__class__.last_feishu_payload = json.loads(self.rfile.read(length))
             self.send_json({"code": 0, "msg": "success"})
-        elif self.path == "/qq-notify":
+        elif path == "/qq-notify":
             length = int(self.headers.get("Content-Length", "0"))
             self.__class__.last_qq_payload = json.loads(self.rfile.read(length))
             self.__class__.last_qq_authorization = self.headers.get("Authorization")
@@ -71,7 +89,9 @@ class MockUpstreamHandler(BaseHTTPRequestHandler):
 class BalanceMonitoringTest(unittest.TestCase):
     def setUp(self):
         MockUpstreamHandler.newapi_quota = 4_000_000
+        MockUpstreamHandler.newapi_today_quota = 1_250_000
         MockUpstreamHandler.sub2api_balance = 3.5
+        MockUpstreamHandler.sub2api_today_cost = 1.75
         MockUpstreamHandler.last_feishu_payload = None
         MockUpstreamHandler.last_qq_payload = None
         MockUpstreamHandler.last_qq_authorization = None
@@ -540,6 +560,56 @@ class BalanceMonitoringTest(unittest.TestCase):
         self.assertEqual(["超哥", "聪明"], [site["name"] for site in payload["data"]])
         self.assertEqual(["精选分组"], [group["name"] for group in payload["data"][0]["groups"]])
         self.assertEqual(["默认分组"], [group["name"] for group in payload["data"][1]["groups"]])
+
+    def test_bot_today_usage_api_queries_all_enabled_sites(self):
+        sub2api_id = self.add_site("sub2api", 5)
+        app.db_execute("UPDATE sites SET base_url = ? WHERE id = ?", (f"{self.base_url}/sub2api", sub2api_id))
+        newapi_id = self.add_site("newapi", 5, token="system-token")
+        app.db_execute("UPDATE sites SET name = ? WHERE id = ?", ("上游A", sub2api_id))
+        app.db_execute("UPDATE sites SET name = ? WHERE id = ?", ("上游B", newapi_id))
+        app.update_notification_settings({
+            "qq_enabled": True,
+            "qq_api_url": f"{self.base_url}/qq-notify",
+            "qq_api_token": "usage-secret",
+            "qq_group_id": "123456789",
+        })
+
+        unauthorized = urllib.request.Request(
+            f"{self.api_url}/api/bot/usages/today",
+            data=b"{}",
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as context:
+            urllib.request.urlopen(unauthorized)
+        self.assertEqual(401, context.exception.code)
+
+        request = urllib.request.Request(
+            f"{self.api_url}/api/bot/usages/today",
+            data=b"{}",
+            headers={"Authorization": "Bearer usage-secret", "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request) as response:
+            payload = json.loads(response.read())
+        self.assertTrue(payload["success"])
+        self.assertEqual(["上游A", "上游B"], [site["name"] for site in payload["data"]])
+        self.assertEqual([1.75, 2.5], [site["amount"] for site in payload["data"]])
+        self.assertTrue(all(site["success"] for site in payload["data"]))
+
+    def test_today_usage_falls_back_to_valid_sub2api_token_when_proactive_refresh_fails(self):
+        site = {
+            "id": 99,
+            "base_url": self.base_url,
+            "auth_mode": "token",
+            "access_token": "still-valid-token",
+            "refresh_token": "expired-refresh-token",
+            "token_expires_at": "2020-01-01T00:00:00+08:00",
+        }
+        with patch.object(app, "sub2api_refresh_token", return_value=(False, {}, "刷新失败")):
+            ok, usage, error = app.fetch_sub2api_today_usage(site)
+        self.assertTrue(ok, error)
+        self.assertEqual(1.75, usage["amount"])
 
     def test_existing_notification_database_is_migrated_for_qq(self):
         connection = sqlite3.connect(app.DB_PATH)
