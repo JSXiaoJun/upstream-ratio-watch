@@ -77,6 +77,15 @@ Authorization: Bearer <QQ通知接口Token>
 
 接口只返回监控面板已经采集并保存的余额，不会主动触发站点检测。
 
+通知群发送 `查倍率` 时，机器人会调用实时检测接口：
+
+```text
+POST http://upstream-ratio-watch:8000/api/bot/ratios
+Authorization: Bearer <QQ通知接口Token>
+```
+
+接口会立即并发检测全部启用站点，并只返回各站点在“变化通知分组”中勾选的分组；站点配置为通知全部分组时返回当前全部分组。
+
 如果服务器已经占用 8000 端口，可以修改 `docker-compose.yml`，把：
 
 ```yaml

@@ -14,6 +14,7 @@ import time
 import traceback
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from http import HTTPStatus
@@ -29,7 +30,7 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 STATIC_DIR = APP_DIR / "static"
 DB_PATH = DATA_DIR / "app.db"
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.4.0"
 AUTH_CONFIG_PATH = Path(os.getenv("AUTH_CONFIG_PATH") or (DATA_DIR / "auth.json"))
 AUTH_COOKIE_NAME = "upstream_watch_session"
 DEFAULT_SESSION_DAYS = 30
@@ -52,6 +53,8 @@ DB_LOCK = threading.RLock()
 AUTH_LOCK = threading.RLock()
 AUTH_FAILURES: Dict[str, List[float]] = {}
 STOP_EVENT = threading.Event()
+SITE_DETECTION_LOCKS_LOCK = threading.Lock()
+SITE_DETECTION_LOCKS: Dict[int, threading.Lock] = {}
 
 
 def app_now() -> datetime:
@@ -1215,6 +1218,63 @@ def bot_balance_payload() -> List[Dict[str, Any]]:
     )
 
 
+def site_detection_lock(site_id: int) -> threading.Lock:
+    with SITE_DETECTION_LOCKS_LOCK:
+        return SITE_DETECTION_LOCKS.setdefault(site_id, threading.Lock())
+
+
+def ratio_groups_for_site(site: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    groups = result.get("groups") if isinstance(result.get("groups"), dict) else {}
+    login_groups = result.get("login_groups") if isinstance(result.get("login_groups"), dict) else {}
+    if site.get("login_enabled") and login_groups:
+        return login_groups
+    return groups
+
+
+def bot_live_ratio_payload() -> List[Dict[str, Any]]:
+    sites = db_query_all("SELECT * FROM sites WHERE enabled = 1 ORDER BY id ASC")
+    if not sites:
+        return []
+
+    def inspect_site(site: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            result = detect_site(int(site["id"]))
+            refreshed_site = db_query_one("SELECT * FROM sites WHERE id = ?", (site["id"],)) or site
+            groups = ratio_groups_for_site(refreshed_site, result)
+            selected = notification_groups_for_site(refreshed_site)
+            names = selected if selected else sorted(groups.keys())
+            selected_groups = []
+            for name in names:
+                item = groups.get(name)
+                selected_groups.append({
+                    "name": name,
+                    "ratio": item.get("ratio") if isinstance(item, dict) else None,
+                    "available": isinstance(item, dict),
+                })
+            return {
+                "id": site["id"],
+                "name": site["name"],
+                "success": bool(result.get("success")) and bool(groups),
+                "error": None if result.get("success") else str(result.get("message") or "检测失败"),
+                "groups": selected_groups,
+            }
+        except Exception as exc:
+            return {
+                "id": site["id"],
+                "name": site["name"],
+                "success": False,
+                "error": str(exc),
+                "groups": [],
+            }
+
+    results: Dict[int, Dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=min(4, len(sites))) as executor:
+        futures = {executor.submit(inspect_site, site): int(site["id"]) for site in sites}
+        for future in as_completed(futures):
+            results[futures[future]] = future.result()
+    return [results[int(site["id"])] for site in sites]
+
+
 def update_notification_settings(body: Dict[str, Any]) -> None:
     settings = get_notification_settings()
     wecom_enabled = bool(body.get("wecom_enabled", False))
@@ -1816,6 +1876,11 @@ def collect_site_groups(site: Dict[str, Any]) -> Tuple[bool, Dict[str, Dict[str,
 
 
 def detect_site(site_id: int) -> Dict[str, Any]:
+    with site_detection_lock(site_id):
+        return _detect_site(site_id)
+
+
+def _detect_site(site_id: int) -> Dict[str, Any]:
     site = db_query_one("SELECT * FROM sites WHERE id = ?", (site_id,))
     if not site:
         return {"success": False, "message": "site not found"}
@@ -2384,6 +2449,11 @@ class Handler(BaseHTTPRequestHandler):
                     {"success": True},
                     headers={"Set-Cookie": session_cookie_header(self, "", 0)},
                 )
+
+            if path == "/api/bot/ratios":
+                if not notification_bearer_token_matches(self.headers.get("Authorization")):
+                    return json_response(self, {"success": False, "message": "机器人接口鉴权失败"}, 401)
+                return json_response(self, {"success": True, "data": bot_live_ratio_payload()})
 
             if not self._require_auth(api_request=True):
                 return

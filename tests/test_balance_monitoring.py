@@ -8,6 +8,7 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 import app
 
@@ -364,6 +365,48 @@ class BalanceMonitoringTest(unittest.TestCase):
         balance_site = next(item for item in payload["data"] if item["name"] == "余额测试站")
         self.assertEqual(12.34, balance_site["current_balance"])
         self.assertEqual("USD", balance_site["balance_currency"])
+
+    def test_bot_ratio_api_detects_live_and_filters_selected_groups(self):
+        first_id = self.add_site("sub2api", 5)
+        app.db_execute("UPDATE sites SET base_url = ? WHERE id = ?", (f"{self.base_url}/first", first_id))
+        second_id = self.add_site("newapi", 5, token="system-token")
+        app.db_execute(
+            "UPDATE sites SET name = ?, notify_groups_json = ? WHERE id = ?",
+            ("超哥", json.dumps(["精选分组"]), first_id),
+        )
+        app.db_execute(
+            "UPDATE sites SET name = ?, notify_groups_json = NULL WHERE id = ?",
+            ("聪明", second_id),
+        )
+        app.update_notification_settings({
+            "qq_enabled": True,
+            "qq_api_url": f"{self.base_url}/qq-notify",
+            "qq_api_token": "ratio-secret",
+            "qq_group_id": "123456789",
+        })
+
+        def fake_detect(site_id):
+            groups = {
+                "精选分组": {"ratio": 0.001},
+                "其他分组": {"ratio": 0.002},
+            } if site_id == first_id else {
+                "默认分组": {"ratio": 0.003},
+            }
+            return {"success": True, "message": "ok", "groups": groups, "login_groups": {}}
+
+        request = urllib.request.Request(
+            f"{self.api_url}/api/bot/ratios",
+            data=b"{}",
+            headers={"Authorization": "Bearer ratio-secret", "Content-Type": "application/json"},
+            method="POST",
+        )
+        with patch.object(app, "detect_site", side_effect=fake_detect):
+            with urllib.request.urlopen(request) as response:
+                payload = json.loads(response.read())
+        self.assertTrue(payload["success"])
+        self.assertEqual(["超哥", "聪明"], [site["name"] for site in payload["data"]])
+        self.assertEqual(["精选分组"], [group["name"] for group in payload["data"][0]["groups"]])
+        self.assertEqual(["默认分组"], [group["name"] for group in payload["data"][1]["groups"]])
 
     def test_existing_notification_database_is_migrated_for_qq(self):
         connection = sqlite3.connect(app.DB_PATH)
