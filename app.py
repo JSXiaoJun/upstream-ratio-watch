@@ -30,7 +30,7 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 STATIC_DIR = APP_DIR / "static"
 DB_PATH = DATA_DIR / "app.db"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 AUTH_CONFIG_PATH = Path(os.getenv("AUTH_CONFIG_PATH") or (DATA_DIR / "auth.json"))
 AUTH_COOKIE_NAME = "upstream_watch_session"
 DEFAULT_SESSION_DAYS = 30
@@ -682,6 +682,10 @@ def request_json(url: str, headers: Optional[Dict[str, str]] = None, payload: Op
 
 
 def is_sub2api_auth_error(payload: Any, error: Optional[str] = None) -> bool:
+    auth_markers = (
+        "unauthorized", "forbidden", "token", "jwt", "auth",
+        "未授权", "无权限", "令牌", "登录", "凭证", "认证", "过期", "失效",
+    )
     if isinstance(payload, dict):
         if isinstance(payload.get("groups"), dict) and is_sub2api_auth_error(payload["groups"], error):
             return True
@@ -691,11 +695,56 @@ def is_sub2api_auth_error(payload: Any, error: Optional[str] = None) -> bool:
         raw = str(payload.get("raw") or "")
         message = str(payload.get("message") or payload.get("error") or "")
         code = str(payload.get("code") or "")
-        if status in {401, 403}:
+        if str(status) in {"401", "403"} or code in {"401", "403"}:
             return True
-        text = f"{raw} {message} {code}".lower()
-        return any(word in text for word in ("unauthorized", "forbidden", "token", "jwt", "auth"))
-    return bool(error and error.startswith(("HTTP 401", "HTTP 403")))
+        text = f"{raw} {message} {code} {error or ''}".lower()
+        return any(word in text for word in auth_markers)
+    error_text = str(error or "").lower()
+    return error_text.startswith(("http 401", "http 403")) or any(word in error_text for word in auth_markers)
+
+
+def parse_token_expiry(value: Any) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        timestamp = float(text)
+        if timestamp > 10_000_000_000:
+            timestamp /= 1000
+        return datetime.fromtimestamp(timestamp, timezone.utc)
+    except (TypeError, ValueError, OSError, OverflowError):
+        pass
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return parsed.replace(tzinfo=APP_TIMEZONE) if parsed.tzinfo is None else parsed
+    except ValueError:
+        return None
+
+
+def sub2api_token_refresh_due(token_expires_at: Any, leeway_seconds: int = 300) -> bool:
+    expires_at = parse_token_expiry(token_expires_at)
+    return bool(expires_at and expires_at <= app_now() + timedelta(seconds=leeway_seconds))
+
+
+def refreshed_token_expiry(data: Dict[str, Any]) -> Optional[str]:
+    expires_in = data.get("expires_in")
+    try:
+        if expires_in is not None:
+            return (app_now() + timedelta(seconds=int(expires_in))).isoformat(timespec="seconds")
+    except (TypeError, ValueError, OverflowError):
+        pass
+    explicit = data.get("token_expires_at") or data.get("expires_at")
+    parsed = parse_token_expiry(explicit)
+    return parsed.astimezone(APP_TIMEZONE).isoformat(timespec="seconds") if parsed else None
+
+
+def refreshed_auth_payload(data: Dict[str, Any], fallback_refresh_token: str) -> Dict[str, Any]:
+    return {
+        "access_token": str(data.get("access_token") or "").strip(),
+        "refresh_token": str(data.get("refresh_token") or fallback_refresh_token).strip(),
+        "expires_in": data.get("expires_in"),
+        "token_expires_at": refreshed_token_expiry(data),
+    }
 
 
 def unwrap_sub2api_response(payload: Any) -> Tuple[bool, Any, Optional[str]]:
@@ -887,12 +936,33 @@ def fetch_sub2api_user_groups(
     auth_mode: str = "password",
     access_token: str = "",
     refresh_token: str = "",
+    token_expires_at: Any = None,
 ) -> Tuple[bool, Dict[str, Any], Optional[str]]:
     mode = (auth_mode or "password").strip().lower()
     if mode == "token":
+        refresh_attempted = False
+        refresh_failure: Optional[str] = None
+        refresh_payload: Dict[str, Any] = {}
+        if refresh_token and sub2api_token_refresh_due(token_expires_at):
+            refresh_attempted = True
+            refresh_ok, refreshed, refresh_error = sub2api_refresh_token(base_url, refresh_token)
+            refresh_payload = refreshed
+            if refresh_ok:
+                new_access_token = str(refreshed.get("access_token") or "").strip()
+                if new_access_token:
+                    ok, payload, error_message = fetch_sub2api_groups_by_token(base_url, new_access_token)
+                    if isinstance(payload, dict):
+                        payload["refreshed_auth"] = refreshed_auth_payload(refreshed, refresh_token)
+                    return ok, payload, error_message
+                refresh_failure = "刷新成功但没有返回 access_token"
+            else:
+                refresh_failure = refresh_error or "登录态主动刷新失败"
+
         ok, payload, error_message = fetch_sub2api_groups_by_token(base_url, access_token)
         if ok or not refresh_token or not is_sub2api_auth_error(payload, error_message):
             return ok, payload, error_message
+        if refresh_attempted:
+            return False, {"groups": payload, "refresh": refresh_payload}, refresh_failure or error_message or "登录态刷新失败"
         refresh_ok, refreshed, refresh_error = sub2api_refresh_token(base_url, refresh_token)
         if not refresh_ok:
             return False, {"groups": payload, "refresh": refreshed}, refresh_error or error_message or "登录态刷新失败"
@@ -901,11 +971,7 @@ def fetch_sub2api_user_groups(
             return False, {"refresh": refreshed}, "刷新成功但没有返回 access_token"
         ok, payload, error_message = fetch_sub2api_groups_by_token(base_url, new_access_token)
         if isinstance(payload, dict):
-            payload["refreshed_auth"] = {
-                "access_token": new_access_token,
-                "refresh_token": str(refreshed.get("refresh_token") or refresh_token).strip(),
-                "expires_in": refreshed.get("expires_in"),
-            }
+            payload["refreshed_auth"] = refreshed_auth_payload(refreshed, refresh_token)
         return ok, payload, error_message
 
     login_ok, token, login_payload, login_error = sub2api_login(base_url, username, password)
@@ -973,6 +1039,7 @@ def probe_sub2api_groups(
     auth_mode: str = "password",
     access_token: str = "",
     refresh_token: str = "",
+    token_expires_at: Any = None,
 ) -> Dict[str, Any]:
     ok, payload, error_message = fetch_sub2api_user_groups(
         base_url,
@@ -981,22 +1048,29 @@ def probe_sub2api_groups(
         auth_mode=auth_mode,
         access_token=access_token,
         refresh_token=refresh_token,
+        token_expires_at=token_expires_at,
     )
     if not ok:
-        return {
+        result = {
             "success": False,
             "message": error_message or "request failed",
             "groups_count": 0,
             "groups": {},
             "raw": payload,
         }
+        if isinstance(payload.get("refreshed_auth"), dict):
+            result["refreshed_auth"] = payload["refreshed_auth"]
+        return result
     groups = parse_sub2api_groups(payload.get("data"), payload.get("user_rates"))
-    return {
+    result = {
         "success": True,
         "message": "ok",
         "groups_count": len(groups),
         "groups": groups,
     }
+    if isinstance(payload.get("refreshed_auth"), dict):
+        result["refreshed_auth"] = payload["refreshed_auth"]
+    return result
 
 
 def get_last_success_snapshot(site_id: int) -> Optional[Dict[str, Any]]:
@@ -1866,6 +1940,7 @@ def collect_site_groups(site: Dict[str, Any]) -> Tuple[bool, Dict[str, Dict[str,
             auth_mode=site.get("auth_mode") or "password",
             access_token=site.get("access_token") or "",
             refresh_token=site.get("refresh_token") or "",
+            token_expires_at=site.get("token_expires_at"),
         )
         groups = parse_sub2api_groups(payload.get("data"), payload.get("user_rates")) if ok else {}
         return ok, groups, payload, "/api/v1/groups/available", error_message
@@ -1888,6 +1963,14 @@ def _detect_site(site_id: int) -> Dict[str, Any]:
     checked_at = utc_now_iso()
     ok, new_groups, payload, source, error_message = collect_site_groups(site)
     latest_success = get_last_success_snapshot(site_id)
+    refreshed_auth = payload.get("refreshed_auth") if isinstance(payload, dict) else None
+    refreshed_access_token = ""
+    refreshed_refresh_token = ""
+    refreshed_expires_at = None
+    if isinstance(refreshed_auth, dict):
+        refreshed_access_token = str(refreshed_auth.get("access_token") or "").strip()
+        refreshed_refresh_token = str(refreshed_auth.get("refresh_token") or "").strip()
+        refreshed_expires_at = str(refreshed_auth.get("token_expires_at") or "").strip() or refreshed_token_expiry(refreshed_auth)
 
     if not ok:
         db_execute(
@@ -1904,10 +1987,18 @@ def _detect_site(site_id: int) -> Dict[str, Any]:
         db_execute(
             """
             UPDATE sites
-            SET status = ?, last_error = ?, last_check_at = ?, next_check_at = ?, consecutive_failures = ?, updated_at = ?
+            SET status = ?, last_error = ?, last_check_at = ?, next_check_at = ?, consecutive_failures = ?,
+                access_token = COALESCE(NULLIF(?, ''), access_token),
+                refresh_token = COALESCE(NULLIF(?, ''), refresh_token),
+                token_expires_at = COALESCE(?, token_expires_at),
+                updated_at = ?
             WHERE id = ?
             """,
-            (status, error_message, checked_at, next_check_at, consecutive_failures, checked_at, site_id),
+            (
+                status, error_message, checked_at, next_check_at, consecutive_failures,
+                refreshed_access_token, refreshed_refresh_token, refreshed_expires_at,
+                checked_at, site_id,
+            ),
         )
         return {"success": False, "message": error_message, "status": status}
 
@@ -1916,7 +2007,6 @@ def _detect_site(site_id: int) -> Dict[str, Any]:
     login_groups: Dict[str, Dict[str, Any]] = {}
     login_groups_json: Optional[str] = None
     login_error: Optional[str] = None
-    refreshed_auth = payload.get("refreshed_auth") if isinstance(payload, dict) else None
     if refreshed_auth and isinstance(payload, dict):
         payload = dict(payload)
         payload.pop("refreshed_auth", None)
@@ -2042,19 +2132,6 @@ def _detect_site(site_id: int) -> Dict[str, Any]:
 
     next_check_at = next_check_iso(int(site["interval_minutes"] or DEFAULT_INTERVAL_MINUTES))
     effective_status = "warning" if login_error or alert_active or (site.get("balance_alert_enabled") and balance_error) else "ok"
-    refreshed_access_token = ""
-    refreshed_refresh_token = ""
-    refreshed_expires_at = None
-    if isinstance(refreshed_auth, dict):
-        refreshed_access_token = str(refreshed_auth.get("access_token") or "").strip()
-        refreshed_refresh_token = str(refreshed_auth.get("refresh_token") or "").strip()
-        expires_in = refreshed_auth.get("expires_in")
-        try:
-            refreshed_expires_at = (
-                app_now() + timedelta(seconds=int(expires_in))
-            ).isoformat(timespec="seconds") if expires_in is not None else None
-        except (TypeError, ValueError):
-            refreshed_expires_at = None
     db_execute(
         """
         UPDATE sites
@@ -2472,6 +2549,7 @@ class Handler(BaseHTTPRequestHandler):
                         auth_mode=str(body.get("auth_mode") or "password").strip().lower(),
                         access_token=str(body.get("access_token") or "").strip(),
                         refresh_token=str(body.get("refresh_token") or "").strip(),
+                        token_expires_at=body.get("token_expires_at"),
                     )
                 else:
                     result = probe_newapi_groups(base_url)

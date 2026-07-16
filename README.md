@@ -235,8 +235,10 @@ token_expires_at
 字段说明：
 
 - `auth_token`：必填，监控程序访问 sub2api 用户分组接口时使用。
-- `refresh_token`：建议填写，`auth_token` 过期后程序会尝试自动刷新。
-- `token_expires_at`：可选，浏览器记录的 token 过期时间，主要用于记录和后续展示。
+- `refresh_token`：建议填写；程序会使用它自动刷新 AT，并保存上游轮换后的新 RT。
+- `token_expires_at`：建议填写浏览器记录的过期时间；程序会在到期前 5 分钟主动刷新。支持 ISO 时间、Unix 秒或 Unix 毫秒时间戳。
+
+未填写 `token_expires_at` 时，程序仍会在上游返回 AT 过期/未授权错误后尝试自动刷新。若 RT 本身也已过期，导入登录态模式无法继续自动续期，需要重新登录获取新的 AT 和 RT；账号密码模式则会在每次检测时重新登录。
 
 注意：
 

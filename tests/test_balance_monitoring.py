@@ -276,6 +276,98 @@ class BalanceMonitoringTest(unittest.TestCase):
         self.assertEqual("旧名称", changes[0]["old_value"])
         self.assertEqual("新名称", changes[0]["new_value"])
 
+    def test_sub2api_token_expiry_supports_milliseconds_and_proactive_refresh(self):
+        expired_ms = int((app.app_now() - app.timedelta(minutes=1)).timestamp() * 1000)
+        future_ms = int((app.app_now() + app.timedelta(hours=1)).timestamp() * 1000)
+        self.assertTrue(app.sub2api_token_refresh_due(expired_ms))
+        self.assertFalse(app.sub2api_token_refresh_due(future_ms))
+        self.assertTrue(app.is_sub2api_auth_error({"message": "登录已过期，请重新认证"}))
+
+        refreshed = {
+            "access_token": "new-access-token",
+            "refresh_token": "new-refresh-token",
+            "expires_in": 3600,
+        }
+        groups_payload = {"success": True, "data": []}
+        with patch.object(app, "sub2api_refresh_token", return_value=(True, refreshed, None)) as refresh_mock:
+            with patch.object(app, "fetch_sub2api_groups_by_token", return_value=(True, groups_payload, None)) as fetch_mock:
+                ok, payload, error = app.fetch_sub2api_user_groups(
+                    "https://sub2api.example",
+                    auth_mode="token",
+                    access_token="expired-access-token",
+                    refresh_token="old-refresh-token",
+                    token_expires_at=expired_ms,
+                )
+        self.assertTrue(ok, error)
+        refresh_mock.assert_called_once_with("https://sub2api.example", "old-refresh-token")
+        fetch_mock.assert_called_once_with("https://sub2api.example", "new-access-token")
+        self.assertEqual("new-refresh-token", payload["refreshed_auth"]["refresh_token"])
+        self.assertTrue(payload["refreshed_auth"]["token_expires_at"])
+
+    def test_sub2api_proactive_refresh_failure_falls_back_to_valid_access_token(self):
+        expired_at = (app.app_now() - app.timedelta(minutes=1)).isoformat()
+        groups_payload = {"success": True, "data": []}
+        with patch.object(app, "sub2api_refresh_token", return_value=(False, {"code": 401}, "RT 已过期")) as refresh_mock:
+            with patch.object(app, "fetch_sub2api_groups_by_token", return_value=(True, groups_payload, None)) as fetch_mock:
+                ok, payload, error = app.fetch_sub2api_user_groups(
+                    "https://sub2api.example",
+                    auth_mode="token",
+                    access_token="still-valid-access-token",
+                    refresh_token="expired-refresh-token",
+                    token_expires_at=expired_at,
+                )
+        self.assertTrue(ok, error)
+        self.assertIs(groups_payload, payload)
+        refresh_mock.assert_called_once()
+        fetch_mock.assert_called_once_with("https://sub2api.example", "still-valid-access-token")
+
+    def test_sub2api_chinese_expiry_error_triggers_reactive_refresh(self):
+        expired_payload = {"groups": {"code": 401, "message": "登录已过期，请重新认证"}}
+        groups_payload = {"success": True, "data": []}
+        refreshed = {"access_token": "new-access-token", "refresh_token": "rotated-refresh-token", "expires_in": 3600}
+        with patch.object(app, "sub2api_refresh_token", return_value=(True, refreshed, None)) as refresh_mock:
+            with patch.object(
+                app,
+                "fetch_sub2api_groups_by_token",
+                side_effect=[(False, expired_payload, "登录已过期"), (True, groups_payload, None)],
+            ) as fetch_mock:
+                ok, payload, error = app.fetch_sub2api_user_groups(
+                    "https://sub2api.example",
+                    auth_mode="token",
+                    access_token="expired-access-token",
+                    refresh_token="old-refresh-token",
+                )
+        self.assertTrue(ok, error)
+        self.assertEqual(2, fetch_mock.call_count)
+        refresh_mock.assert_called_once_with("https://sub2api.example", "old-refresh-token")
+        self.assertEqual("rotated-refresh-token", payload["refreshed_auth"]["refresh_token"])
+
+    def test_rotated_sub2api_tokens_are_saved_even_when_group_fetch_fails(self):
+        site_id = self.add_site("sub2api", 5, token="old-access-token")
+        app.db_execute(
+            "UPDATE sites SET refresh_token = ?, token_expires_at = ? WHERE id = ?",
+            ("old-refresh-token", app.utc_now_iso(), site_id),
+        )
+        refreshed_auth = {
+            "access_token": "new-access-token",
+            "refresh_token": "new-refresh-token",
+            "token_expires_at": (app.app_now() + app.timedelta(hours=1)).isoformat(),
+        }
+        with patch.object(
+            app,
+            "fetch_sub2api_user_groups",
+            return_value=(False, {"refreshed_auth": refreshed_auth}, "分组请求失败"),
+        ):
+            result = app.detect_site(site_id)
+        self.assertFalse(result["success"])
+        site = app.db_query_one(
+            "SELECT access_token, refresh_token, token_expires_at FROM sites WHERE id = ?",
+            (site_id,),
+        )
+        self.assertEqual("new-access-token", site["access_token"])
+        self.assertEqual("new-refresh-token", site["refresh_token"])
+        self.assertEqual(refreshed_auth["token_expires_at"], site["token_expires_at"])
+
     def test_group_rename_keeps_selected_notification_scope(self):
         site_id = self.add_site("sub2api", 5)
         app.db_execute(

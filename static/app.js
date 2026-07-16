@@ -924,8 +924,14 @@ els.testConnBtn.addEventListener('click', async () => {
         login_password: els.siteLoginPassword.value,
         access_token: els.siteSub2apiAccessToken.value.trim(),
         refresh_token: els.siteRefreshToken.value.trim(),
+        token_expires_at: els.siteTokenExpiresAt.value.trim(),
       }),
     });
+    if (res.refreshed_auth) {
+      els.siteSub2apiAccessToken.value = res.refreshed_auth.access_token || els.siteSub2apiAccessToken.value;
+      els.siteRefreshToken.value = res.refreshed_auth.refresh_token || els.siteRefreshToken.value;
+      els.siteTokenExpiresAt.value = res.refreshed_auth.token_expires_at || els.siteTokenExpiresAt.value;
+    }
     els.dialogMsg.textContent = res.success
       ? `连接成功：${res.groups_count} 个分组`
       : `失败：${res.message}`;
@@ -966,8 +972,14 @@ els.testLoginBtn.addEventListener('click', async () => {
           login_password: password,
           access_token: accessToken,
           refresh_token: refreshToken,
+          token_expires_at: els.siteTokenExpiresAt.value.trim(),
         }),
       });
+      if (res.refreshed_auth) {
+        els.siteSub2apiAccessToken.value = res.refreshed_auth.access_token || els.siteSub2apiAccessToken.value;
+        els.siteRefreshToken.value = res.refreshed_auth.refresh_token || els.siteRefreshToken.value;
+        els.siteTokenExpiresAt.value = res.refreshed_auth.token_expires_at || els.siteTokenExpiresAt.value;
+      }
       els.dialogMsg.textContent = res.success
         ? `${authMode === 'token' ? '登录态可用' : '登录成功'}：当前用户可见 ${res.groups_count} 个分组`
         : `${authMode === 'token' ? '登录态失败' : '登录失败'}：${res.message}`;
