@@ -302,7 +302,7 @@ function renderStats() {
 function renderActiveView() {
   if (state.activeView === 'overview') {
     renderStats();
-    els.overviewSitesBody.innerHTML = siteRows(state.sites.slice(0, 6));
+    els.overviewSitesBody.innerHTML = siteRows(state.sites);
     els.overviewChangesBody.innerHTML = changeRows(state.changes.slice(0, 8));
     return;
   }
@@ -385,7 +385,7 @@ function renderSites() {
     els.sitesBody.innerHTML = siteRows(filteredSites());
   }
   if (state.activeView === 'overview') {
-    els.overviewSitesBody.innerHTML = siteRows(state.sites.slice(0, 6));
+    els.overviewSitesBody.innerHTML = siteRows(state.sites);
   }
 }
 
