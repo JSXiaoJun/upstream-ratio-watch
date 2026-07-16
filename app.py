@@ -30,7 +30,7 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 STATIC_DIR = APP_DIR / "static"
 DB_PATH = DATA_DIR / "app.db"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 AUTH_CONFIG_PATH = Path(os.getenv("AUTH_CONFIG_PATH") or (DATA_DIR / "auth.json"))
 AUTH_COOKIE_NAME = "upstream_watch_session"
 DEFAULT_SESSION_DAYS = 30
@@ -289,6 +289,7 @@ def init_db() -> None:
                 access_user_id TEXT,
                 refresh_token TEXT,
                 token_expires_at TEXT,
+                auth_alert_active INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'unknown',
                 last_error TEXT,
                 last_check_at TEXT,
@@ -420,6 +421,8 @@ def init_db() -> None:
             conn.execute("ALTER TABLE sites ADD COLUMN refresh_token TEXT")
         if "token_expires_at" not in columns:
             conn.execute("ALTER TABLE sites ADD COLUMN token_expires_at TEXT")
+        if "auth_alert_active" not in columns:
+            conn.execute("ALTER TABLE sites ADD COLUMN auth_alert_active INTEGER NOT NULL DEFAULT 0")
         if "current_login_groups_json" not in columns:
             conn.execute("ALTER TABLE sites ADD COLUMN current_login_groups_json TEXT")
         if "login_last_error" not in columns:
@@ -1893,6 +1896,28 @@ def notify_changes(site: Dict[str, Any], changes: List[Dict[str, Any]], checked_
     send_qq_message(subject, message)
 
 
+def sub2api_auth_state_failed(site: Dict[str, Any], payload: Dict[str, Any], error_message: Optional[str]) -> bool:
+    if (site.get("platform") or "newapi") != "sub2api" or (site.get("auth_mode") or "password") != "token":
+        return False
+    if not is_sub2api_auth_error(payload, error_message):
+        return False
+    return not site.get("refresh_token") or "refresh" in payload or "refreshed_auth" in payload
+
+
+def notify_sub2api_auth_failure(site: Dict[str, Any], error_message: Optional[str], checked_at: str) -> Tuple[bool, Optional[str]]:
+    subject = f"【{site['name']}】登录状态失效"
+    message = "\n".join([
+        subject,
+        f"站点：{site['name']}",
+        f"地址：{site['base_url']}",
+        "状态：AT 已失效，自动刷新未能恢复监控",
+        f"错误：{error_message or '登录态刷新失败'}",
+        f"时间：{fmt_local_time_for_message(checked_at)}",
+        "请重新登录 sub2api，并更新 AT、RT 和 token_expires_at。",
+    ])
+    return send_qq_message(subject, message)
+
+
 def format_balance_amount(amount: float, currency: str = "USD") -> str:
     symbol = "$" if currency == "USD" else f"{currency} "
     return f"{symbol}{amount:.2f}"
@@ -1984,6 +2009,11 @@ def _detect_site(site_id: int) -> Dict[str, Any]:
         consecutive_failures = int(site["consecutive_failures"] or 0) + 1
         status = "failed" if consecutive_failures >= 3 else "warning"
         next_check_at = next_check_iso(int(site["interval_minutes"] or DEFAULT_INTERVAL_MINUTES))
+        auth_alert_active = bool(site.get("auth_alert_active"))
+        if sub2api_auth_state_failed(site, payload, error_message) and not auth_alert_active:
+            notification_ok, _ = notify_sub2api_auth_failure(site, error_message, checked_at)
+            if notification_ok:
+                auth_alert_active = True
         db_execute(
             """
             UPDATE sites
@@ -1991,13 +2021,14 @@ def _detect_site(site_id: int) -> Dict[str, Any]:
                 access_token = COALESCE(NULLIF(?, ''), access_token),
                 refresh_token = COALESCE(NULLIF(?, ''), refresh_token),
                 token_expires_at = COALESCE(?, token_expires_at),
+                auth_alert_active = ?,
                 updated_at = ?
             WHERE id = ?
             """,
             (
                 status, error_message, checked_at, next_check_at, consecutive_failures,
                 refreshed_access_token, refreshed_refresh_token, refreshed_expires_at,
-                checked_at, site_id,
+                1 if auth_alert_active else 0, checked_at, site_id,
             ),
         )
         return {"success": False, "message": error_message, "status": status}
@@ -2147,6 +2178,7 @@ def _detect_site(site_id: int) -> Dict[str, Any]:
             access_token = COALESCE(NULLIF(?, ''), access_token),
             refresh_token = COALESCE(NULLIF(?, ''), refresh_token),
             token_expires_at = COALESCE(?, token_expires_at),
+            auth_alert_active = 0,
             current_balance = COALESCE(?, current_balance),
             balance_currency = COALESCE(?, balance_currency),
             balance_last_error = CASE WHEN ? = 1 THEN ? ELSE balance_last_error END,
@@ -2312,6 +2344,7 @@ def site_summary(site: Dict[str, Any]) -> Dict[str, Any]:
         "has_access_token": bool(site.get("access_token")),
         "has_refresh_token": bool(site.get("refresh_token")),
         "token_expires_at": site.get("token_expires_at") or "",
+        "auth_alert_active": bool(site.get("auth_alert_active")),
         "access_user_id": site.get("access_user_id") or "",
         "login_last_error": site.get("login_last_error"),
         "login_last_check_at": site.get("login_last_check_at"),
@@ -2769,6 +2802,7 @@ class Handler(BaseHTTPRequestHandler):
                 fields.append("auth_mode = ?")
                 params.append(auth_mode if target_platform == "sub2api" else "password")
                 if target_platform == "sub2api":
+                    fields.append("auth_alert_active = 0")
                     if auth_mode == "password" and login_username:
                         fields.append("login_username = ?")
                         params.append(login_username)

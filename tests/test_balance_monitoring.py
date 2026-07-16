@@ -368,6 +368,47 @@ class BalanceMonitoringTest(unittest.TestCase):
         self.assertEqual("new-refresh-token", site["refresh_token"])
         self.assertEqual(refreshed_auth["token_expires_at"], site["token_expires_at"])
 
+    def test_sub2api_auth_failure_notifies_once_and_rearms_after_recovery(self):
+        site_id = self.add_site("sub2api", 5, token="expired-access-token")
+        app.db_execute(
+            "UPDATE sites SET name = ?, refresh_token = ? WHERE id = ?",
+            ("超哥", "expired-refresh-token", site_id),
+        )
+        auth_failure = {
+            "groups": {"groups": {"code": 401, "message": "登录已过期"}},
+            "refresh": {"code": 401, "message": "refresh token 已失效"},
+        }
+        success_payload = {
+            "data": [],
+            "user_rates": {},
+            "balance": {"amount": 10.0, "currency": "USD"},
+        }
+        with patch.object(
+            app,
+            "fetch_sub2api_user_groups",
+            return_value=(False, auth_failure, "refresh token 已失效"),
+        ):
+            with patch.object(app, "send_qq_message", return_value=(True, None)) as send_mock:
+                app.detect_site(site_id)
+                app.detect_site(site_id)
+                send_mock.assert_called_once()
+                subject, message = send_mock.call_args.args
+                self.assertEqual("【超哥】登录状态失效", subject)
+                self.assertIn("AT 已失效，自动刷新未能恢复监控", message)
+
+                with patch.object(
+                    app,
+                    "fetch_sub2api_user_groups",
+                    return_value=(True, success_payload, None),
+                ):
+                    app.detect_site(site_id)
+                self.assertEqual(0, app.db_query_one(
+                    "SELECT auth_alert_active FROM sites WHERE id = ?", (site_id,),
+                )["auth_alert_active"])
+
+                app.detect_site(site_id)
+                self.assertEqual(2, send_mock.call_count)
+
     def test_group_rename_keeps_selected_notification_scope(self):
         site_id = self.add_site("sub2api", 5)
         app.db_execute(
