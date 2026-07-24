@@ -93,7 +93,7 @@ POST http://upstream-ratio-watch:8000/api/bot/usages/today
 Authorization: Bearer <QQ通知接口Token>
 ```
 
-接口会并发查询全部启用站点的今日实际消耗。NewAPI 站点使用 `/api/log/self/stat` 并按站点的 `quota_per_unit` 换算金额，sub2api 站点使用 `/api/v1/usage/dashboard/stats` 的 `today_actual_cost`。所有参与计算的站点都必须启用登录检测并配置有效登录凭据；任一站点失败时，QQ 机器人将拒绝计算不完整的利润。
+接口会并发查询全部启用站点的今日实际消耗。NewAPI 站点使用 `/api/log/self/stat` 并按站点的 `quota_per_unit` 换算金额，sub2api 站点使用 `/api/v1/usage/dashboard/stats` 的 `today_actual_cost`。每个站点当天最近一次成功结果会持久化保存；实时查询失败时返回该缓存值和成功时间，没有当天成功记录时由机器人显示“查询失败（0）”并按 `0` 计算。单个上游失败不会中断其他站点或整条利润查询。
 
 如果服务器已经占用 8000 端口，可以修改 `docker-compose.yml`，把：
 

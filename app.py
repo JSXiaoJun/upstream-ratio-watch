@@ -30,7 +30,7 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 STATIC_DIR = APP_DIR / "static"
 DB_PATH = DATA_DIR / "app.db"
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.0"
 AUTH_CONFIG_PATH = Path(os.getenv("AUTH_CONFIG_PATH") or (DATA_DIR / "auth.json"))
 AUTH_COOKIE_NAME = "upstream_watch_session"
 DEFAULT_SESSION_DAYS = 30
@@ -349,6 +349,15 @@ def init_db() -> None:
                 FOREIGN KEY(site_id) REFERENCES sites(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS daily_usage_cache (
+                site_id INTEGER PRIMARY KEY,
+                usage_date TEXT NOT NULL,
+                amount REAL NOT NULL,
+                currency TEXT NOT NULL DEFAULT 'USD',
+                fetched_at TEXT NOT NULL,
+                FOREIGN KEY(site_id) REFERENCES sites(id) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS notification_settings (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 wecom_enabled INTEGER NOT NULL DEFAULT 0,
@@ -394,6 +403,7 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_snapshots_site_checked ON snapshots(site_id, checked_at DESC);
             CREATE INDEX IF NOT EXISTS idx_changes_site_created ON changes(site_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_balance_snapshots_site_checked ON balance_snapshots(site_id, checked_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_daily_usage_cache_date ON daily_usage_cache(usage_date);
             CREATE INDEX IF NOT EXISTS idx_notification_logs_created ON notification_logs(created_at DESC);
             """
         )
@@ -1421,25 +1431,77 @@ def bot_balance_payload() -> List[Dict[str, Any]]:
     )
 
 
+def save_daily_usage_cache(
+    site_id: int,
+    usage_date: str,
+    amount: float,
+    currency: str,
+    fetched_at: str,
+) -> None:
+    db_execute(
+        """
+        INSERT INTO daily_usage_cache (site_id, usage_date, amount, currency, fetched_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(site_id) DO UPDATE SET
+            usage_date = excluded.usage_date,
+            amount = excluded.amount,
+            currency = excluded.currency,
+            fetched_at = excluded.fetched_at
+        """,
+        (site_id, usage_date, amount, currency, fetched_at),
+    )
+
+
+def get_daily_usage_cache(site_id: int, usage_date: str) -> Optional[Dict[str, Any]]:
+    return db_query_one(
+        """
+        SELECT amount, currency, fetched_at
+        FROM daily_usage_cache
+        WHERE site_id = ? AND usage_date = ?
+        """,
+        (site_id, usage_date),
+    )
+
+
 def bot_today_usage_payload() -> List[Dict[str, Any]]:
     sites = db_query_all("SELECT * FROM sites WHERE enabled = 1 ORDER BY id ASC")
     if not sites:
         return []
     now = app_now()
+    usage_date = now.date().isoformat()
     start_timestamp = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
     end_timestamp = int(now.timestamp())
 
     def inspect_site(site: Dict[str, Any]) -> Dict[str, Any]:
-        try:
-            if not site.get("login_enabled"):
+        def failed_result(error: Any) -> Dict[str, Any]:
+            cached = get_daily_usage_cache(int(site["id"]), usage_date)
+            if cached:
                 return {
                     "id": site["id"],
                     "name": site["name"],
-                    "success": False,
-                    "amount": None,
-                    "currency": "USD",
-                    "error": "未启用登录检测，无法查询今日消耗",
+                    "success": True,
+                    "live_success": False,
+                    "cached": True,
+                    "amount": cached["amount"],
+                    "currency": cached.get("currency") or "USD",
+                    "fetched_at": cached["fetched_at"],
+                    "error": str(error or "查询失败"),
                 }
+            return {
+                "id": site["id"],
+                "name": site["name"],
+                "success": False,
+                "live_success": False,
+                "cached": False,
+                "amount": None,
+                "currency": "USD",
+                "fetched_at": None,
+                "error": str(error or "查询失败"),
+            }
+
+        try:
+            if not site.get("login_enabled"):
+                return failed_result("未启用登录检测，无法查询今日消耗")
             if (site.get("platform") or "newapi") == "sub2api":
                 ok, usage, error = fetch_sub2api_today_usage(site)
             else:
@@ -1450,23 +1512,25 @@ def bot_today_usage_payload() -> List[Dict[str, Any]]:
                     start_timestamp,
                     end_timestamp,
                 )
+            if not ok:
+                return failed_result(error)
+            fetched_at = utc_now_iso()
+            amount = float(usage["amount"])
+            currency = str(usage.get("currency") or "USD")
+            save_daily_usage_cache(int(site["id"]), usage_date, amount, currency, fetched_at)
             return {
                 "id": site["id"],
                 "name": site["name"],
-                "success": ok,
-                "amount": usage.get("amount") if ok else None,
-                "currency": usage.get("currency", "USD") if ok else "USD",
-                "error": None if ok else str(error or "查询失败"),
+                "success": True,
+                "live_success": True,
+                "cached": False,
+                "amount": amount,
+                "currency": currency,
+                "fetched_at": fetched_at,
+                "error": None,
             }
         except Exception as exc:
-            return {
-                "id": site["id"],
-                "name": site["name"],
-                "success": False,
-                "amount": None,
-                "currency": "USD",
-                "error": str(exc),
-            }
+            return failed_result(exc)
 
     results: Dict[int, Dict[str, Any]] = {}
     with ThreadPoolExecutor(max_workers=min(4, len(sites))) as executor:

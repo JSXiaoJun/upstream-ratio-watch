@@ -596,6 +596,42 @@ class BalanceMonitoringTest(unittest.TestCase):
         self.assertEqual(["上游A", "上游B"], [site["name"] for site in payload["data"]])
         self.assertEqual([1.75, 2.5], [site["amount"] for site in payload["data"]])
         self.assertTrue(all(site["success"] for site in payload["data"]))
+        self.assertTrue(all(site["live_success"] for site in payload["data"]))
+        self.assertTrue(all(not site["cached"] for site in payload["data"]))
+
+    def test_today_usage_uses_same_day_cache_when_live_query_fails(self):
+        sub2api_id = self.add_site("sub2api", 5)
+        app.db_execute("UPDATE sites SET base_url = ? WHERE id = ?", (f"{self.base_url}/sub2api", sub2api_id))
+        newapi_id = self.add_site("newapi", 5, token="system-token")
+
+        first = app.bot_today_usage_payload()
+        first_by_id = {site["id"]: site for site in first}
+        self.assertEqual(1.75, first_by_id[sub2api_id]["amount"])
+        self.assertEqual(2.5, first_by_id[newapi_id]["amount"])
+
+        with patch.object(app, "fetch_sub2api_today_usage", return_value=(False, {}, "HTTP 403")), \
+             patch.object(app, "fetch_newapi_today_usage", return_value=(False, {}, "请求超时")):
+            fallback = app.bot_today_usage_payload()
+
+        fallback_by_id = {site["id"]: site for site in fallback}
+        for site_id in (sub2api_id, newapi_id):
+            self.assertTrue(fallback_by_id[site_id]["success"])
+            self.assertFalse(fallback_by_id[site_id]["live_success"])
+            self.assertTrue(fallback_by_id[site_id]["cached"])
+            self.assertEqual(first_by_id[site_id]["amount"], fallback_by_id[site_id]["amount"])
+            self.assertEqual(first_by_id[site_id]["fetched_at"], fallback_by_id[site_id]["fetched_at"])
+
+    def test_today_usage_does_not_use_previous_day_cache(self):
+        site_id = self.add_site("newapi", 5, token="system-token")
+        app.save_daily_usage_cache(site_id, "2000-01-01", 99.0, "USD", "2000-01-01T12:00:00+08:00")
+
+        with patch.object(app, "fetch_newapi_today_usage", return_value=(False, {}, "HTTP 403")):
+            result = app.bot_today_usage_payload()
+
+        self.assertEqual(1, len(result))
+        self.assertFalse(result[0]["success"])
+        self.assertFalse(result[0]["cached"])
+        self.assertIsNone(result[0]["amount"])
 
     def test_today_usage_falls_back_to_valid_sub2api_token_when_proactive_refresh_fails(self):
         site = {
