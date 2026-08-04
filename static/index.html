@@ -360,6 +360,14 @@
               <span>启用监控</span>
               <input id="siteEnabled" type="checkbox" checked />
             </label>
+            <label class="field span-2">
+              <span>金额换算倍率</span>
+              <div class="usage-ratio-input">
+                <span class="usage-ratio-prefix">1 :</span>
+                <input id="siteUsageDivisor" class="input" type="number" min="0.000001" step="any" value="1" inputmode="decimal" />
+              </div>
+              <small class="field-help">今日消耗和账户余额均按“上游原始金额 ÷ 右侧倍率”换算为人民币；例如 1:10 填写 10。</small>
+            </label>
           </div>
         </section>
 
@@ -437,7 +445,7 @@
               <input id="siteBalanceAlertEnabled" type="checkbox" />
             </label>
             <label class="field balance-threshold-field">
-              <span>预警阈值（美元）</span>
+              <span>预警阈值（换算后人民币）</span>
               <input id="siteBalanceAlertThreshold" class="input" type="number" min="0" step="0.01" value="10" />
             </label>
           </div>

@@ -44,6 +44,7 @@ const els = {
   sitePlatform: document.getElementById('sitePlatform'),
   siteBaseUrl: document.getElementById('siteBaseUrl'),
   siteInterval: document.getElementById('siteInterval'),
+  siteUsageDivisor: document.getElementById('siteUsageDivisor'),
   siteAuthMode: document.getElementById('siteAuthMode'),
   siteLoginEnabled: document.getElementById('siteLoginEnabled'),
   siteLoginUsername: document.getElementById('siteLoginUsername'),
@@ -162,11 +163,20 @@ function ratioLabel(item) {
   return `${ratio}`;
 }
 
+function usageDivisorLabel(value) {
+  const divisor = Number(value);
+  if (!Number.isFinite(divisor) || divisor <= 0) return '1 : 1';
+  const text = divisor.toFixed(8).replace(/0+$/, '').replace(/\.$/, '');
+  return `1 : ${text || '1'}`;
+}
+
 function balanceLabel(site) {
   if (site.current_balance === null || site.current_balance === undefined) return '-';
   const value = Number(site.current_balance);
   if (!Number.isFinite(value)) return '-';
-  return `${site.balance_currency === 'USD' ? '$' : `${site.balance_currency || ''} `}${value.toFixed(2)}`;
+  const currency = String(site.balance_currency || '').toUpperCase();
+  const symbol = currency === 'USD' ? '$' : ['CNY', 'RMB'].includes(currency) ? '¥' : `${currency} `;
+  return `${symbol}${value.toFixed(2)}`;
 }
 
 function showToast(message, type = 'success') {
@@ -528,10 +538,11 @@ function renderDetail(site) {
     ${site.last_error ? `<div class="error-box">${escapeHtml(site.last_error)}</div>` : ''}
     <div class="detail-meta">
       <div class="meta-card"><div class="k">监控间隔</div><div class="v">${site.interval_minutes} 分钟</div></div>
+      <div class="meta-card"><div class="k">金额换算</div><div class="v">${usageDivisorLabel(site.usage_divisor)}</div></div>
       <div class="meta-card"><div class="k">公开分组</div><div class="v">${site.current_groups_count || 0}</div></div>
       <div class="meta-card"><div class="k">认证分组</div><div class="v">${site.current_login_groups_count || 0}</div></div>
       <div class="meta-card"><div class="k">账户余额</div><div class="v ${site.balance_alert_active ? 'balance-low' : ''}">${escapeHtml(balanceLabel(site))}</div></div>
-      <div class="meta-card"><div class="k">余额预警</div><div class="v">${site.balance_alert_enabled ? `低于 $${Number(site.balance_alert_threshold || 0).toFixed(2)}` : '未启用'}</div></div>
+      <div class="meta-card"><div class="k">余额预警</div><div class="v">${site.balance_alert_enabled ? `低于 ¥${Number(site.balance_alert_threshold || 0).toFixed(2)}` : '未启用'}</div></div>
       <div class="meta-card"><div class="k">余额检测</div><div class="v">${fmtTime(site.balance_last_check_at)}</div></div>
       <div class="meta-card"><div class="k">上次检测</div><div class="v">${fmtTime(site.last_check_at)}</div></div>
       <div class="meta-card"><div class="k">下次检测</div><div class="v">${fmtTime(site.next_check_at)}</div></div>
@@ -603,6 +614,7 @@ function openDialog(site = null) {
     els.sitePlatform.value = site.platform || 'newapi';
     els.siteBaseUrl.value = site.base_url;
     els.siteInterval.value = site.interval_minutes;
+    els.siteUsageDivisor.value = site.usage_divisor ?? 1;
     els.siteAuthMode.value = site.auth_mode || 'password';
     els.siteLoginEnabled.checked = !!site.login_enabled;
     els.siteLoginUsername.value = site.login_username || '';
@@ -624,6 +636,7 @@ function openDialog(site = null) {
     els.sitePlatform.value = 'newapi';
     els.siteBaseUrl.value = '';
     els.siteInterval.value = 3;
+    els.siteUsageDivisor.value = 1;
     els.siteAuthMode.value = 'password';
     els.siteLoginEnabled.checked = false;
     els.siteLoginUsername.value = '';
@@ -843,6 +856,7 @@ els.form.addEventListener('submit', async (e) => {
     platform,
     base_url: els.siteBaseUrl.value.trim(),
     interval_minutes: Math.max(1, Number(els.siteInterval.value || 3)),
+    usage_divisor: Number(els.siteUsageDivisor.value),
     login_enabled: platform === 'sub2api' ? true : els.siteLoginEnabled.checked,
     auth_mode: authMode,
     login_username: authMode === 'password' ? els.siteLoginUsername.value.trim() : '',
@@ -864,6 +878,13 @@ els.form.addEventListener('submit', async (e) => {
     els.dialogMsg.textContent = '请填写站点名称和 Base URL';
     els.dialogMsg.classList.add('error');
     showToast('站点名称和 Base URL 不能为空', 'error');
+    return;
+  }
+  if (!Number.isFinite(payload.usage_divisor) || payload.usage_divisor <= 0) {
+    setSiteDialogTab('basic');
+    els.dialogMsg.textContent = '金额换算倍率必须是大于 0 的数字';
+    els.dialogMsg.classList.add('error');
+    showToast('金额换算倍率必须是大于 0 的数字', 'error');
     return;
   }
   if (!payload.notify_all_groups && !payload.notify_groups.length) {

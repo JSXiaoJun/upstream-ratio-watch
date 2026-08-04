@@ -75,7 +75,7 @@ GET http://upstream-ratio-watch:8000/api/bot/balances
 Authorization: Bearer <QQ通知接口Token>
 ```
 
-接口只返回监控面板已经采集并保存的余额，不会主动触发站点检测。
+接口只返回监控面板已经采集并保存的余额，不会主动触发站点检测。返回的 `current_balance` 会按站点金额换算倍率除算为人民币，同时保留 `raw_current_balance` 和 `raw_balance_currency` 便于核对上游原值。
 
 通知群发送 `查倍率` 时，机器人会调用实时检测接口：
 
@@ -93,7 +93,7 @@ POST http://upstream-ratio-watch:8000/api/bot/usages/today
 Authorization: Bearer <QQ通知接口Token>
 ```
 
-接口会并发查询全部启用站点的今日实际消耗。NewAPI 站点使用 `/api/log/self/stat` 并按站点的 `quota_per_unit` 换算金额，sub2api 站点使用 `/api/v1/usage/dashboard/stats` 的 `today_actual_cost`。每个站点当天最近一次成功结果会持久化保存；实时查询失败时返回该缓存值和成功时间，没有当天成功记录时由机器人显示“查询失败（0）”并按 `0` 计算。单个上游失败不会中断其他站点或整条利润查询。
+接口会并发查询全部启用站点的今日实际消耗。NewAPI 站点使用 `/api/log/self/stat` 并按站点的 `quota_per_unit` 换算金额，sub2api 站点使用 `/api/v1/usage/dashboard/stats` 的 `today_actual_cost`。每个站点当天最近一次成功结果会持久化保存；实时查询失败时返回该缓存值和成功时间，没有当天成功记录时由机器人显示“查询失败（0）”并按 `0` 计算。站点配置的金额换算倍率会应用于实时与缓存结果，例如 `1:10` 会返回“原始消耗 ÷ 10”的人民币金额，并通过 `raw_amount`、`raw_currency` 保留上游原值。单个上游失败不会中断其他站点或整条利润查询。
 
 如果服务器已经占用 8000 端口，可以修改 `docker-compose.yml`，把：
 
@@ -176,6 +176,7 @@ HOST=0.0.0.0 PORT=8000 python app.py
 - Base URL：上游站点地址，例如 `https://example.com`，不要带具体 API 路径。
 - 监控间隔：单位为分钟，最低 1 分钟。
 - 启用监控：开启后会按设定间隔自动检测。
+- 金额换算倍率：默认 `1:1`；如果上游金额按 `1:10` 计算，右侧填写 `10`，利润查询消耗和账户余额都会使用“上游原始金额 ÷ 10”的人民币结果，并按标准四舍五入保留两位小数。
 
 保存后，程序会定时访问：
 
@@ -360,7 +361,7 @@ New-Api-User: NewAPI 用户 ID
 
 ## 余额监控
 
-在添加或编辑站点时可启用“低余额预警”，并按美元设置阈值。
+在添加或编辑站点时可启用“低余额预警”，阈值按金额倍率换算后的人民币设置。
 
 - NewAPI：需要开启认证增强监控，程序请求 `GET /api/user/self`，将返回的 `quota` 按站点 `quota_per_unit` 换算为美元。
 - sub2api：复用账号登录或导入的登录态，请求 `GET /api/v1/user/profile`，读取返回的 `balance`。

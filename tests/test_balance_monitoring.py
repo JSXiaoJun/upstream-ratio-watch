@@ -179,12 +179,19 @@ class BalanceMonitoringTest(unittest.TestCase):
         self.assertEqual([], second["changes"])
 
     def test_sub2api_profile_balance_is_collected(self):
-        site_id = self.add_site("sub2api", 5)
+        site_id = self.add_site("sub2api", 0.5)
+        app.db_execute("UPDATE sites SET usage_divisor = 10 WHERE id = ?", (site_id,))
         result = app.detect_site(site_id)
-        self.assertEqual(3.5, result["balance"]["amount"])
+        self.assertEqual(0.35, result["balance"]["amount"])
+        self.assertEqual(3.5, result["balance"]["raw_amount"])
+        self.assertEqual("CNY", result["balance"]["currency"])
         site = app.db_query_one("SELECT current_balance, balance_alert_active FROM sites WHERE id = ?", (site_id,))
         self.assertEqual(3.5, site["current_balance"])
         self.assertEqual(1, site["balance_alert_active"])
+        summary = app.site_summary(app.db_query_one("SELECT * FROM sites WHERE id = ?", (site_id,)))
+        self.assertEqual(0.35, summary["current_balance"])
+        self.assertEqual(3.5, summary["raw_current_balance"])
+        self.assertEqual("CNY", summary["balance_currency"])
 
     def test_site_api_saves_balance_configuration(self):
         body = json.dumps({
@@ -196,6 +203,7 @@ class BalanceMonitoringTest(unittest.TestCase):
             "access_user_id": "1",
             "balance_alert_enabled": True,
             "balance_alert_threshold": 12.5,
+            "usage_divisor": 10,
             "notify_all_groups": False,
             "notify_groups": ["pro专用", "plus/free混合号池"],
         }).encode()
@@ -210,17 +218,38 @@ class BalanceMonitoringTest(unittest.TestCase):
         site = app.db_query_one("SELECT * FROM sites WHERE id = ?", (result["id"],))
         self.assertEqual(1, site["balance_alert_enabled"])
         self.assertEqual(12.5, site["balance_alert_threshold"])
+        self.assertEqual(10, site["usage_divisor"])
         self.assertEqual(["pro专用", "plus/free混合号池"], json.loads(site["notify_groups_json"]))
         update = urllib.request.Request(
             f"{self.api_url}/api/sites/{result['id']}",
-            data=json.dumps({"balance_alert_enabled": True, "balance_alert_threshold": 7.25}).encode(),
+            data=json.dumps({
+                "balance_alert_enabled": True,
+                "balance_alert_threshold": 7.25,
+                "usage_divisor": 5,
+            }).encode(),
             headers={"Content-Type": "application/json", "Cookie": self.session_cookie},
             method="PUT",
         )
         with urllib.request.urlopen(update):
             pass
-        updated = app.db_query_one("SELECT balance_alert_threshold FROM sites WHERE id = ?", (result["id"],))
+        updated = app.db_query_one(
+            "SELECT balance_alert_threshold, usage_divisor FROM sites WHERE id = ?",
+            (result["id"],),
+        )
         self.assertEqual(7.25, updated["balance_alert_threshold"])
+        self.assertEqual(5, updated["usage_divisor"])
+
+        invalid_update = urllib.request.Request(
+            f"{self.api_url}/api/sites/{result['id']}",
+            data=json.dumps({"usage_divisor": 0}).encode(),
+            headers={"Content-Type": "application/json", "Cookie": self.session_cookie},
+            method="PUT",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as context:
+            urllib.request.urlopen(invalid_update)
+        self.assertEqual(400, context.exception.code)
+        error_payload = json.loads(context.exception.read())
+        self.assertIn("大于 0", error_payload["message"])
 
     def test_api_requires_login_and_session_cookie_lasts_30_days(self):
         with urllib.request.urlopen(f"{self.api_url}/api/version") as response:
@@ -493,8 +522,8 @@ class BalanceMonitoringTest(unittest.TestCase):
     def test_bot_balance_api_requires_notification_token(self):
         site_id = self.add_site("sub2api", 5)
         app.db_execute(
-            "UPDATE sites SET name = ?, current_balance = ?, balance_currency = ?, balance_last_check_at = ? WHERE id = ?",
-            ("余额测试站", 12.34, "USD", app.utc_now_iso(), site_id),
+            "UPDATE sites SET name = ?, current_balance = ?, balance_currency = ?, balance_last_check_at = ?, usage_divisor = ? WHERE id = ?",
+            ("余额测试站", 123.456, "USD", app.utc_now_iso(), 10, site_id),
         )
         app.update_notification_settings({
             "qq_enabled": True,
@@ -516,8 +545,11 @@ class BalanceMonitoringTest(unittest.TestCase):
             payload = json.loads(response.read())
         self.assertTrue(payload["success"])
         balance_site = next(item for item in payload["data"] if item["name"] == "余额测试站")
-        self.assertEqual(12.34, balance_site["current_balance"])
-        self.assertEqual("USD", balance_site["balance_currency"])
+        self.assertEqual(12.35, balance_site["current_balance"])
+        self.assertEqual("CNY", balance_site["balance_currency"])
+        self.assertEqual(123.456, balance_site["raw_current_balance"])
+        self.assertEqual("USD", balance_site["raw_balance_currency"])
+        self.assertEqual(10, balance_site["usage_divisor"])
 
     def test_bot_ratio_api_detects_live_and_filters_selected_groups(self):
         first_id = self.add_site("sub2api", 5)
@@ -620,6 +652,31 @@ class BalanceMonitoringTest(unittest.TestCase):
             self.assertTrue(fallback_by_id[site_id]["cached"])
             self.assertEqual(first_by_id[site_id]["amount"], fallback_by_id[site_id]["amount"])
             self.assertEqual(first_by_id[site_id]["fetched_at"], fallback_by_id[site_id]["fetched_at"])
+
+    def test_today_usage_applies_current_divisor_to_live_and_cached_raw_amount(self):
+        site_id = self.add_site("newapi", 5, token="system-token")
+        app.db_execute("UPDATE sites SET usage_divisor = 10 WHERE id = ?", (site_id,))
+
+        live = app.bot_today_usage_payload()[0]
+        self.assertEqual(2.5, live["raw_amount"])
+        self.assertEqual(10, live["usage_divisor"])
+        self.assertEqual(0.25, live["amount"])
+        self.assertEqual("CNY", live["currency"])
+        self.assertEqual("USD", live["raw_currency"])
+
+        app.db_execute("UPDATE sites SET usage_divisor = 5 WHERE id = ?", (site_id,))
+        with patch.object(app, "fetch_newapi_today_usage", return_value=(False, {}, "HTTP 403")):
+            cached = app.bot_today_usage_payload()[0]
+
+        self.assertTrue(cached["cached"])
+        self.assertEqual(2.5, cached["raw_amount"])
+        self.assertEqual(5, cached["usage_divisor"])
+        self.assertEqual(0.5, cached["amount"])
+        self.assertEqual("CNY", cached["currency"])
+        self.assertEqual("USD", cached["raw_currency"])
+
+        self.assertEqual(0.83, app.converted_money_amount(2.5, 3))
+        self.assertEqual(2.68, app.converted_money_amount(2.675, 1))
 
     def test_today_usage_does_not_use_previous_day_cache(self):
         site_id = self.add_site("newapi", 5, token="system-token")

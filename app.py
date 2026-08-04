@@ -16,6 +16,7 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from email.message import EmailMessage
 from http import HTTPStatus
 from http.cookies import SimpleCookie
@@ -30,7 +31,7 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 STATIC_DIR = APP_DIR / "static"
 DB_PATH = DATA_DIR / "app.db"
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.9.0"
 AUTH_CONFIG_PATH = Path(os.getenv("AUTH_CONFIG_PATH") or (DATA_DIR / "auth.json"))
 AUTH_COOKIE_NAME = "upstream_watch_session"
 DEFAULT_SESSION_DAYS = 30
@@ -279,6 +280,7 @@ def init_db() -> None:
                 platform TEXT NOT NULL DEFAULT 'newapi',
                 enabled INTEGER NOT NULL DEFAULT 1,
                 interval_minutes INTEGER NOT NULL DEFAULT 3,
+                usage_divisor REAL NOT NULL DEFAULT 1,
                 focus_keywords TEXT,
                 notify_groups_json TEXT,
                 login_enabled INTEGER NOT NULL DEFAULT 0,
@@ -440,6 +442,7 @@ def init_db() -> None:
         if "login_last_check_at" not in columns:
             conn.execute("ALTER TABLE sites ADD COLUMN login_last_check_at TEXT")
         site_columns = {
+            "usage_divisor": "REAL NOT NULL DEFAULT 1",
             "balance_alert_enabled": "INTEGER NOT NULL DEFAULT 0",
             "balance_alert_threshold": "REAL NOT NULL DEFAULT 10",
             "current_balance": "REAL",
@@ -822,6 +825,57 @@ def normalized_balance(amount: Any, source: str, **extra: Any) -> Optional[Dict[
         return None
     result = {"amount": round(value, 6), "currency": "USD", "source": source}
     result.update({key: value for key, value in extra.items() if value is not None})
+    return result
+
+
+def validate_usage_divisor(value: Any) -> float:
+    try:
+        divisor = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("金额换算倍率必须是大于 0 的数字")
+    if not math.isfinite(divisor) or divisor <= 0:
+        raise ValueError("金额换算倍率必须是大于 0 的数字")
+    return divisor
+
+
+def site_usage_divisor(site: Dict[str, Any]) -> float:
+    try:
+        return validate_usage_divisor(site.get("usage_divisor", 1))
+    except ValueError:
+        return 1.0
+
+
+def converted_money_amount(amount: Any, divisor: Any) -> Optional[float]:
+    try:
+        value = Decimal(str(amount))
+        divisor_value = Decimal(str(divisor))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not value.is_finite() or not divisor_value.is_finite() or divisor_value <= 0:
+        return None
+    return float((value / divisor_value).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def converted_balance(site: Dict[str, Any], amount: Any) -> Optional[float]:
+    if amount is None:
+        return None
+    return converted_money_amount(amount, site_usage_divisor(site))
+
+
+def converted_balance_info(site: Dict[str, Any], balance: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not balance:
+        return None
+    amount = converted_balance(site, balance.get("amount"))
+    if amount is None:
+        return None
+    result = dict(balance)
+    result.update({
+        "amount": amount,
+        "currency": "CNY",
+        "raw_amount": balance.get("amount"),
+        "raw_currency": balance.get("currency") or "USD",
+        "usage_divisor": site_usage_divisor(site),
+    })
     return result
 
 
@@ -1421,14 +1475,22 @@ def notification_bearer_token_matches(authorization: Any) -> bool:
 
 
 def bot_balance_payload() -> List[Dict[str, Any]]:
-    return db_query_all(
+    sites = db_query_all(
         """
         SELECT name, current_balance, balance_currency, balance_last_error,
-               balance_last_check_at, enabled, status
+               balance_last_check_at, enabled, status, usage_divisor
         FROM sites
         ORDER BY id ASC
         """
     )
+    for site in sites:
+        raw_balance = site.get("current_balance")
+        site["raw_current_balance"] = raw_balance
+        site["raw_balance_currency"] = site.get("balance_currency") or "USD"
+        site["current_balance"] = converted_balance(site, raw_balance)
+        site["balance_currency"] = "CNY"
+        site["usage_divisor"] = site_usage_divisor(site)
+    return sites
 
 
 def save_daily_usage_cache(
@@ -1473,17 +1535,23 @@ def bot_today_usage_payload() -> List[Dict[str, Any]]:
     end_timestamp = int(now.timestamp())
 
     def inspect_site(site: Dict[str, Any]) -> Dict[str, Any]:
+        usage_divisor = site_usage_divisor(site)
+
         def failed_result(error: Any) -> Dict[str, Any]:
             cached = get_daily_usage_cache(int(site["id"]), usage_date)
             if cached:
+                raw_amount = float(cached["amount"])
                 return {
                     "id": site["id"],
                     "name": site["name"],
                     "success": True,
                     "live_success": False,
                     "cached": True,
-                    "amount": cached["amount"],
-                    "currency": cached.get("currency") or "USD",
+                    "amount": converted_money_amount(raw_amount, usage_divisor),
+                    "raw_amount": raw_amount,
+                    "usage_divisor": usage_divisor,
+                    "currency": "CNY",
+                    "raw_currency": cached.get("currency") or "USD",
                     "fetched_at": cached["fetched_at"],
                     "error": str(error or "查询失败"),
                 }
@@ -1494,7 +1562,10 @@ def bot_today_usage_payload() -> List[Dict[str, Any]]:
                 "live_success": False,
                 "cached": False,
                 "amount": None,
-                "currency": "USD",
+                "raw_amount": None,
+                "usage_divisor": usage_divisor,
+                "currency": "CNY",
+                "raw_currency": "USD",
                 "fetched_at": None,
                 "error": str(error or "查询失败"),
             }
@@ -1515,17 +1586,20 @@ def bot_today_usage_payload() -> List[Dict[str, Any]]:
             if not ok:
                 return failed_result(error)
             fetched_at = utc_now_iso()
-            amount = float(usage["amount"])
+            raw_amount = float(usage["amount"])
             currency = str(usage.get("currency") or "USD")
-            save_daily_usage_cache(int(site["id"]), usage_date, amount, currency, fetched_at)
+            save_daily_usage_cache(int(site["id"]), usage_date, raw_amount, currency, fetched_at)
             return {
                 "id": site["id"],
                 "name": site["name"],
                 "success": True,
                 "live_success": True,
                 "cached": False,
-                "amount": amount,
-                "currency": currency,
+                "amount": converted_money_amount(raw_amount, usage_divisor),
+                "raw_amount": raw_amount,
+                "usage_divisor": usage_divisor,
+                "currency": "CNY",
+                "raw_currency": currency,
                 "fetched_at": fetched_at,
                 "error": None,
             }
@@ -2164,16 +2238,23 @@ def notify_sub2api_auth_failure(site: Dict[str, Any], error_message: Optional[st
 
 
 def format_balance_amount(amount: float, currency: str = "USD") -> str:
-    symbol = "$" if currency == "USD" else f"{currency} "
+    symbol = "$" if currency == "USD" else "¥" if currency in {"CNY", "RMB"} else f"{currency} "
     return f"{symbol}{amount:.2f}"
 
 
-def record_balance_event(site: Dict[str, Any], event_type: str, amount: float, threshold: float, checked_at: str) -> None:
+def record_balance_event(
+    site: Dict[str, Any],
+    event_type: str,
+    amount: float,
+    threshold: float,
+    checked_at: str,
+    currency: str = "CNY",
+) -> None:
     recovered = event_type == "balance_recovered"
     message = (
-        f"余额已恢复至 {format_balance_amount(amount)}，高于预警阈值 {format_balance_amount(threshold)}"
+        f"余额已恢复至 {format_balance_amount(amount, currency)}，高于预警阈值 {format_balance_amount(threshold, currency)}"
         if recovered
-        else f"余额仅剩 {format_balance_amount(amount)}，已低于预警阈值 {format_balance_amount(threshold)}"
+        else f"余额仅剩 {format_balance_amount(amount, currency)}，已低于预警阈值 {format_balance_amount(threshold, currency)}"
     )
     db_execute(
         """
@@ -2184,13 +2265,13 @@ def record_balance_event(site: Dict[str, Any], event_type: str, amount: float, t
         (site["id"], event_type, json.dumps(threshold), json.dumps(amount), message, checked_at),
     )
     label = "余额恢复" if recovered else "低余额预警"
-    subject = f"【{platform_label(site)} {label}】{site['name']}：{format_balance_amount(amount)}"
+    subject = f"【{platform_label(site)} {label}】{site['name']}：{format_balance_amount(amount, currency)}"
     body = "\n".join([
         "上游余额监控提醒",
         f"站点：{site['name']}",
         f"平台：{platform_label(site)}",
-        f"当前余额：{format_balance_amount(amount)}",
-        f"预警阈值：{format_balance_amount(threshold)}",
+        f"当前余额：{format_balance_amount(amount, currency)}",
+        f"预警阈值：{format_balance_amount(threshold, currency)}",
         f"状态：{'余额已恢复' if recovered else '余额不足，请及时充值'}",
         f"时间：{fmt_local_time_for_message(checked_at)}",
     ])
@@ -2396,15 +2477,16 @@ def _detect_site(site_id: int) -> Dict[str, Any]:
     alert_active = bool(site.get("balance_alert_active"))
     if not site.get("balance_alert_enabled"):
         alert_active = False
-    if balance_info and site.get("balance_alert_enabled"):
-        amount = float(balance_info["amount"])
+    displayed_balance_info = converted_balance_info(site, balance_info)
+    if displayed_balance_info and site.get("balance_alert_enabled"):
+        amount = float(displayed_balance_info["amount"])
         threshold = float(site.get("balance_alert_threshold") or 0)
         if amount <= threshold and not alert_active:
             alert_active = True
-            record_balance_event(site, "balance_low", amount, threshold, checked_at)
+            record_balance_event(site, "balance_low", amount, threshold, checked_at, "CNY")
         elif amount > threshold and alert_active:
             alert_active = False
-            record_balance_event(site, "balance_recovered", amount, threshold, checked_at)
+            record_balance_event(site, "balance_recovered", amount, threshold, checked_at, "CNY")
 
     next_check_at = next_check_iso(int(site["interval_minutes"] or DEFAULT_INTERVAL_MINUTES))
     effective_status = "warning" if login_error or alert_active or (site.get("balance_alert_enabled") and balance_error) else "ok"
@@ -2462,7 +2544,7 @@ def _detect_site(site_id: int) -> Dict[str, Any]:
         "groups": new_groups,
         "login_groups": login_groups,
         "changes": changes,
-        "balance": balance_info,
+        "balance": displayed_balance_info,
         "balance_error": balance_error,
     }
 
@@ -2572,6 +2654,7 @@ def site_summary(site: Dict[str, Any]) -> Dict[str, Any]:
         "SELECT * FROM changes WHERE site_id = ? ORDER BY id DESC LIMIT 1",
         (site["id"],),
     )
+    raw_current_balance = site.get("current_balance")
     return {
         "id": site["id"],
         "name": site["name"],
@@ -2580,6 +2663,7 @@ def site_summary(site: Dict[str, Any]) -> Dict[str, Any]:
         "platform_label": "sub2api" if site["platform"] == "sub2api" else "NewAPI",
         "enabled": bool(site["enabled"]),
         "interval_minutes": site["interval_minutes"],
+        "usage_divisor": site_usage_divisor(site),
         "notify_all_groups": not bool(notify_groups),
         "notify_groups": notify_groups,
         "login_enabled": bool(site.get("login_enabled")),
@@ -2595,8 +2679,10 @@ def site_summary(site: Dict[str, Any]) -> Dict[str, Any]:
         "login_last_check_at": site.get("login_last_check_at"),
         "balance_alert_enabled": bool(site.get("balance_alert_enabled")),
         "balance_alert_threshold": float(site.get("balance_alert_threshold") or 0),
-        "current_balance": site.get("current_balance"),
-        "balance_currency": site.get("balance_currency") or "USD",
+        "current_balance": converted_balance(site, raw_current_balance),
+        "balance_currency": "CNY",
+        "raw_current_balance": raw_current_balance,
+        "raw_balance_currency": site.get("balance_currency") or "USD",
         "balance_last_error": site.get("balance_last_error"),
         "balance_last_check_at": site.get("balance_last_check_at"),
         "balance_alert_active": bool(site.get("balance_alert_active")),
@@ -2862,6 +2948,10 @@ class Handler(BaseHTTPRequestHandler):
                 enabled = bool(body.get("enabled", True))
                 interval = int(body.get("interval_minutes") or DEFAULT_INTERVAL_MINUTES)
                 interval = max(MIN_INTERVAL_MINUTES, interval)
+                try:
+                    usage_divisor = validate_usage_divisor(body.get("usage_divisor", 1))
+                except ValueError as exc:
+                    return json_response(self, {"success": False, "message": str(exc)}, 400)
                 login_enabled = bool(body.get("login_enabled", False))
                 login_username = str(body.get("login_username") or "").strip()
                 login_password = str(body.get("login_password") or "")
@@ -2896,8 +2986,8 @@ class Handler(BaseHTTPRequestHandler):
                 site_id = db_execute(
                     """
                     INSERT INTO sites
-                    (name, base_url, platform, enabled, interval_minutes, notify_groups_json, login_enabled, auth_mode, login_username, login_password, access_token, access_user_id, refresh_token, token_expires_at, balance_alert_enabled, balance_alert_threshold, status, last_error, last_check_at, next_check_at, consecutive_failures, current_groups_json, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', NULL, NULL, ?, 0, NULL, ?, ?)
+                    (name, base_url, platform, enabled, interval_minutes, usage_divisor, notify_groups_json, login_enabled, auth_mode, login_username, login_password, access_token, access_user_id, refresh_token, token_expires_at, balance_alert_enabled, balance_alert_threshold, status, last_error, last_check_at, next_check_at, consecutive_failures, current_groups_json, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', NULL, NULL, ?, 0, NULL, ?, ?)
                     """,
                     (
                         name,
@@ -2905,6 +2995,7 @@ class Handler(BaseHTTPRequestHandler):
                         platform,
                         1 if enabled else 0,
                         interval,
+                        usage_divisor,
                         None if notify_all_groups else json.dumps(notify_groups, ensure_ascii=False),
                         1 if (login_enabled or platform == "sub2api") else 0,
                         auth_mode if platform == "sub2api" else "password",
@@ -3001,6 +3092,13 @@ class Handler(BaseHTTPRequestHandler):
             if "interval_minutes" in body:
                 fields.append("interval_minutes = ?")
                 params.append(max(MIN_INTERVAL_MINUTES, int(body["interval_minutes"])))
+            if "usage_divisor" in body:
+                try:
+                    usage_divisor = validate_usage_divisor(body["usage_divisor"])
+                except ValueError as exc:
+                    return json_response(self, {"success": False, "message": str(exc)}, 400)
+                fields.append("usage_divisor = ?")
+                params.append(usage_divisor)
             if "notify_all_groups" in body or "notify_groups" in body:
                 notify_all_groups = bool(body.get("notify_all_groups", not bool(notification_groups_for_site(site))))
                 notify_groups = normalize_notify_groups(body.get("notify_groups", notification_groups_for_site(site)))
