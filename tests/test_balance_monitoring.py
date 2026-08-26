@@ -5,6 +5,7 @@ import tempfile
 import threading
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -18,6 +19,11 @@ class MockUpstreamHandler(BaseHTTPRequestHandler):
     newapi_today_quota = 1_250_000
     sub2api_balance = 3.5
     sub2api_today_cost = 1.75
+    sub2api_stats_total_cost = 2.25
+    sub2api_dashboard_supported = True
+    sub2api_dashboard_requests = 0
+    sub2api_stats_requests = 0
+    last_sub2api_stats_path = None
     last_feishu_payload = None
     last_qq_payload = None
     last_qq_authorization = None
@@ -34,10 +40,19 @@ class MockUpstreamHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        path = self.path.split("?", 1)[0]
+        original_path = self.path
+        path = original_path.split("?", 1)[0]
         api_index = path.find("/api/")
         if api_index > 0:
             path = path[api_index:]
+        if path == "/api/v1/usage/dashboard/stats":
+            self.__class__.sub2api_dashboard_requests += 1
+            if not self.__class__.sub2api_dashboard_supported:
+                self.send_json({"code": 404, "message": "route not found"})
+                return
+        if path == "/api/v1/usage/stats":
+            self.__class__.sub2api_stats_requests += 1
+            self.__class__.last_sub2api_stats_path = original_path
         routes = {
             "/api/user/groups": {"success": True, "data": {"default": {"ratio": 1}}},
             "/api/user/self/groups": {"success": True, "data": {"default": {"ratio": 1}}},
@@ -62,6 +77,10 @@ class MockUpstreamHandler(BaseHTTPRequestHandler):
             "/api/v1/usage/dashboard/stats": {
                 "code": 0,
                 "data": {"today_actual_cost": self.sub2api_today_cost},
+            },
+            "/api/v1/usage/stats": {
+                "code": 0,
+                "data": {"total_actual_cost": self.sub2api_stats_total_cost},
             },
         }
         self.send_json(routes.get(path, {"code": 404}))
@@ -92,6 +111,11 @@ class BalanceMonitoringTest(unittest.TestCase):
         MockUpstreamHandler.newapi_today_quota = 1_250_000
         MockUpstreamHandler.sub2api_balance = 3.5
         MockUpstreamHandler.sub2api_today_cost = 1.75
+        MockUpstreamHandler.sub2api_stats_total_cost = 2.25
+        MockUpstreamHandler.sub2api_dashboard_supported = True
+        MockUpstreamHandler.sub2api_dashboard_requests = 0
+        MockUpstreamHandler.sub2api_stats_requests = 0
+        MockUpstreamHandler.last_sub2api_stats_path = None
         MockUpstreamHandler.last_feishu_payload = None
         MockUpstreamHandler.last_qq_payload = None
         MockUpstreamHandler.last_qq_authorization = None
@@ -656,6 +680,44 @@ class BalanceMonitoringTest(unittest.TestCase):
         self.assertTrue(cached["cached"])
         self.assertEqual("HTTP 429", cached["error"])
         self.assertEqual(0.18, cached["amount"])
+
+    def test_sub2api_today_usage_auto_switches_and_persists_stats_endpoint(self):
+        site_id = self.add_site("sub2api", 5)
+        MockUpstreamHandler.sub2api_dashboard_supported = False
+
+        first = app.today_usage_for_site(app.db_query_one("SELECT * FROM sites WHERE id = ?", (site_id,)))
+
+        self.assertTrue(first["live_success"])
+        self.assertEqual(2.25, first["raw_amount"])
+        self.assertEqual("stats", first["sub2api_usage_endpoint"])
+        self.assertTrue(first["endpoint_switched"])
+        self.assertEqual(1, MockUpstreamHandler.sub2api_dashboard_requests)
+        self.assertEqual(1, MockUpstreamHandler.sub2api_stats_requests)
+        saved = app.db_query_one("SELECT sub2api_usage_endpoint FROM sites WHERE id = ?", (site_id,))
+        self.assertEqual("stats", saved["sub2api_usage_endpoint"])
+
+        stats_url = urllib.parse.urlparse(MockUpstreamHandler.last_sub2api_stats_path)
+        stats_query = urllib.parse.parse_qs(stats_url.query)
+        self.assertEqual([app.app_now().date().isoformat()], stats_query["start_date"])
+        self.assertEqual(stats_query["start_date"], stats_query["end_date"])
+        self.assertEqual([app.APP_TIMEZONE_NAME], stats_query["timezone"])
+
+        second = app.today_usage_for_site(app.db_query_one("SELECT * FROM sites WHERE id = ?", (site_id,)))
+        self.assertTrue(second["live_success"])
+        self.assertFalse(second["endpoint_switched"])
+        self.assertEqual(1, MockUpstreamHandler.sub2api_dashboard_requests)
+        self.assertEqual(2, MockUpstreamHandler.sub2api_stats_requests)
+
+        update = urllib.request.Request(
+            f"{self.api_url}/api/sites/{site_id}",
+            data=json.dumps({"sub2api_usage_endpoint": "dashboard"}).encode(),
+            headers={"Content-Type": "application/json", "Cookie": self.session_cookie},
+            method="PUT",
+        )
+        with urllib.request.urlopen(update):
+            pass
+        restored = app.db_query_one("SELECT sub2api_usage_endpoint FROM sites WHERE id = ?", (site_id,))
+        self.assertEqual("dashboard", restored["sub2api_usage_endpoint"])
 
     def test_site_auth_api_uses_saved_secrets_without_exposing_them(self):
         sub2api_id = self.add_site("sub2api", 5)

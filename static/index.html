@@ -368,6 +368,13 @@
               </div>
               <small class="field-help">今日消耗和账户余额均按“上游原始金额 ÷ 右侧倍率”换算为人民币；例如 1:10 填写 10。</small>
             </label>
+            <label id="sub2apiUsageEndpointField" class="field span-2 hidden">
+              <span>今日消耗接口</span>
+              <select id="siteSub2apiUsageEndpoint" class="input">
+                <option value="dashboard">默认接口 /api/v1/usage/dashboard/stats</option>
+                <option value="stats">兼容接口 /api/v1/usage/stats</option>
+              </select>
+            </label>
           </div>
         </section>
 

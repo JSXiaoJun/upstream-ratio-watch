@@ -23,7 +23,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
@@ -31,7 +31,7 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 STATIC_DIR = APP_DIR / "static"
 DB_PATH = DATA_DIR / "app.db"
-APP_VERSION = "1.10.0"
+APP_VERSION = "1.11.0"
 AUTH_CONFIG_PATH = Path(os.getenv("AUTH_CONFIG_PATH") or (DATA_DIR / "auth.json"))
 AUTH_COOKIE_NAME = "upstream_watch_session"
 DEFAULT_SESSION_DAYS = 30
@@ -281,6 +281,7 @@ def init_db() -> None:
                 enabled INTEGER NOT NULL DEFAULT 1,
                 interval_minutes INTEGER NOT NULL DEFAULT 3,
                 usage_divisor REAL NOT NULL DEFAULT 1,
+                sub2api_usage_endpoint TEXT NOT NULL DEFAULT 'dashboard',
                 focus_keywords TEXT,
                 notify_groups_json TEXT,
                 login_enabled INTEGER NOT NULL DEFAULT 0,
@@ -443,6 +444,7 @@ def init_db() -> None:
             conn.execute("ALTER TABLE sites ADD COLUMN login_last_check_at TEXT")
         site_columns = {
             "usage_divisor": "REAL NOT NULL DEFAULT 1",
+            "sub2api_usage_endpoint": "TEXT NOT NULL DEFAULT 'dashboard'",
             "balance_alert_enabled": "INTEGER NOT NULL DEFAULT 0",
             "balance_alert_threshold": "REAL NOT NULL DEFAULT 10",
             "current_balance": "REAL",
@@ -989,12 +991,46 @@ def fetch_newapi_today_usage(
     }, None
 
 
-def fetch_sub2api_today_usage_by_token(base_url: str, access_token: str) -> Tuple[bool, Dict[str, Any], Optional[str]]:
+def validate_sub2api_usage_endpoint(value: Any) -> str:
+    endpoint = str(value or "dashboard").strip().lower()
+    if endpoint not in {"dashboard", "stats"}:
+        raise ValueError("sub2api 今日消耗接口无效")
+    return endpoint
+
+
+def site_sub2api_usage_endpoint(site: Dict[str, Any]) -> str:
+    try:
+        return validate_sub2api_usage_endpoint(site.get("sub2api_usage_endpoint"))
+    except ValueError:
+        return "dashboard"
+
+
+def fetch_sub2api_today_usage_by_token(
+    base_url: str,
+    access_token: str,
+    endpoint: str = "dashboard",
+    usage_date: Optional[str] = None,
+) -> Tuple[bool, Dict[str, Any], Optional[str]]:
     token = (access_token or "").strip()
     if not token:
         return False, {}, "sub2api 访问令牌为空"
+    endpoint = validate_sub2api_usage_endpoint(endpoint)
+    if endpoint == "stats":
+        date_text = str(usage_date or app_now().date().isoformat())
+        query = urlencode({
+            "start_date": date_text,
+            "end_date": date_text,
+            "timezone": APP_TIMEZONE_NAME,
+        })
+        source = "/api/v1/usage/stats"
+        amount_key = "total_actual_cost"
+        url = f"{normalize_base_url(base_url)}{source}?{query}"
+    else:
+        source = "/api/v1/usage/dashboard/stats"
+        amount_key = "today_actual_cost"
+        url = f"{normalize_base_url(base_url)}{source}"
     ok, payload, error = request_json(
-        f"{normalize_base_url(base_url)}/api/v1/usage/dashboard/stats",
+        url,
         headers=sub2api_token_headers(token),
     )
     if not ok:
@@ -1003,20 +1039,70 @@ def fetch_sub2api_today_usage_by_token(base_url: str, access_token: str) -> Tupl
     if not success or not isinstance(data, dict):
         return False, payload if isinstance(payload, dict) else {"raw": payload}, message or "今日消耗响应无效"
     try:
-        amount = float(data.get("today_actual_cost"))
+        amount = float(data.get(amount_key))
     except (TypeError, ValueError):
-        return False, payload, "今日消耗响应缺少有效 today_actual_cost"
+        return False, payload, f"今日消耗响应缺少有效 {amount_key}"
     if not math.isfinite(amount):
         return False, payload, "今日消耗响应无效"
     return True, {
         "amount": amount,
         "currency": "USD",
-        "source": "/api/v1/usage/dashboard/stats",
+        "source": source,
+        "sub2api_usage_endpoint": endpoint,
     }, None
 
 
-def fetch_sub2api_today_usage(site: Dict[str, Any]) -> Tuple[bool, Dict[str, Any], Optional[str]]:
+def fetch_sub2api_today_usage(
+    site: Dict[str, Any],
+    now: Optional[datetime] = None,
+) -> Tuple[bool, Dict[str, Any], Optional[str]]:
     mode = str(site.get("auth_mode") or "password").strip().lower()
+    endpoint = site_sub2api_usage_endpoint(site)
+    usage_date = (now or app_now()).date().isoformat()
+
+    def fetch_selected(token: str) -> Tuple[bool, Dict[str, Any], Optional[str]]:
+        return fetch_sub2api_today_usage_by_token(site["base_url"], token, endpoint, usage_date)
+
+    def fall_back_to_stats(
+        token: str,
+        primary_ok: bool,
+        primary_payload: Dict[str, Any],
+        primary_error: Optional[str],
+    ) -> Tuple[bool, Dict[str, Any], Optional[str]]:
+        if primary_ok or endpoint != "dashboard" or is_sub2api_auth_error(primary_payload, primary_error):
+            return primary_ok, primary_payload, primary_error
+        stats_ok, stats_payload, stats_error = fetch_sub2api_today_usage_by_token(
+            site["base_url"], token, "stats", usage_date,
+        )
+        if not stats_ok:
+            return False, {
+                "dashboard": primary_payload,
+                "stats": stats_payload,
+            }, f"原接口失败：{primary_error or '响应无效'}；兼容接口失败：{stats_error or '响应无效'}"
+        if site.get("id") is not None:
+            db_execute(
+                "UPDATE sites SET sub2api_usage_endpoint = 'stats', updated_at = ? WHERE id = ?",
+                (utc_now_iso(), site["id"]),
+            )
+        stats_payload["endpoint_switched"] = True
+        return True, stats_payload, None
+
+    def save_refreshed_auth(refreshed: Dict[str, Any], fallback_refresh_token: str) -> str:
+        auth = refreshed_auth_payload(refreshed, fallback_refresh_token)
+        if site.get("id") is not None:
+            db_execute(
+                """
+                UPDATE sites
+                SET access_token = ?, refresh_token = ?, token_expires_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    auth["access_token"], auth["refresh_token"], auth["token_expires_at"],
+                    utc_now_iso(), site["id"],
+                ),
+            )
+        return auth["access_token"]
+
     if mode != "token":
         login_ok, token, login_payload, login_error = sub2api_login(
             site["base_url"],
@@ -1025,7 +1111,7 @@ def fetch_sub2api_today_usage(site: Dict[str, Any]) -> Tuple[bool, Dict[str, Any
         )
         if not login_ok:
             return False, {"login": login_payload}, login_error or "登录失败"
-        return fetch_sub2api_today_usage_by_token(site["base_url"], token)
+        return fall_back_to_stats(token, *fetch_selected(token))
 
     access_token = str(site.get("access_token") or "").strip()
     refresh_token = str(site.get("refresh_token") or "").strip()
@@ -1036,14 +1122,18 @@ def fetch_sub2api_today_usage(site: Dict[str, Any]) -> Tuple[bool, Dict[str, Any
     if should_refresh:
         refresh_ok, refreshed, refresh_error = sub2api_refresh_token(site["base_url"], refresh_token)
         if not refresh_ok:
-            ok, payload, error = fetch_sub2api_today_usage_by_token(site["base_url"], access_token)
+            ok, payload, error = fetch_selected(access_token)
             if ok:
                 return ok, payload, error
+            if not is_sub2api_auth_error(payload, error):
+                return fall_back_to_stats(access_token, ok, payload, error)
             return False, {"usage": payload, "refresh": refreshed}, refresh_error or error or "登录态刷新失败"
     else:
-        ok, payload, error = fetch_sub2api_today_usage_by_token(site["base_url"], access_token)
-        if ok or not refresh_token or not is_sub2api_auth_error(payload, error):
+        ok, payload, error = fetch_selected(access_token)
+        if ok:
             return ok, payload, error
+        if not refresh_token or not is_sub2api_auth_error(payload, error):
+            return fall_back_to_stats(access_token, ok, payload, error)
         refresh_ok, refreshed, refresh_error = sub2api_refresh_token(site["base_url"], refresh_token)
 
     if not refresh_ok:
@@ -1051,19 +1141,8 @@ def fetch_sub2api_today_usage(site: Dict[str, Any]) -> Tuple[bool, Dict[str, Any
     new_access_token = str(refreshed.get("access_token") or "").strip()
     if not new_access_token:
         return False, {"refresh": refreshed}, "刷新成功但没有返回 access_token"
-    auth = refreshed_auth_payload(refreshed, refresh_token)
-    db_execute(
-        """
-        UPDATE sites
-        SET access_token = ?, refresh_token = ?, token_expires_at = ?, updated_at = ?
-        WHERE id = ?
-        """,
-        (
-            auth["access_token"], auth["refresh_token"], auth["token_expires_at"],
-            utc_now_iso(), site["id"],
-        ),
-    )
-    return fetch_sub2api_today_usage_by_token(site["base_url"], new_access_token)
+    new_access_token = save_refreshed_auth(refreshed, refresh_token)
+    return fall_back_to_stats(new_access_token, *fetch_selected(new_access_token))
 
 
 def fetch_sub2api_groups_by_token(base_url: str, access_token: str) -> Tuple[bool, Dict[str, Any], Optional[str]]:
@@ -1634,6 +1713,7 @@ def today_usage_for_site(site: Dict[str, Any], now: Optional[datetime] = None) -
                 "raw_currency": cached.get("currency") or "USD",
                 "fetched_at": cached["fetched_at"],
                 "error": str(error or "查询失败"),
+                "sub2api_usage_endpoint": site_sub2api_usage_endpoint(site) if site.get("platform") == "sub2api" else None,
             }
         return {
             "id": site["id"],
@@ -1648,13 +1728,14 @@ def today_usage_for_site(site: Dict[str, Any], now: Optional[datetime] = None) -
             "raw_currency": "USD",
             "fetched_at": None,
             "error": str(error or "查询失败"),
+            "sub2api_usage_endpoint": site_sub2api_usage_endpoint(site) if site.get("platform") == "sub2api" else None,
         }
 
     try:
         if not site.get("login_enabled"):
             return failed_result("未启用登录检测，无法查询今日消耗")
         if (site.get("platform") or "newapi") == "sub2api":
-            ok, usage, error = fetch_sub2api_today_usage(site)
+            ok, usage, error = fetch_sub2api_today_usage(site, now)
         else:
             start_timestamp = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
             end_timestamp = int(now.timestamp())
@@ -1684,6 +1765,9 @@ def today_usage_for_site(site: Dict[str, Any], now: Optional[datetime] = None) -
             "raw_currency": currency,
             "fetched_at": fetched_at,
             "error": None,
+            "source": usage.get("source"),
+            "sub2api_usage_endpoint": usage.get("sub2api_usage_endpoint"),
+            "endpoint_switched": bool(usage.get("endpoint_switched")),
         }
     except Exception as exc:
         return failed_result(exc)
@@ -2753,6 +2837,7 @@ def site_summary(site: Dict[str, Any]) -> Dict[str, Any]:
         "enabled": bool(site["enabled"]),
         "interval_minutes": site["interval_minutes"],
         "usage_divisor": site_usage_divisor(site),
+        "sub2api_usage_endpoint": site_sub2api_usage_endpoint(site),
         "notify_all_groups": not bool(notify_groups),
         "notify_groups": notify_groups,
         "login_enabled": bool(site.get("login_enabled")),
@@ -3041,6 +3126,10 @@ class Handler(BaseHTTPRequestHandler):
                     usage_divisor = validate_usage_divisor(body.get("usage_divisor", 1))
                 except ValueError as exc:
                     return json_response(self, {"success": False, "message": str(exc)}, 400)
+                try:
+                    sub2api_usage_endpoint = validate_sub2api_usage_endpoint(body.get("sub2api_usage_endpoint"))
+                except ValueError as exc:
+                    return json_response(self, {"success": False, "message": str(exc)}, 400)
                 login_enabled = bool(body.get("login_enabled", False))
                 login_username = str(body.get("login_username") or "").strip()
                 login_password = str(body.get("login_password") or "")
@@ -3075,8 +3164,8 @@ class Handler(BaseHTTPRequestHandler):
                 site_id = db_execute(
                     """
                     INSERT INTO sites
-                    (name, base_url, platform, enabled, interval_minutes, usage_divisor, notify_groups_json, login_enabled, auth_mode, login_username, login_password, access_token, access_user_id, refresh_token, token_expires_at, balance_alert_enabled, balance_alert_threshold, status, last_error, last_check_at, next_check_at, consecutive_failures, current_groups_json, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', NULL, NULL, ?, 0, NULL, ?, ?)
+                    (name, base_url, platform, enabled, interval_minutes, usage_divisor, sub2api_usage_endpoint, notify_groups_json, login_enabled, auth_mode, login_username, login_password, access_token, access_user_id, refresh_token, token_expires_at, balance_alert_enabled, balance_alert_threshold, status, last_error, last_check_at, next_check_at, consecutive_failures, current_groups_json, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', NULL, NULL, ?, 0, NULL, ?, ?)
                     """,
                     (
                         name,
@@ -3085,6 +3174,7 @@ class Handler(BaseHTTPRequestHandler):
                         1 if enabled else 0,
                         interval,
                         usage_divisor,
+                        sub2api_usage_endpoint if platform == "sub2api" else "dashboard",
                         None if notify_all_groups else json.dumps(notify_groups, ensure_ascii=False),
                         1 if (login_enabled or platform == "sub2api") else 0,
                         auth_mode if platform == "sub2api" else "password",
@@ -3208,6 +3298,13 @@ class Handler(BaseHTTPRequestHandler):
                     return json_response(self, {"success": False, "message": str(exc)}, 400)
                 fields.append("usage_divisor = ?")
                 params.append(usage_divisor)
+            if "sub2api_usage_endpoint" in body:
+                try:
+                    sub2api_usage_endpoint = validate_sub2api_usage_endpoint(body["sub2api_usage_endpoint"])
+                except ValueError as exc:
+                    return json_response(self, {"success": False, "message": str(exc)}, 400)
+                fields.append("sub2api_usage_endpoint = ?")
+                params.append(sub2api_usage_endpoint if target_platform == "sub2api" else "dashboard")
             if "notify_all_groups" in body or "notify_groups" in body:
                 notify_all_groups = bool(body.get("notify_all_groups", not bool(notification_groups_for_site(site))))
                 notify_groups = normalize_notify_groups(body.get("notify_groups", notification_groups_for_site(site)))

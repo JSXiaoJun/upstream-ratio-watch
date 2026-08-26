@@ -45,6 +45,8 @@ const els = {
   siteBaseUrl: document.getElementById('siteBaseUrl'),
   siteInterval: document.getElementById('siteInterval'),
   siteUsageDivisor: document.getElementById('siteUsageDivisor'),
+  sub2apiUsageEndpointField: document.getElementById('sub2apiUsageEndpointField'),
+  siteSub2apiUsageEndpoint: document.getElementById('siteSub2apiUsageEndpoint'),
   siteAuthMode: document.getElementById('siteAuthMode'),
   siteLoginEnabled: document.getElementById('siteLoginEnabled'),
   siteLoginUsername: document.getElementById('siteLoginUsername'),
@@ -257,6 +259,7 @@ function updatePlatformFields() {
   const isSub2api = platform === 'sub2api';
   els.newapiAuthSection.classList.toggle('hidden', isSub2api);
   els.sub2apiAuthSection.classList.toggle('hidden', !isSub2api);
+  els.sub2apiUsageEndpointField.classList.toggle('hidden', !isSub2api);
   updateSub2apiAuthFields();
   els.testLoginBtn.textContent = isSub2api ? (sub2apiAuthMode() === 'token' ? '测试登录态' : '测试登录') : '测试认证';
   if (isSub2api) {
@@ -616,6 +619,7 @@ function openDialog(site = null) {
     els.siteBaseUrl.value = site.base_url;
     els.siteInterval.value = site.interval_minutes;
     els.siteUsageDivisor.value = site.usage_divisor ?? 1;
+    els.siteSub2apiUsageEndpoint.value = site.sub2api_usage_endpoint || 'dashboard';
     els.siteAuthMode.value = site.auth_mode || 'password';
     els.siteLoginEnabled.checked = !!site.login_enabled;
     els.siteLoginUsername.value = site.login_username || '';
@@ -639,6 +643,7 @@ function openDialog(site = null) {
     els.siteBaseUrl.value = '';
     els.siteInterval.value = 3;
     els.siteUsageDivisor.value = 1;
+    els.siteSub2apiUsageEndpoint.value = 'dashboard';
     els.siteAuthMode.value = 'password';
     els.siteLoginEnabled.checked = false;
     els.siteLoginUsername.value = '';
@@ -860,6 +865,7 @@ els.form.addEventListener('submit', async (e) => {
     base_url: els.siteBaseUrl.value.trim(),
     interval_minutes: Math.max(1, Number(els.siteInterval.value || 3)),
     usage_divisor: Number(els.siteUsageDivisor.value),
+    sub2api_usage_endpoint: platform === 'sub2api' ? els.siteSub2apiUsageEndpoint.value : 'dashboard',
     login_enabled: platform === 'sub2api' ? true : els.siteLoginEnabled.checked,
     auth_mode: authMode,
     login_username: authMode === 'password' ? els.siteLoginUsername.value.trim() : '',
@@ -1147,8 +1153,14 @@ els.queryTodayUsageBtn.addEventListener('click', async () => {
       method: 'POST',
       body: '{}',
     });
+    if (result.sub2api_usage_endpoint) {
+      els.siteSub2apiUsageEndpoint.value = result.sub2api_usage_endpoint;
+      const site = state.sites.find((item) => item.id === siteId);
+      if (site) site.sub2api_usage_endpoint = result.sub2api_usage_endpoint;
+    }
+    const switchedText = result.endpoint_switched ? '；默认接口不可用，已自动切换并固定使用兼容接口' : '';
     if (result.live_success) {
-      els.dialogMsg.textContent = `今日消耗：¥${Number(result.amount || 0).toFixed(2)}（上游原始 ${Number(result.raw_amount || 0).toFixed(4)} ${result.raw_currency || 'USD'}）`;
+      els.dialogMsg.textContent = `今日消耗：¥${Number(result.amount || 0).toFixed(2)}（上游原始 ${Number(result.raw_amount || 0).toFixed(4)} ${result.raw_currency || 'USD'}）${switchedText}`;
     } else if (result.cached) {
       els.dialogMsg.textContent = `实时查询失败：${result.error || '未知错误'}；当天缓存：¥${Number(result.amount || 0).toFixed(2)}`;
       els.dialogMsg.classList.add('error');
