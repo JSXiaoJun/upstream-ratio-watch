@@ -25,10 +25,26 @@
 
 推荐使用 Docker 部署，适合放在 VPS、云服务器、NAS 或 1Panel / 宝塔这类面板里长期运行。
 
+每次推送到 `master` 后，GitHub Actions 会自动运行测试并构建 `linux/amd64`、`linux/arm64` 镜像，发布到：
+
+```text
+ghcr.io/jsxiaojun/upstream-ratio-watch:latest
+```
+
+同时会发布 `sha-<提交哈希>` 标签；推送 `v*` Git 标签时还会发布同名版本标签。首次发布后，需要在 GitHub Packages 的 Package settings 中将镜像可见性设为 `Public`，未登录的服务器才能直接拉取。
+
+直接使用预构建镜像：
+
+```bash
+docker pull ghcr.io/jsxiaojun/upstream-ratio-watch:latest
+```
+
+仓库自带的 `docker-compose.yml` 继续使用本地源码构建，便于直接修改和调试。
+
 完整部署命令：
 
 ```bash
-git clone https://github.com/Regert888/upstream-ratio-watch.git
+git clone https://github.com/JSXiaoJun/upstream-ratio-watch.git
 cd upstream-ratio-watch
 docker network create qq-notify
 docker compose up -d
