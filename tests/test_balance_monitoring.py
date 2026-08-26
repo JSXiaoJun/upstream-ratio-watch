@@ -631,6 +631,32 @@ class BalanceMonitoringTest(unittest.TestCase):
         self.assertTrue(all(site["live_success"] for site in payload["data"]))
         self.assertTrue(all(not site["cached"] for site in payload["data"]))
 
+    def test_site_today_usage_api_queries_one_site_and_reports_cache_fallback(self):
+        site_id = self.add_site("sub2api", 5)
+        app.db_execute("UPDATE sites SET usage_divisor = 10 WHERE id = ?", (site_id,))
+        request = urllib.request.Request(
+            f"{self.api_url}/api/sites/{site_id}/usage/today",
+            data=b"{}",
+            headers={"Content-Type": "application/json", "Cookie": self.session_cookie},
+            method="POST",
+        )
+        with urllib.request.urlopen(request) as response:
+            live = json.loads(response.read())
+        self.assertTrue(live["success"])
+        self.assertTrue(live["live_success"])
+        self.assertFalse(live["cached"])
+        self.assertEqual(0.18, live["amount"])
+        self.assertEqual(1.75, live["raw_amount"])
+
+        with patch.object(app, "fetch_sub2api_today_usage", return_value=(False, {}, "HTTP 429")):
+            with urllib.request.urlopen(request) as response:
+                cached = json.loads(response.read())
+        self.assertTrue(cached["success"])
+        self.assertFalse(cached["live_success"])
+        self.assertTrue(cached["cached"])
+        self.assertEqual("HTTP 429", cached["error"])
+        self.assertEqual(0.18, cached["amount"])
+
     def test_today_usage_uses_same_day_cache_when_live_query_fails(self):
         sub2api_id = self.add_site("sub2api", 5)
         app.db_execute("UPDATE sites SET base_url = ? WHERE id = ?", (f"{self.base_url}/sub2api", sub2api_id))

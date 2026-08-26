@@ -648,7 +648,8 @@ body {
 }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 10px; margin: 0; }
 .dialog-actions .btn { min-width: 94px; }
-.dialog-msg { color: var(--muted); min-height: 20px; }
+#queryTodayUsageBtn { min-width: 118px; }
+.dialog-msg { flex: 1; min-width: 0; min-height: 20px; color: var(--muted); overflow-wrap: anywhere; }
 .dialog-msg.error { color: var(--red); }
 
 .toast-container {
@@ -749,6 +750,7 @@ body {
   .notify-footer { grid-template-columns: 1fr; align-items: stretch; }
   .dialog-grid .span-2, .span-2 { grid-column: auto; }
   .dialog-footer { align-items: stretch; flex-direction: column; padding: 10px 14px; }
-  .dialog-actions { width: 100%; }
-  .dialog-actions .btn { flex: 1; padding: 0 8px; }
+  .dialog-actions { width: 100%; flex-wrap: wrap; }
+  .dialog-actions .btn,
+  #queryTodayUsageBtn { flex: 1 1 calc(50% - 5px); min-width: 0; padding: 0 8px; }
 }

@@ -72,6 +72,7 @@ const els = {
   siteDialogPanels: Array.from(document.querySelectorAll('[data-site-tab-panel]')),
   testConnBtn: document.getElementById('testConnBtn'),
   testLoginBtn: document.getElementById('testLoginBtn'),
+  queryTodayUsageBtn: document.getElementById('queryTodayUsageBtn'),
   closeDialogBtn: document.getElementById('closeDialogBtn'),
   notifyForm: document.getElementById('notifyForm'),
   wecomEnabled: document.getElementById('wecomEnabled'),
@@ -629,6 +630,7 @@ function openDialog(site = null) {
     state.dialogNotifyAllGroups = site.notify_all_groups !== false;
     renderNotifyGroupPicker(availableGroupsForSite(site), site.notify_groups || [], state.dialogNotifyAllGroups);
     els.siteEnabled.checked = !!site.enabled;
+    els.queryTodayUsageBtn.classList.remove('hidden');
   } else {
     els.dialogTitle.textContent = '添加站点';
     els.siteId.value = '';
@@ -651,6 +653,7 @@ function openDialog(site = null) {
     state.dialogNotifyAllGroups = true;
     renderNotifyGroupPicker([], [], true);
     els.siteEnabled.checked = true;
+    els.queryTodayUsageBtn.classList.add('hidden');
   }
   updatePlatformFields();
   els.dialog.showModal();
@@ -1036,6 +1039,37 @@ els.testLoginBtn.addEventListener('click', async () => {
     }
   } catch (err) {
     els.dialogMsg.textContent = `验证失败：${err.message}`;
+  }
+});
+
+els.queryTodayUsageBtn.addEventListener('click', async () => {
+  const siteId = Number(els.siteId.value);
+  if (!siteId) return;
+  const originalText = els.queryTodayUsageBtn.textContent;
+  els.queryTodayUsageBtn.disabled = true;
+  els.queryTodayUsageBtn.textContent = '查询中...';
+  els.dialogMsg.textContent = '正在实时查询今日消耗...';
+  els.dialogMsg.classList.remove('error');
+  try {
+    const result = await api(`/api/sites/${siteId}/usage/today`, {
+      method: 'POST',
+      body: '{}',
+    });
+    if (result.live_success) {
+      els.dialogMsg.textContent = `今日消耗：¥${Number(result.amount || 0).toFixed(2)}（上游原始 ${Number(result.raw_amount || 0).toFixed(4)} ${result.raw_currency || 'USD'}）`;
+    } else if (result.cached) {
+      els.dialogMsg.textContent = `实时查询失败：${result.error || '未知错误'}；当天缓存：¥${Number(result.amount || 0).toFixed(2)}`;
+      els.dialogMsg.classList.add('error');
+    } else {
+      els.dialogMsg.textContent = `今日消耗查询失败：${result.error || '未知错误'}`;
+      els.dialogMsg.classList.add('error');
+    }
+  } catch (err) {
+    els.dialogMsg.textContent = `今日消耗查询失败：${err.message}`;
+    els.dialogMsg.classList.add('error');
+  } finally {
+    els.queryTodayUsageBtn.disabled = false;
+    els.queryTodayUsageBtn.textContent = originalText;
   }
 });
 

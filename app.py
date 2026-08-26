@@ -1525,90 +1525,92 @@ def get_daily_usage_cache(site_id: int, usage_date: str) -> Optional[Dict[str, A
     )
 
 
+def today_usage_for_site(site: Dict[str, Any], now: Optional[datetime] = None) -> Dict[str, Any]:
+    now = now or app_now()
+    usage_date = now.date().isoformat()
+    usage_divisor = site_usage_divisor(site)
+
+    def failed_result(error: Any) -> Dict[str, Any]:
+        cached = get_daily_usage_cache(int(site["id"]), usage_date)
+        if cached:
+            raw_amount = float(cached["amount"])
+            return {
+                "id": site["id"],
+                "name": site["name"],
+                "success": True,
+                "live_success": False,
+                "cached": True,
+                "amount": converted_money_amount(raw_amount, usage_divisor),
+                "raw_amount": raw_amount,
+                "usage_divisor": usage_divisor,
+                "currency": "CNY",
+                "raw_currency": cached.get("currency") or "USD",
+                "fetched_at": cached["fetched_at"],
+                "error": str(error or "查询失败"),
+            }
+        return {
+            "id": site["id"],
+            "name": site["name"],
+            "success": False,
+            "live_success": False,
+            "cached": False,
+            "amount": None,
+            "raw_amount": None,
+            "usage_divisor": usage_divisor,
+            "currency": "CNY",
+            "raw_currency": "USD",
+            "fetched_at": None,
+            "error": str(error or "查询失败"),
+        }
+
+    try:
+        if not site.get("login_enabled"):
+            return failed_result("未启用登录检测，无法查询今日消耗")
+        if (site.get("platform") or "newapi") == "sub2api":
+            ok, usage, error = fetch_sub2api_today_usage(site)
+        else:
+            start_timestamp = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+            end_timestamp = int(now.timestamp())
+            ok, usage, error = fetch_newapi_today_usage(
+                site["base_url"],
+                site.get("access_token") or "",
+                site.get("access_user_id") or "",
+                start_timestamp,
+                end_timestamp,
+            )
+        if not ok:
+            return failed_result(error)
+        fetched_at = utc_now_iso()
+        raw_amount = float(usage["amount"])
+        currency = str(usage.get("currency") or "USD")
+        save_daily_usage_cache(int(site["id"]), usage_date, raw_amount, currency, fetched_at)
+        return {
+            "id": site["id"],
+            "name": site["name"],
+            "success": True,
+            "live_success": True,
+            "cached": False,
+            "amount": converted_money_amount(raw_amount, usage_divisor),
+            "raw_amount": raw_amount,
+            "usage_divisor": usage_divisor,
+            "currency": "CNY",
+            "raw_currency": currency,
+            "fetched_at": fetched_at,
+            "error": None,
+        }
+    except Exception as exc:
+        return failed_result(exc)
+
+
 def bot_today_usage_payload() -> List[Dict[str, Any]]:
     sites = db_query_all("SELECT * FROM sites WHERE enabled = 1 ORDER BY id ASC")
     if not sites:
         return []
     now = app_now()
-    usage_date = now.date().isoformat()
-    start_timestamp = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
-    end_timestamp = int(now.timestamp())
-
-    def inspect_site(site: Dict[str, Any]) -> Dict[str, Any]:
-        usage_divisor = site_usage_divisor(site)
-
-        def failed_result(error: Any) -> Dict[str, Any]:
-            cached = get_daily_usage_cache(int(site["id"]), usage_date)
-            if cached:
-                raw_amount = float(cached["amount"])
-                return {
-                    "id": site["id"],
-                    "name": site["name"],
-                    "success": True,
-                    "live_success": False,
-                    "cached": True,
-                    "amount": converted_money_amount(raw_amount, usage_divisor),
-                    "raw_amount": raw_amount,
-                    "usage_divisor": usage_divisor,
-                    "currency": "CNY",
-                    "raw_currency": cached.get("currency") or "USD",
-                    "fetched_at": cached["fetched_at"],
-                    "error": str(error or "查询失败"),
-                }
-            return {
-                "id": site["id"],
-                "name": site["name"],
-                "success": False,
-                "live_success": False,
-                "cached": False,
-                "amount": None,
-                "raw_amount": None,
-                "usage_divisor": usage_divisor,
-                "currency": "CNY",
-                "raw_currency": "USD",
-                "fetched_at": None,
-                "error": str(error or "查询失败"),
-            }
-
-        try:
-            if not site.get("login_enabled"):
-                return failed_result("未启用登录检测，无法查询今日消耗")
-            if (site.get("platform") or "newapi") == "sub2api":
-                ok, usage, error = fetch_sub2api_today_usage(site)
-            else:
-                ok, usage, error = fetch_newapi_today_usage(
-                    site["base_url"],
-                    site.get("access_token") or "",
-                    site.get("access_user_id") or "",
-                    start_timestamp,
-                    end_timestamp,
-                )
-            if not ok:
-                return failed_result(error)
-            fetched_at = utc_now_iso()
-            raw_amount = float(usage["amount"])
-            currency = str(usage.get("currency") or "USD")
-            save_daily_usage_cache(int(site["id"]), usage_date, raw_amount, currency, fetched_at)
-            return {
-                "id": site["id"],
-                "name": site["name"],
-                "success": True,
-                "live_success": True,
-                "cached": False,
-                "amount": converted_money_amount(raw_amount, usage_divisor),
-                "raw_amount": raw_amount,
-                "usage_divisor": usage_divisor,
-                "currency": "CNY",
-                "raw_currency": currency,
-                "fetched_at": fetched_at,
-                "error": None,
-            }
-        except Exception as exc:
-            return failed_result(exc)
 
     results: Dict[int, Dict[str, Any]] = {}
     with ThreadPoolExecutor(max_workers=min(4, len(sites))) as executor:
-        futures = {executor.submit(inspect_site, site): int(site["id"]) for site in sites}
+        futures = {executor.submit(today_usage_for_site, site, now): int(site["id"]) for site in sites}
         for future in as_completed(futures):
             results[futures[future]] = future.result()
     return [results[int(site["id"])] for site in sites]
@@ -3021,6 +3023,16 @@ class Handler(BaseHTTPRequestHandler):
                     return json_response(self, {"success": False, "message": "invalid site id"}, 400)
                 result = detect_site(site_id)
                 return json_response(self, result)
+
+            if path.startswith("/api/sites/") and path.endswith("/usage/today"):
+                try:
+                    site_id = int(path.split("/")[3])
+                except Exception:
+                    return json_response(self, {"success": False, "message": "invalid site id"}, 400)
+                site = db_query_one("SELECT * FROM sites WHERE id = ?", (site_id,))
+                if not site:
+                    return json_response(self, {"success": False, "message": "site not found"}, 404)
+                return json_response(self, today_usage_for_site(site))
 
             if path == "/api/notifications/test-email":
                 body = read_json_body(self)
