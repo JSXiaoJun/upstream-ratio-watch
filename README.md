@@ -39,7 +39,7 @@ ghcr.io/jsxiaojun/upstream-ratio-watch:latest
 docker pull ghcr.io/jsxiaojun/upstream-ratio-watch:latest
 ```
 
-仓库自带的 `docker-compose.yml` 继续使用本地源码构建，便于直接修改和调试。
+仓库自带的 `docker-compose.yml` 使用上述预构建镜像；每次执行 `docker compose up -d` 时都会检查并拉取最新镜像。需要在本地修改源码并构建时，可改用 `docker compose up -d --build` 前先将服务的 `image` 和 `pull_policy` 替换为 `build: .`。
 
 完整部署命令：
 
@@ -73,7 +73,8 @@ docker compose down
 ```bash
 cd upstream-ratio-watch
 git pull
-docker compose up -d --build
+docker compose pull
+docker compose up -d --force-recreate
 ```
 
 更新后可在服务器核对当前运行版本：

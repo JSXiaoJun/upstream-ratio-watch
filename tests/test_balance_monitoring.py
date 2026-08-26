@@ -657,6 +657,121 @@ class BalanceMonitoringTest(unittest.TestCase):
         self.assertEqual("HTTP 429", cached["error"])
         self.assertEqual(0.18, cached["amount"])
 
+    def test_site_auth_api_uses_saved_secrets_without_exposing_them(self):
+        sub2api_id = self.add_site("sub2api", 5)
+        sub2api_request = urllib.request.Request(
+            f"{self.api_url}/api/sites/{sub2api_id}/auth/test",
+            data=json.dumps({
+                "platform": "sub2api",
+                "base_url": self.base_url,
+                "auth_mode": "password",
+                "login_username": "user@example.com",
+                "login_password": "",
+            }).encode(),
+            headers={"Content-Type": "application/json", "Cookie": self.session_cookie},
+            method="POST",
+        )
+        with patch.object(app, "probe_sub2api_groups", return_value={
+            "success": True,
+            "message": "ok",
+            "groups_count": 1,
+            "groups": {"default": {"ratio": 1}},
+        }) as probe_mock:
+            with urllib.request.urlopen(sub2api_request) as response:
+                sub2api_result = json.loads(response.read())
+        self.assertTrue(sub2api_result["success"])
+        self.assertTrue(sub2api_result["used_saved_credentials"])
+        self.assertNotIn("access_token", json.dumps(sub2api_result))
+        probe_mock.assert_called_once_with(
+            self.base_url,
+            username="user@example.com",
+            password="password",
+            auth_mode="password",
+            access_token="",
+            refresh_token="",
+            token_expires_at=None,
+        )
+
+        app.db_execute("DELETE FROM sites WHERE id = ?", (sub2api_id,))
+        sub2api_token_id = self.add_site("sub2api", 5, token="saved-auth-token")
+        sub2api_token_site = app.db_query_one("SELECT * FROM sites WHERE id = ?", (sub2api_token_id,))
+        with patch.object(app, "probe_sub2api_groups", return_value={
+            "success": True,
+            "message": "ok",
+            "groups_count": 1,
+            "groups": {"default": {"ratio": 1}},
+        }) as token_probe_mock:
+            sub2api_token_result = app.test_site_authentication(sub2api_token_site, {
+                "auth_mode": "token",
+                "access_token": "",
+            })
+        self.assertTrue(sub2api_token_result["success"])
+        self.assertTrue(sub2api_token_result["used_saved_credentials"])
+        token_probe_mock.assert_called_once_with(
+            self.base_url,
+            username="user@example.com",
+            password="",
+            auth_mode="token",
+            access_token="saved-auth-token",
+            refresh_token="",
+            token_expires_at=None,
+        )
+
+        app.db_execute("DELETE FROM sites WHERE id = ?", (sub2api_token_id,))
+        newapi_id = self.add_site("newapi", 5, token="saved-system-token")
+        newapi_request = urllib.request.Request(
+            f"{self.api_url}/api/sites/{newapi_id}/auth/test",
+            data=json.dumps({
+                "platform": "newapi",
+                "base_url": self.base_url,
+                "access_token": "",
+                "access_user_id": "1",
+            }).encode(),
+            headers={"Content-Type": "application/json", "Cookie": self.session_cookie},
+            method="POST",
+        )
+        with patch.object(
+            app,
+            "fetch_newapi_groups_with_access_token",
+            return_value=(True, {"success": True, "data": {"default": {"ratio": 1}}}, None),
+        ) as fetch_mock:
+            with urllib.request.urlopen(newapi_request) as response:
+                newapi_result = json.loads(response.read())
+        self.assertTrue(newapi_result["success"])
+        self.assertTrue(newapi_result["used_saved_credentials"])
+        fetch_mock.assert_called_once_with(self.base_url, "saved-system-token", "1")
+
+    def test_saved_auth_test_persists_rotated_tokens_without_returning_them(self):
+        site_id = self.add_site("sub2api", 5, token="old-access-token")
+        app.db_execute(
+            "UPDATE sites SET refresh_token = ?, token_expires_at = ? WHERE id = ?",
+            ("old-refresh-token", "2020-01-01T00:00:00+08:00", site_id),
+        )
+        site = app.db_query_one("SELECT * FROM sites WHERE id = ?", (site_id,))
+        refreshed_auth = {
+            "access_token": "new-access-token",
+            "refresh_token": "new-refresh-token",
+            "token_expires_at": "2030-01-01T00:00:00+08:00",
+        }
+        with patch.object(app, "probe_sub2api_groups", return_value={
+            "success": True,
+            "message": "ok",
+            "groups_count": 1,
+            "groups": {"default": {"ratio": 1}},
+            "refreshed_auth": refreshed_auth,
+        }):
+            result = app.test_site_authentication(site, {})
+        self.assertTrue(result["success"])
+        self.assertTrue(result["auth_updated"])
+        self.assertNotIn("refreshed_auth", result)
+        updated = app.db_query_one(
+            "SELECT access_token, refresh_token, token_expires_at FROM sites WHERE id = ?",
+            (site_id,),
+        )
+        self.assertEqual("new-access-token", updated["access_token"])
+        self.assertEqual("new-refresh-token", updated["refresh_token"])
+        self.assertEqual("2030-01-01T00:00:00+08:00", updated["token_expires_at"])
+
     def test_today_usage_uses_same_day_cache_when_live_query_fails(self):
         sub2api_id = self.add_site("sub2api", 5)
         app.db_execute("UPDATE sites SET base_url = ? WHERE id = ?", (f"{self.base_url}/sub2api", sub2api_id))

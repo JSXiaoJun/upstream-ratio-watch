@@ -31,7 +31,7 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 STATIC_DIR = APP_DIR / "static"
 DB_PATH = DATA_DIR / "app.db"
-APP_VERSION = "1.9.0"
+APP_VERSION = "1.10.0"
 AUTH_CONFIG_PATH = Path(os.getenv("AUTH_CONFIG_PATH") or (DATA_DIR / "auth.json"))
 AUTH_COOKIE_NAME = "upstream_watch_session"
 DEFAULT_SESSION_DAYS = 30
@@ -1264,6 +1264,93 @@ def probe_sub2api_groups(
     if isinstance(payload.get("refreshed_auth"), dict):
         result["refreshed_auth"] = payload["refreshed_auth"]
     return result
+
+
+def test_site_authentication(site: Dict[str, Any], overrides: Any = None) -> Dict[str, Any]:
+    values = overrides if isinstance(overrides, dict) else {}
+    stored_platform = str(site.get("platform") or "newapi").strip().lower()
+    platform = str(values.get("platform") or stored_platform).strip().lower()
+    if platform not in {"newapi", "sub2api"}:
+        return {"success": False, "message": "platform invalid", "groups_count": 0, "groups": {}}
+
+    same_platform = platform == stored_platform
+    base_url = normalize_base_url(str(values.get("base_url") or site.get("base_url") or ""))
+    if not base_url:
+        return {"success": False, "message": "Base URL 不能为空", "groups_count": 0, "groups": {}}
+
+    if platform == "sub2api":
+        stored_mode = str(site.get("auth_mode") or "password").strip().lower()
+        auth_mode = str(values.get("auth_mode") or stored_mode).strip().lower()
+        if auth_mode not in {"password", "token"}:
+            return {"success": False, "message": "auth_mode invalid", "groups_count": 0, "groups": {}}
+        same_auth = same_platform and auth_mode == stored_mode
+        username = str(values.get("login_username") or (site.get("login_username") if same_auth else "") or "").strip()
+        supplied_password = str(values.get("login_password") or "")
+        supplied_access_token = str(values.get("access_token") or "").strip()
+        supplied_refresh_token = str(values.get("refresh_token") or "").strip()
+        password = (
+            supplied_password or (str(site.get("login_password") or "") if same_auth else "")
+        ) if auth_mode == "password" else ""
+        access_token = (
+            supplied_access_token or (str(site.get("access_token") or "").strip() if same_auth else "")
+        ) if auth_mode == "token" else ""
+        refresh_token = (
+            supplied_refresh_token or (str(site.get("refresh_token") or "").strip() if same_auth else "")
+        ) if auth_mode == "token" else ""
+        token_expires_at = (
+            values.get("token_expires_at") or (site.get("token_expires_at") if same_auth else None)
+        ) if auth_mode == "token" else None
+        used_saved_credentials = same_auth and (
+            not supplied_password if auth_mode == "password" else not supplied_access_token
+        )
+
+        result = probe_sub2api_groups(
+            base_url,
+            username=username,
+            password=password,
+            auth_mode=auth_mode,
+            access_token=access_token,
+            refresh_token=refresh_token,
+            token_expires_at=token_expires_at,
+        )
+        refreshed_auth = result.pop("refreshed_auth", None)
+        if isinstance(refreshed_auth, dict):
+            auth = refreshed_auth_payload(refreshed_auth, refresh_token)
+            db_execute(
+                """
+                UPDATE sites
+                SET access_token = COALESCE(NULLIF(?, ''), access_token),
+                    refresh_token = COALESCE(NULLIF(?, ''), refresh_token),
+                    token_expires_at = COALESCE(NULLIF(?, ''), token_expires_at),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    auth["access_token"], auth["refresh_token"], auth["token_expires_at"],
+                    utc_now_iso(), site["id"],
+                ),
+            )
+            result["auth_updated"] = True
+        result.pop("raw", None)
+        result["used_saved_credentials"] = used_saved_credentials
+        return result
+
+    supplied_access_token = str(values.get("access_token") or "").strip()
+    access_token = supplied_access_token or (str(site.get("access_token") or "").strip() if same_platform else "")
+    access_user_id = str(values.get("access_user_id") or (site.get("access_user_id") if same_platform else "") or "").strip()
+    groups_ok, groups_payload, groups_error = fetch_newapi_groups_with_access_token(
+        base_url,
+        access_token,
+        access_user_id,
+    )
+    groups = parse_groups_payload(groups_payload) if groups_ok else {}
+    return {
+        "success": groups_ok,
+        "message": groups_error or "访问令牌验证成功",
+        "groups_count": len(groups),
+        "groups": groups,
+        "used_saved_credentials": same_platform and not supplied_access_token,
+    }
 
 
 def get_last_success_snapshot(site_id: int) -> Optional[Dict[str, Any]]:
@@ -3033,6 +3120,16 @@ class Handler(BaseHTTPRequestHandler):
                 if not site:
                     return json_response(self, {"success": False, "message": "site not found"}, 404)
                 return json_response(self, today_usage_for_site(site))
+
+            if path.startswith("/api/sites/") and path.endswith("/auth/test"):
+                try:
+                    site_id = int(path.split("/")[3])
+                except Exception:
+                    return json_response(self, {"success": False, "message": "invalid site id"}, 400)
+                site = db_query_one("SELECT * FROM sites WHERE id = ?", (site_id,))
+                if not site:
+                    return json_response(self, {"success": False, "message": "site not found"}, 404)
+                return json_response(self, test_site_authentication(site, read_json_body(self)))
 
             if path == "/api/notifications/test-email":
                 body = read_json_body(self)

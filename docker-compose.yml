@@ -1,6 +1,7 @@
 services:
   upstream-ratio-watch:
-    build: .
+    image: ghcr.io/jsxiaojun/upstream-ratio-watch:latest
+    pull_policy: always
     container_name: upstream-ratio-watch
     restart: unless-stopped
     environment:

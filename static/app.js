@@ -920,6 +920,39 @@ els.form.addEventListener('submit', async (e) => {
   }
 });
 
+function siteAuthTestPayload() {
+  const platform = els.sitePlatform.value;
+  const authMode = platform === 'sub2api' ? sub2apiAuthMode() : 'password';
+  return {
+    platform,
+    base_url: els.siteBaseUrl.value.trim().replace(/\/+$/, ''),
+    auth_mode: authMode,
+    login_username: els.siteLoginUsername.value.trim(),
+    login_password: els.siteLoginPassword.value,
+    access_token: platform === 'sub2api'
+      ? els.siteSub2apiAccessToken.value.trim()
+      : els.siteAccessToken.value.trim(),
+    refresh_token: els.siteRefreshToken.value.trim(),
+    token_expires_at: els.siteTokenExpiresAt.value.trim(),
+    access_user_id: els.siteAccessUserId.value.trim(),
+  };
+}
+
+async function testSavedSiteAuthentication() {
+  const siteId = Number(els.siteId.value);
+  if (!siteId) throw new Error('请先保存站点配置');
+  return api(`/api/sites/${siteId}/auth/test`, {
+    method: 'POST',
+    body: JSON.stringify(siteAuthTestPayload()),
+  });
+}
+
+function updateGroupsFromAuthTest(result) {
+  if (result.success && result.groups) {
+    renderNotifyGroupPicker(Object.keys(result.groups), selectedNotifyGroups(), state.dialogNotifyAllGroups);
+  }
+}
+
 els.testConnBtn.addEventListener('click', async () => {
   const baseUrl = els.siteBaseUrl.value.trim().replace(/\/+$/, '');
   const platform = els.sitePlatform.value;
@@ -928,6 +961,23 @@ els.testConnBtn.addEventListener('click', async () => {
     return;
   }
   const authMode = platform === 'sub2api' ? sub2apiAuthMode() : 'password';
+  if (platform === 'sub2api' && els.siteId.value) {
+    els.dialogMsg.textContent = '正在使用已保存认证检测连接...';
+    els.dialogMsg.classList.remove('error');
+    try {
+      const res = await testSavedSiteAuthentication();
+      const source = res.used_saved_credentials ? '已保存认证' : '当前输入认证';
+      els.dialogMsg.textContent = res.success
+        ? `连接成功（${source}）：${res.groups_count} 个分组`
+        : `连接失败：${res.message}`;
+      els.dialogMsg.classList.toggle('error', !res.success);
+      updateGroupsFromAuthTest(res);
+    } catch (err) {
+      els.dialogMsg.textContent = `连接失败：${err.message}`;
+      els.dialogMsg.classList.add('error');
+    }
+    return;
+  }
   if (platform === 'sub2api' && authMode === 'password' && (!els.siteLoginUsername.value.trim() || !els.siteLoginPassword.value)) {
     els.dialogMsg.textContent = '请填写 sub2api 用户邮箱和密码';
     return;
@@ -976,6 +1026,27 @@ els.testLoginBtn.addEventListener('click', async () => {
     const password = els.siteLoginPassword.value;
     const accessToken = els.siteSub2apiAccessToken.value.trim();
     const refreshToken = els.siteRefreshToken.value.trim();
+    if (els.siteId.value) {
+      if (!baseUrl) {
+        els.dialogMsg.textContent = '请填写 Base URL';
+        return;
+      }
+      els.dialogMsg.textContent = authMode === 'token' ? '正在测试已保存登录态...' : '正在测试已保存登录密码...';
+      els.dialogMsg.classList.remove('error');
+      try {
+        const res = await testSavedSiteAuthentication();
+        const source = res.used_saved_credentials ? '已保存认证' : '当前输入认证';
+        els.dialogMsg.textContent = res.success
+          ? `${authMode === 'token' ? '登录态可用' : '登录成功'}（${source}）：当前用户可见 ${res.groups_count} 个分组`
+          : `${authMode === 'token' ? '登录态失败' : '登录失败'}：${res.message}`;
+        els.dialogMsg.classList.toggle('error', !res.success);
+        updateGroupsFromAuthTest(res);
+      } catch (err) {
+        els.dialogMsg.textContent = `${authMode === 'token' ? '登录态失败' : '登录失败'}：${err.message}`;
+        els.dialogMsg.classList.add('error');
+      }
+      return;
+    }
     if (authMode === 'password' && (!baseUrl || !username || !password)) {
       els.dialogMsg.textContent = '请填写 Base URL、用户邮箱和密码';
       return;
@@ -1017,6 +1088,27 @@ els.testLoginBtn.addEventListener('click', async () => {
   }
   const accessToken = els.siteAccessToken.value.trim();
   const accessUserId = els.siteAccessUserId.value.trim();
+  if (els.siteId.value) {
+    if (!baseUrl || !accessUserId) {
+      els.dialogMsg.textContent = '请填写 Base URL 和 NewAPI 用户 ID';
+      return;
+    }
+    els.dialogMsg.textContent = '正在测试已保存访问令牌...';
+    els.dialogMsg.classList.remove('error');
+    try {
+      const res = await testSavedSiteAuthentication();
+      const source = res.used_saved_credentials ? '已保存令牌' : '当前输入令牌';
+      els.dialogMsg.textContent = res.success
+        ? `验证成功（${source}）：认证后可见 ${res.groups_count} 个分组`
+        : `验证失败：${res.message}`;
+      els.dialogMsg.classList.toggle('error', !res.success);
+      updateGroupsFromAuthTest(res);
+    } catch (err) {
+      els.dialogMsg.textContent = `验证失败：${err.message}`;
+      els.dialogMsg.classList.add('error');
+    }
+    return;
+  }
   if (!baseUrl || !accessToken || !accessUserId) {
     els.dialogMsg.textContent = '请填写 Base URL、系统访问令牌和 NewAPI 用户 ID';
     return;
