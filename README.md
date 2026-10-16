@@ -361,6 +361,15 @@ New-Api-User: NewAPI 用户 ID
 - 该 NewAPI 站点是否支持 `/api/user/self/groups`。
 - 站点是否限制了系统访问令牌权限。
 
+新版 NewAPI 的访问令牌按权限（scope）授权，本程序需要勾选：
+
+| 用途 | 接口 | 权限 |
+| --- | --- | --- |
+| 认证分组、余额 | `/api/user/self/groups`、`/api/user/self` | 个人资料 · 查看（`profile:read`） |
+| 今日消耗 | `/api/log/self/stat` | 使用记录 · 查看（`usage:read`） |
+
+注意“钱包 · 查看”（`wallet:read`）只覆盖充值记录、订阅和邀请信息，不包含余额接口。
+
 
 ## 邮箱推送
 

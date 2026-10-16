@@ -917,6 +917,43 @@ def find_quota_per_unit(payload: Any) -> Optional[float]:
     return None
 
 
+NEWAPI_USER_ID_INVALID_MESSAGE = "NewAPI 用户 ID 应为纯数字（上游「个人资料」中的 ID），请勿填写访问令牌"
+
+NEWAPI_SCOPE_LABELS = {
+    "profile:read": "个人资料 · 查看",
+    "usage:read": "使用记录 · 查看",
+    "wallet:read": "钱包 · 查看",
+}
+
+
+def newapi_auth_error_message(payload: Any, fallback: Optional[str]) -> Optional[str]:
+    if not isinstance(payload, dict):
+        return fallback
+    body: Any = payload
+    raw = payload.get("raw")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            body = json.loads(raw)
+        except ValueError:
+            return fallback
+    if not isinstance(body, dict):
+        return fallback
+    code = str(body.get("code") or "")
+    if code == "ACCESS_TOKEN_SCOPE_DENIED":
+        params = body.get("message_params")
+        scope = str(params.get("scope") or "") if isinstance(params, dict) else ""
+        label = NEWAPI_SCOPE_LABELS.get(scope, scope or "未知权限")
+        return f"访问令牌缺少权限 {scope}（{label}），请在上游「安全与访问」中给令牌勾选该权限"
+    if code == "ACCESS_TOKEN_EXPIRED":
+        return "访问令牌已过期，请在上游重新创建"
+    if code == "ACCESS_TOKEN_LEGACY_RETIRED":
+        return "旧版访问令牌已停用，请在上游「安全与访问」中创建新的访问令牌"
+    message = body.get("message")
+    if body.get("success") is False and message:
+        return f"{fallback}: {message}" if fallback else str(message)
+    return fallback
+
+
 def fetch_newapi_balance(base_url: str, access_token: str, user_id: str = "") -> Tuple[bool, Dict[str, Any], Optional[str]]:
     token = (access_token or "").strip()
     if not token:
@@ -925,13 +962,15 @@ def fetch_newapi_balance(base_url: str, access_token: str, user_id: str = "") ->
         "Authorization": token.removeprefix("Bearer ").removeprefix("bearer ").strip(),
     }
     if str(user_id or "").strip():
+        if not str(user_id).strip().isdigit():
+            return False, {}, NEWAPI_USER_ID_INVALID_MESSAGE
         headers["New-Api-User"] = str(user_id).strip()
     ok, payload, error = request_json(
         f"{normalize_base_url(base_url)}/api/user/self",
         headers=headers,
     )
     if not ok or not isinstance(payload, dict):
-        return False, payload if isinstance(payload, dict) else {"raw": payload}, error or "余额请求失败"
+        return False, payload if isinstance(payload, dict) else {"raw": payload}, newapi_auth_error_message(payload, error or "余额请求失败")
     if payload.get("success") is False:
         return False, payload, str(payload.get("message") or "余额响应 success=false")
     user_data = payload.get("data")
@@ -971,6 +1010,8 @@ def fetch_newapi_today_usage(
     user_id = str(user_id or "").strip()
     if not token or not user_id:
         return False, {}, "今日消耗查询需要系统访问令牌和用户 ID"
+    if not user_id.isdigit():
+        return False, {}, NEWAPI_USER_ID_INVALID_MESSAGE
     headers = {
         "Authorization": token,
         "New-Api-User": user_id,
@@ -981,7 +1022,7 @@ def fetch_newapi_today_usage(
     )
     ok, payload, error = request_json(url, headers=headers)
     if not ok or not isinstance(payload, dict):
-        return False, payload if isinstance(payload, dict) else {"raw": payload}, error or "今日消耗请求失败"
+        return False, payload if isinstance(payload, dict) else {"raw": payload}, newapi_auth_error_message(payload, error or "今日消耗请求失败")
     if payload.get("success") is False:
         return False, payload, str(payload.get("message") or "今日消耗响应 success=false")
     data = payload.get("data")
@@ -1281,6 +1322,8 @@ def fetch_newapi_groups_with_access_token(base_url: str, access_token: str, user
         "Authorization": token.removeprefix("Bearer ").removeprefix("bearer ").strip(),
     }
     if str(user_id or "").strip():
+        if not str(user_id).strip().isdigit():
+            return False, {}, NEWAPI_USER_ID_INVALID_MESSAGE
         headers["New-Api-User"] = str(user_id).strip()
     errors: List[str] = []
     for path in ("/api/user/self/groups", "/api/user/groups"):
@@ -1295,7 +1338,15 @@ def fetch_newapi_groups_with_access_token(base_url: str, access_token: str, user
                 message = payload.get("message") if isinstance(payload, dict) else None
                 errors.append(f"{path}: {message or 'success=false'}")
         except urllib.error.HTTPError as exc:
-            errors.append(f"{path}: HTTP {exc.code}")
+            try:
+                raw = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                raw = ""
+            errors.append(f"{path}: {newapi_auth_error_message({'raw': raw}, f'HTTP {exc.code}')}")
+            # /api/user/groups is public on NewAPI, so falling back after an
+            # auth rejection would report a broken token as valid.
+            if exc.code in (401, 403):
+                break
         except Exception as exc:
             errors.append(f"{path}: {exc}")
 
@@ -3524,6 +3575,8 @@ class Handler(BaseHTTPRequestHandler):
                     return json_response(self, {"success": False, "message": "name/base_url required"}, 400)
                 if platform == "newapi" and login_enabled and (not access_token or not access_user_id):
                     return json_response(self, {"success": False, "message": "使用系统访问令牌时需要填写 NewAPI 用户 ID"}, 400)
+                if platform == "newapi" and login_enabled and not access_user_id.isdigit():
+                    return json_response(self, {"success": False, "message": NEWAPI_USER_ID_INVALID_MESSAGE}, 400)
                 if platform == "sub2api" and auth_mode == "password" and (not login_username or not login_password):
                     return json_response(self, {"success": False, "message": "sub2api 需要填写普通用户邮箱和密码"}, 400)
                 if platform == "sub2api" and auth_mode == "token" and not access_token:
@@ -3791,6 +3844,8 @@ class Handler(BaseHTTPRequestHandler):
                     has_user_id_after_update = bool(access_user_id or existing_access_user_id)
                     if login_enabled and (not has_token_after_update or not has_user_id_after_update):
                         return json_response(self, {"success": False, "message": "使用系统访问令牌时需要填写 NewAPI 用户 ID"}, 400)
+                    if login_enabled and access_user_id and not access_user_id.isdigit():
+                        return json_response(self, {"success": False, "message": NEWAPI_USER_ID_INVALID_MESSAGE}, 400)
                 if target_platform == "sub2api" and auth_mode == "password" and (not (login_username or existing_username) or not (login_password or existing_password)):
                     return json_response(self, {"success": False, "message": "sub2api 需要填写普通用户邮箱和密码"}, 400)
                 if target_platform == "sub2api" and auth_mode == "token" and not (access_token or existing_access_token):

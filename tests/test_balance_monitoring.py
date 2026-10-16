@@ -1115,5 +1115,31 @@ class BalanceMonitoringTest(unittest.TestCase):
         self.assertIn(f"上游站点：{site['base_url']}", body)
 
 
+class NewApiAuthErrorMessageTest(unittest.TestCase):
+    def test_scope_denied_names_missing_scope(self):
+        raw = json.dumps({
+            "success": False,
+            "message": "The access token lacks the required permission: usage:read",
+            "code": "ACCESS_TOKEN_SCOPE_DENIED",
+            "message_params": {"scope": "usage:read"},
+        })
+        message = app.newapi_auth_error_message({"status": 403, "raw": raw}, "HTTP 403")
+        self.assertIn("usage:read", message)
+        self.assertIn("使用记录", message)
+
+    def test_unparseable_body_keeps_fallback(self):
+        self.assertEqual("HTTP 502", app.newapi_auth_error_message({"status": 502, "raw": "<html>"}, "HTTP 502"))
+
+    def test_token_in_user_id_field_is_rejected_before_request(self):
+        base_url = "http://127.0.0.1:9"
+        for ok, _payload, error in (
+            app.fetch_newapi_today_usage(base_url, "nap_x", "nap_x", 0, 1),
+            app.fetch_newapi_balance(base_url, "nap_x", "nap_x"),
+            app.fetch_newapi_groups_with_access_token(base_url, "nap_x", "nap_x"),
+        ):
+            self.assertFalse(ok)
+            self.assertEqual(app.NEWAPI_USER_ID_INVALID_MESSAGE, error)
+
+
 if __name__ == "__main__":
     unittest.main()
