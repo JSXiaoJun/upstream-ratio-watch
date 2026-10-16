@@ -19,6 +19,8 @@
       <nav class="nav">
         <button class="nav-item active" type="button" data-view-target="overview">总览</button>
         <button class="nav-item" type="button" data-view-target="sites">站点监控</button>
+        <button class="nav-item" type="button" data-view-target="reportGroups">汇报分组</button>
+        <button class="nav-item" type="button" data-view-target="botSettings">机器人指令</button>
         <button class="nav-item" type="button" data-view-target="detail">站点详情</button>
         <button class="nav-item" type="button" data-view-target="changes">变化记录</button>
         <button class="nav-item" type="button" data-view-target="notifications">消息推送</button>
@@ -133,6 +135,58 @@
               </thead>
               <tbody id="sitesBody"></tbody>
             </table>
+          </div>
+        </section>
+      </section>
+
+      <section class="view" data-view="reportGroups">
+        <section class="panel" id="reportGroups">
+          <div class="panel-head">
+            <div>
+              <h2>汇报分组</h2>
+              <p>QQ 机器人“查利润 / 查余额”按这里的分组和顺序汇报；未分组的站点排在最后。发送“查利润 分组名”可只看一个分组。</p>
+            </div>
+            <form id="reportGroupForm" class="toolbar">
+              <input id="reportGroupName" class="input" maxlength="40" placeholder="新分组名称，如：画图" />
+              <button class="btn btn-primary" type="submit">添加分组</button>
+            </form>
+          </div>
+          <div class="report-layout-actions">
+            <span id="reportLayoutStatus" class="muted">调整后点击“保存排序”生效。</span>
+            <button id="saveReportLayoutBtn" class="btn btn-primary" type="button">保存排序</button>
+          </div>
+          <div id="reportGroupsBoard" class="report-board"></div>
+        </section>
+      </section>
+
+      <section class="view" data-view="botSettings">
+        <section class="panel" id="botSettings">
+          <div class="panel-head">
+            <div>
+              <h2>机器人指令与消息格式</h2>
+              <p>保存后 QQ 机器人最多 30 秒内生效，不需要重启或重新部署。</p>
+            </div>
+            <div class="toolbar">
+              <span id="botSettingsStatus" class="muted"></span>
+              <button id="saveBotSettingsBtn" class="btn btn-primary" type="button">保存</button>
+            </div>
+          </div>
+          <div class="bot-settings-body">
+            <section class="form-section">
+              <div class="group-picker-head">
+                <div>
+                  <h3>指令别名</h3>
+                  <p class="field-help">群里发送“别名”时，机器人按“实际执行”处理；别名后面的内容会接在后面，例如别名“利润”→“查利润”，发送“利润 画图”等于“查利润 画图”。可用指令：查利润、查余额、查倍率、查充值、查分组、查监控（以机器人环境变量为准）。</p>
+                </div>
+                <button id="addBotAliasBtn" class="btn btn-secondary btn-small" type="button">添加别名</button>
+              </div>
+              <div id="botAliasList" class="bot-alias-list"></div>
+            </section>
+            <section class="form-section">
+              <h3>消息模板</h3>
+              <p class="field-help">用 {变量} 插入数据；模板留空表示不输出这一行；可以换行。点“恢复默认”还原单项。</p>
+              <div id="botTemplateList" class="bot-template-list"></div>
+            </section>
           </div>
         </section>
       </section>
@@ -351,6 +405,11 @@
             <label class="field span-2">
               <span>Base URL</span>
               <input id="siteBaseUrl" class="input" placeholder="https://example.com" />
+            </label>
+            <label class="field span-2">
+              <span>汇报分组</span>
+              <select id="siteReportGroup" class="input"></select>
+              <small class="field-help">决定 QQ 机器人查利润、查余额时该站点归在哪一组；分组可在“汇报分组”页面管理。</small>
             </label>
             <label class="field">
               <span>监控间隔（分钟）</span>

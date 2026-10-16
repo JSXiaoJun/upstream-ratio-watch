@@ -6,6 +6,7 @@ import hmac
 import json
 import math
 import os
+import re
 import secrets
 import smtplib
 import sqlite3
@@ -31,7 +32,7 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 STATIC_DIR = APP_DIR / "static"
 DB_PATH = DATA_DIR / "app.db"
-APP_VERSION = "1.11.0"
+APP_VERSION = "1.12.0"
 AUTH_CONFIG_PATH = Path(os.getenv("AUTH_CONFIG_PATH") or (DATA_DIR / "auth.json"))
 AUTH_COOKIE_NAME = "upstream_watch_session"
 DEFAULT_SESSION_DAYS = 30
@@ -402,6 +403,21 @@ def init_db() -> None:
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                aliases_json TEXT,
+                templates_json TEXT,
+                updated_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS report_groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_sites_enabled_next_check ON sites(enabled, next_check_at);
             CREATE INDEX IF NOT EXISTS idx_snapshots_site_checked ON snapshots(site_id, checked_at DESC);
             CREATE INDEX IF NOT EXISTS idx_changes_site_created ON changes(site_id, created_at DESC);
@@ -452,6 +468,8 @@ def init_db() -> None:
             "balance_last_error": "TEXT",
             "balance_last_check_at": "TEXT",
             "balance_alert_active": "INTEGER NOT NULL DEFAULT 0",
+            "report_group_id": "INTEGER",
+            "report_sort_order": "INTEGER NOT NULL DEFAULT 0",
         }
         for column_name, column_type in site_columns.items():
             if column_name not in columns:
@@ -1640,13 +1658,298 @@ def notification_bearer_token_matches(authorization: Any) -> bool:
     return bool(expected and supplied and hmac.compare_digest(expected, supplied))
 
 
+REPORT_GROUP_JOIN = "LEFT JOIN report_groups rg ON rg.id = sites.report_group_id"
+REPORT_ORDER_BY = "ORDER BY (rg.id IS NULL) ASC, rg.sort_order ASC, rg.id ASC, sites.report_sort_order ASC, sites.id ASC"
+REPORT_GROUP_COLUMNS = "rg.name AS group_name, rg.sort_order AS group_order"
+MAX_REPORT_GROUP_NAME_LENGTH = 40
+
+
+def ordered_sites(where: str = "", params: Iterable[Any] = ()) -> List[Dict[str, Any]]:
+    return db_query_all(
+        f"SELECT sites.*, {REPORT_GROUP_COLUMNS} FROM sites {REPORT_GROUP_JOIN} {where} {REPORT_ORDER_BY}",
+        params,
+    )
+
+
+def list_report_groups() -> List[Dict[str, Any]]:
+    return db_query_all(
+        """
+        SELECT rg.id, rg.name, rg.sort_order, COUNT(sites.id) AS site_count
+        FROM report_groups rg
+        LEFT JOIN sites ON sites.report_group_id = rg.id
+        GROUP BY rg.id
+        ORDER BY rg.sort_order ASC, rg.id ASC
+        """
+    )
+
+
+def validate_report_group_name(value: Any) -> str:
+    name = str(value or "").strip()
+    if not name:
+        raise ValueError("分组名称不能为空")
+    if len(name) > MAX_REPORT_GROUP_NAME_LENGTH:
+        raise ValueError(f"分组名称不能超过 {MAX_REPORT_GROUP_NAME_LENGTH} 个字符")
+    if any(ch.isspace() for ch in name):
+        raise ValueError("分组名称不能包含空格，方便在 QQ 指令中使用")
+    return name
+
+
+def validate_report_group_id(value: Any) -> Optional[int]:
+    if value in (None, "", 0, "0"):
+        return None
+    try:
+        group_id = int(value)
+    except (TypeError, ValueError):
+        raise ValueError("汇报分组无效")
+    if not db_query_one("SELECT id FROM report_groups WHERE id = ?", (group_id,)):
+        raise ValueError("汇报分组不存在")
+    return group_id
+
+
+def next_report_sort_order(group_id: Optional[int]) -> int:
+    row = db_query_one(
+        "SELECT COALESCE(MAX(report_sort_order), 0) AS max_order FROM sites WHERE report_group_id IS ?",
+        (group_id,),
+    )
+    return int((row or {}).get("max_order") or 0) + 1
+
+
+def create_report_group(name: Any) -> int:
+    group_name = validate_report_group_name(name)
+    if db_query_one("SELECT id FROM report_groups WHERE name = ?", (group_name,)):
+        raise ValueError("分组名称已存在")
+    row = db_query_one("SELECT COALESCE(MAX(sort_order), 0) AS max_order FROM report_groups")
+    now = utc_now_iso()
+    return db_execute(
+        "INSERT INTO report_groups (name, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?)",
+        (group_name, int((row or {}).get("max_order") or 0) + 1, now, now),
+    )
+
+
+def rename_report_group(group_id: int, name: Any) -> None:
+    group_name = validate_report_group_name(name)
+    existing = db_query_one("SELECT id FROM report_groups WHERE name = ?", (group_name,))
+    if existing and int(existing["id"]) != group_id:
+        raise ValueError("分组名称已存在")
+    if not db_query_one("SELECT id FROM report_groups WHERE id = ?", (group_id,)):
+        raise LookupError("分组不存在")
+    db_execute("UPDATE report_groups SET name = ?, updated_at = ? WHERE id = ?", (group_name, utc_now_iso(), group_id))
+
+
+def delete_report_group(group_id: int) -> None:
+    with DB_LOCK, connect_db() as conn:
+        conn.execute("UPDATE sites SET report_group_id = NULL WHERE report_group_id = ?", (group_id,))
+        conn.execute("DELETE FROM report_groups WHERE id = ?", (group_id,))
+
+
+def parse_id_list(value: Any, label: str) -> List[int]:
+    if not isinstance(value, list):
+        raise ValueError(f"{label}必须是数组")
+    try:
+        ids = [int(item) for item in value]
+    except (TypeError, ValueError):
+        raise ValueError(f"{label}包含无效 ID")
+    if len(set(ids)) != len(ids):
+        raise ValueError(f"{label}包含重复 ID")
+    return ids
+
+
+def reorder_report_groups(group_ids: Any) -> None:
+    ids = parse_id_list(group_ids, "分组顺序")
+    existing = {int(row["id"]) for row in db_query_all("SELECT id FROM report_groups")}
+    if set(ids) != existing:
+        raise ValueError("分组顺序必须包含全部分组")
+    now = utc_now_iso()
+    db_execute_many(
+        "UPDATE report_groups SET sort_order = ?, updated_at = ? WHERE id = ?",
+        [(index + 1, now, group_id) for index, group_id in enumerate(ids)],
+    )
+
+
+def reorder_report_sites(layout: Any) -> None:
+    """layout: [{"group_id": int | None, "site_ids": [int, ...]}, ...] covering every site."""
+    if not isinstance(layout, list):
+        raise ValueError("站点排序数据无效")
+    existing_groups = {int(row["id"]) for row in db_query_all("SELECT id FROM report_groups")}
+    existing_sites = {int(row["id"]) for row in db_query_all("SELECT id FROM sites")}
+    updates: List[Tuple[Optional[int], int, int]] = []
+    seen: set = set()
+    for entry in layout:
+        if not isinstance(entry, dict):
+            raise ValueError("站点排序数据无效")
+        group_id = entry.get("group_id")
+        group_id = None if group_id in (None, "", 0) else int(group_id)
+        if group_id is not None and group_id not in existing_groups:
+            raise ValueError("站点排序包含不存在的分组")
+        for index, site_id in enumerate(parse_id_list(entry.get("site_ids"), "站点顺序")):
+            if site_id in seen:
+                raise ValueError("站点排序包含重复站点")
+            seen.add(site_id)
+            updates.append((group_id, index + 1, site_id))
+    if seen != existing_sites:
+        raise ValueError("站点排序必须包含全部站点")
+    db_execute_many("UPDATE sites SET report_group_id = ?, report_sort_order = ? WHERE id = ?", updates)
+
+
+MAX_BOT_ALIASES = 100
+MAX_BOT_ALIAS_LENGTH = 30
+MAX_BOT_ALIAS_TARGET_LENGTH = 80
+MAX_BOT_TEMPLATE_LENGTH = 500
+
+# Must stay identical to DEFAULT_TEMPLATES in qq-monitor-bot/src/notification-api.mjs.
+DEFAULT_BOT_TEMPLATES: Dict[str, str] = {
+    "profit_title": "【利润】",
+    "profit_group_header": "▍{group}",
+    "profit_site_line": "{name}：{amount}{age}",
+    "profit_site_failed": "{name}：查询失败（0）",
+    "profit_group_subtotal": "小计：{subtotal}",
+    "profit_separator": "——————",
+    "profit_footer": "上游总和：{upstream_total}\n本站消耗：{local_usage}\n利润：{profit}",
+    "profit_filter_title": "【上游消耗 · {group}】",
+    "profit_filter_footer": "分组合计：{total}",
+    "balance_title": "【当前余额】",
+    "balance_filter_title": "【当前余额 · {group}】",
+    "balance_group_header": "▍{group}",
+    "balance_site_line": "{name}：{balance}{age}",
+    "balance_site_missing": "{name}：暂无数据",
+    "balance_group_subtotal": "小计：{subtotal}",
+}
+
+BOT_TEMPLATE_VARIABLES: Dict[str, List[str]] = {
+    "profit_title": [],
+    "profit_group_header": ["group", "count"],
+    "profit_site_line": ["name", "amount", "age", "group"],
+    "profit_site_failed": ["name", "group"],
+    "profit_group_subtotal": ["group", "subtotal", "count"],
+    "profit_separator": [],
+    "profit_footer": ["upstream_total", "local_usage", "profit"],
+    "profit_filter_title": ["group"],
+    "profit_filter_footer": ["group", "total"],
+    "balance_title": [],
+    "balance_filter_title": ["group"],
+    "balance_group_header": ["group", "count"],
+    "balance_site_line": ["name", "balance", "age", "group"],
+    "balance_site_missing": ["name", "group"],
+    "balance_group_subtotal": ["group", "subtotal", "count"],
+}
+
+TEMPLATE_PLACEHOLDER_PATTERN = re.compile(r"\{([A-Za-z_]+)\}")
+
+
+def load_bot_settings_row() -> Dict[str, Any]:
+    row = db_query_one("SELECT aliases_json, templates_json, updated_at FROM bot_settings WHERE id = 1") or {}
+
+    def parse(raw: Any, fallback: Any) -> Any:
+        try:
+            value = json.loads(raw) if raw else fallback
+        except (TypeError, ValueError):
+            return fallback
+        return value if isinstance(value, type(fallback)) else fallback
+
+    return {
+        "aliases": parse(row.get("aliases_json"), []),
+        "templates": parse(row.get("templates_json"), {}),
+        "updated_at": row.get("updated_at"),
+    }
+
+
+def bot_settings_payload() -> Dict[str, Any]:
+    stored = load_bot_settings_row()
+    overrides = {key: value for key, value in stored["templates"].items() if key in DEFAULT_BOT_TEMPLATES}
+    return {
+        "aliases": stored["aliases"],
+        "template_overrides": overrides,
+        "templates": {**DEFAULT_BOT_TEMPLATES, **overrides},
+        "default_templates": DEFAULT_BOT_TEMPLATES,
+        "template_variables": BOT_TEMPLATE_VARIABLES,
+        "updated_at": stored["updated_at"],
+    }
+
+
+def bot_config_payload() -> Dict[str, Any]:
+    payload = bot_settings_payload()
+    return {"aliases": payload["aliases"], "templates": payload["templates"], "updated_at": payload["updated_at"]}
+
+
+def validate_bot_aliases(value: Any) -> List[Dict[str, str]]:
+    if not isinstance(value, list):
+        raise ValueError("指令别名必须是数组")
+    if len(value) > MAX_BOT_ALIASES:
+        raise ValueError(f"指令别名最多 {MAX_BOT_ALIASES} 条")
+    aliases: List[Dict[str, str]] = []
+    seen: set = set()
+    for index, item in enumerate(value, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"第 {index} 条别名格式无效")
+        alias = str(item.get("alias") or "").strip()
+        target = " ".join(str(item.get("target") or "").split())
+        if not alias or not target:
+            raise ValueError(f"第 {index} 条别名的指令和实际执行内容都不能为空")
+        if any(ch.isspace() for ch in alias):
+            raise ValueError(f"别名「{alias}」不能包含空格")
+        if len(alias) > MAX_BOT_ALIAS_LENGTH:
+            raise ValueError(f"别名「{alias}」不能超过 {MAX_BOT_ALIAS_LENGTH} 个字符")
+        if len(target) > MAX_BOT_ALIAS_TARGET_LENGTH:
+            raise ValueError(f"别名「{alias}」的实际执行内容不能超过 {MAX_BOT_ALIAS_TARGET_LENGTH} 个字符")
+        if target == alias or target.split(" ", 1)[0] == alias:
+            raise ValueError(f"别名「{alias}」不能指向自己")
+        if alias in seen:
+            raise ValueError(f"别名「{alias}」重复")
+        seen.add(alias)
+        aliases.append({"alias": alias, "target": target})
+    return aliases
+
+
+def validate_bot_templates(value: Any) -> Dict[str, str]:
+    if not isinstance(value, dict):
+        raise ValueError("消息模板格式无效")
+    overrides: Dict[str, str] = {}
+    for key, raw in value.items():
+        if key not in DEFAULT_BOT_TEMPLATES:
+            raise ValueError(f"未知的模板项：{key}")
+        if raw is None:
+            continue
+        text = str(raw).replace("\r\n", "\n")
+        if len(text) > MAX_BOT_TEMPLATE_LENGTH:
+            raise ValueError(f"模板「{key}」不能超过 {MAX_BOT_TEMPLATE_LENGTH} 个字符")
+        allowed = set(BOT_TEMPLATE_VARIABLES[key])
+        unknown = sorted({name for name in TEMPLATE_PLACEHOLDER_PATTERN.findall(text) if name not in allowed})
+        if unknown:
+            allowed_text = "、".join(f"{{{name}}}" for name in BOT_TEMPLATE_VARIABLES[key]) or "无"
+            raise ValueError(f"模板「{key}」包含不支持的变量 {'、'.join(f'{{{n}}}' for n in unknown)}，可用变量：{allowed_text}")
+        if text != DEFAULT_BOT_TEMPLATES[key]:
+            overrides[key] = text
+    return overrides
+
+
+def update_bot_settings(body: Any) -> None:
+    if not isinstance(body, dict):
+        raise ValueError("请求体格式无效")
+    current = load_bot_settings_row()
+    aliases = validate_bot_aliases(body["aliases"]) if "aliases" in body else current["aliases"]
+    templates = validate_bot_templates(body["templates"]) if "templates" in body else current["templates"]
+    db_execute(
+        """
+        INSERT INTO bot_settings (id, aliases_json, templates_json, updated_at)
+        VALUES (1, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            aliases_json = excluded.aliases_json,
+            templates_json = excluded.templates_json,
+            updated_at = excluded.updated_at
+        """,
+        (json.dumps(aliases, ensure_ascii=False), json.dumps(templates, ensure_ascii=False), utc_now_iso()),
+    )
+
+
 def bot_balance_payload() -> List[Dict[str, Any]]:
     sites = db_query_all(
-        """
-        SELECT name, current_balance, balance_currency, balance_last_error,
-               balance_last_check_at, enabled, status, usage_divisor
+        f"""
+        SELECT sites.name, sites.current_balance, sites.balance_currency, sites.balance_last_error,
+               sites.balance_last_check_at, sites.enabled, sites.status, sites.usage_divisor,
+               {REPORT_GROUP_COLUMNS}
         FROM sites
-        ORDER BY id ASC
+        {REPORT_GROUP_JOIN}
+        {REPORT_ORDER_BY}
         """
     )
     for site in sites:
@@ -1773,8 +2076,14 @@ def today_usage_for_site(site: Dict[str, Any], now: Optional[datetime] = None) -
         return failed_result(exc)
 
 
+def with_report_group(site: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, Any]:
+    result["group_name"] = site.get("group_name")
+    result["group_order"] = site.get("group_order")
+    return result
+
+
 def bot_today_usage_payload() -> List[Dict[str, Any]]:
-    sites = db_query_all("SELECT * FROM sites WHERE enabled = 1 ORDER BY id ASC")
+    sites = ordered_sites("WHERE sites.enabled = 1")
     if not sites:
         return []
     now = app_now()
@@ -1784,7 +2093,7 @@ def bot_today_usage_payload() -> List[Dict[str, Any]]:
         futures = {executor.submit(today_usage_for_site, site, now): int(site["id"]) for site in sites}
         for future in as_completed(futures):
             results[futures[future]] = future.result()
-    return [results[int(site["id"])] for site in sites]
+    return [with_report_group(site, results[int(site["id"])]) for site in sites]
 
 
 def site_detection_lock(site_id: int) -> threading.Lock:
@@ -1801,7 +2110,7 @@ def ratio_groups_for_site(site: Dict[str, Any], result: Dict[str, Any]) -> Dict[
 
 
 def bot_live_ratio_payload() -> List[Dict[str, Any]]:
-    sites = db_query_all("SELECT * FROM sites WHERE enabled = 1 ORDER BY id ASC")
+    sites = ordered_sites("WHERE sites.enabled = 1")
     if not sites:
         return []
 
@@ -1841,7 +2150,7 @@ def bot_live_ratio_payload() -> List[Dict[str, Any]]:
         futures = {executor.submit(inspect_site, site): int(site["id"]) for site in sites}
         for future in as_completed(futures):
             results[futures[future]] = future.result()
-    return [results[int(site["id"])] for site in sites]
+    return [with_report_group(site, results[int(site["id"])]) for site in sites]
 
 
 def update_notification_settings(body: Dict[str, Any]) -> None:
@@ -2442,6 +2751,7 @@ def record_balance_event(
     body = "\n".join([
         "上游余额监控提醒",
         f"站点：{site['name']}",
+        f"上游站点：{site.get('base_url') or '-'}",
         f"平台：{platform_label(site)}",
         f"当前余额：{format_balance_amount(amount, currency)}",
         f"预警阈值：{format_balance_amount(threshold, currency)}",
@@ -2834,6 +3144,9 @@ def site_summary(site: Dict[str, Any]) -> Dict[str, Any]:
         "base_url": site["base_url"],
         "platform": site["platform"],
         "platform_label": "sub2api" if site["platform"] == "sub2api" else "NewAPI",
+        "report_group_id": site.get("report_group_id"),
+        "report_group_name": site.get("group_name"),
+        "report_sort_order": site.get("report_sort_order") or 0,
         "enabled": bool(site["enabled"]),
         "interval_minutes": site["interval_minutes"],
         "usage_divisor": site_usage_divisor(site),
@@ -2875,7 +3188,7 @@ def site_summary(site: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def overview_payload() -> Dict[str, Any]:
-    sites = db_query_all("SELECT * FROM sites ORDER BY id DESC")
+    sites = ordered_sites()
     changes = db_query_all("SELECT * FROM changes ORDER BY id DESC LIMIT 8")
     totals = {
         "sites_total": len(sites),
@@ -2902,8 +3215,7 @@ def overview_payload() -> Dict[str, Any]:
 
 
 def list_sites_payload() -> List[Dict[str, Any]]:
-    sites = db_query_all("SELECT * FROM sites ORDER BY id DESC")
-    return [site_summary(site) for site in sites]
+    return [site_summary(site) for site in ordered_sites()]
 
 
 def list_snapshots(site_id: int) -> List[Dict[str, Any]]:
@@ -2986,6 +3298,10 @@ class Handler(BaseHTTPRequestHandler):
             if not notification_bearer_token_matches(self.headers.get("Authorization")):
                 return json_response(self, {"success": False, "message": "机器人接口鉴权失败"}, 401)
             return json_response(self, {"success": True, "data": bot_balance_payload()})
+        if path == "/api/bot/config":
+            if not notification_bearer_token_matches(self.headers.get("Authorization")):
+                return json_response(self, {"success": False, "message": "机器人接口鉴权失败"}, 401)
+            return json_response(self, {"success": True, "data": bot_config_payload()})
         if path in {"/login", "/login.html"}:
             if self._auth_session():
                 return redirect_response(self, "/")
@@ -3006,6 +3322,10 @@ class Handler(BaseHTTPRequestHandler):
             return json_response(self, overview_payload())
         if path == "/api/sites":
             return json_response(self, {"data": list_sites_payload()})
+        if path == "/api/report-groups":
+            return json_response(self, {"data": list_report_groups()})
+        if path == "/api/bot-settings":
+            return json_response(self, {"data": bot_settings_payload()})
         if path == "/api/changes":
             params = parse_qs(parsed.query)
             limit = int(params.get("limit", ["100"])[0] or 100)
@@ -3160,6 +3480,10 @@ class Handler(BaseHTTPRequestHandler):
                     return json_response(self, {"success": False, "message": "NewAPI 余额监控需要开启认证增强监控"}, 400)
                 if not notify_all_groups and not notify_groups:
                     return json_response(self, {"success": False, "message": "指定分组通知模式至少需要选择一个分组"}, 400)
+                try:
+                    report_group_id = validate_report_group_id(body.get("report_group_id"))
+                except ValueError as exc:
+                    return json_response(self, {"success": False, "message": str(exc)}, 400)
                 now = utc_now_iso()
                 site_id = db_execute(
                     """
@@ -3191,7 +3515,19 @@ class Handler(BaseHTTPRequestHandler):
                         now,
                     ),
                 )
+                db_execute(
+                    "UPDATE sites SET report_group_id = ?, report_sort_order = ? WHERE id = ?",
+                    (report_group_id, next_report_sort_order(report_group_id), site_id),
+                )
                 return json_response(self, {"success": True, "id": site_id})
+
+            if path == "/api/report-groups":
+                body = read_json_body(self)
+                try:
+                    group_id = create_report_group(body.get("name"))
+                except ValueError as exc:
+                    return json_response(self, {"success": False, "message": str(exc)}, 400)
+                return json_response(self, {"success": True, "id": group_id, "data": list_report_groups()})
 
             if path.startswith("/api/sites/") and path.endswith("/check"):
                 try:
@@ -3261,6 +3597,43 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if not self._require_auth(api_request=True):
             return
+        if path == "/api/bot-settings":
+            try:
+                update_bot_settings(read_json_body(self))
+            except ValueError as exc:
+                return json_response(self, {"success": False, "message": str(exc)}, 400)
+            return json_response(self, {"success": True, "data": bot_settings_payload()})
+
+        if path == "/api/report-groups/order":
+            body = read_json_body(self)
+            try:
+                reorder_report_groups(body.get("group_ids"))
+            except ValueError as exc:
+                return json_response(self, {"success": False, "message": str(exc)}, 400)
+            return json_response(self, {"success": True, "data": list_report_groups()})
+
+        if path == "/api/sites/order":
+            body = read_json_body(self)
+            try:
+                reorder_report_sites(body.get("layout"))
+            except ValueError as exc:
+                return json_response(self, {"success": False, "message": str(exc)}, 400)
+            return json_response(self, {"success": True})
+
+        if path.startswith("/api/report-groups/"):
+            try:
+                group_id = int(path.split("/")[3])
+            except Exception:
+                return json_response(self, {"success": False, "message": "invalid group id"}, 400)
+            body = read_json_body(self)
+            try:
+                rename_report_group(group_id, body.get("name"))
+            except ValueError as exc:
+                return json_response(self, {"success": False, "message": str(exc)}, 400)
+            except LookupError as exc:
+                return json_response(self, {"success": False, "message": str(exc)}, 404)
+            return json_response(self, {"success": True, "data": list_report_groups()})
+
         if path.startswith("/api/sites/"):
             try:
                 site_id = int(path.split("/")[3])
@@ -3405,6 +3778,16 @@ class Handler(BaseHTTPRequestHandler):
                     if login_enabled and access_user_id:
                         fields.append("access_user_id = ?")
                         params.append(access_user_id)
+            if "report_group_id" in body:
+                try:
+                    report_group_id = validate_report_group_id(body["report_group_id"])
+                except ValueError as exc:
+                    return json_response(self, {"success": False, "message": str(exc)}, 400)
+                if report_group_id != site.get("report_group_id"):
+                    fields.append("report_group_id = ?")
+                    params.append(report_group_id)
+                    fields.append("report_sort_order = ?")
+                    params.append(next_report_sort_order(report_group_id))
             if "status" in body:
                 fields.append("status = ?")
                 params.append(str(body["status"]))
@@ -3440,6 +3823,13 @@ class Handler(BaseHTTPRequestHandler):
                 return json_response(self, {"success": False, "message": "invalid site id"}, 400)
             db_execute("DELETE FROM sites WHERE id = ?", (site_id,))
             return json_response(self, {"success": True})
+        if path.startswith("/api/report-groups/"):
+            try:
+                group_id = int(path.split("/")[3])
+            except Exception:
+                return json_response(self, {"success": False, "message": "invalid group id"}, 400)
+            delete_report_group(group_id)
+            return json_response(self, {"success": True, "data": list_report_groups()})
         self.send_error(HTTPStatus.NOT_FOUND)
 
 

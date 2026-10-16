@@ -278,6 +278,90 @@ body {
   word-break: break-all;
 }
 
+.upstream-link {
+  color: var(--blue);
+  text-decoration: none;
+  word-break: break-all;
+}
+.upstream-link:hover,
+.upstream-link:focus-visible { text-decoration: underline; }
+
+.report-layout-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 18px 0;
+}
+.report-layout-actions .error { color: var(--red); }
+.report-board {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: 12px;
+  padding: 12px 18px 18px;
+}
+.report-group-card {
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+}
+.report-group-card.ungrouped { border-style: dashed; }
+.report-group-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+.report-site-list { display: grid; gap: 6px; }
+.report-site-row {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+}
+.report-site-order { color: var(--muted); font-size: 12px; text-align: center; }
+.report-site-name strong { display: block; font-size: 13px; overflow-wrap: anywhere; }
+.report-site-name span { color: var(--muted); font-size: 12px; }
+.input-small { height: 30px; padding: 0 6px; font-size: 12px; max-width: 110px; }
+
+.bot-settings-body { display: grid; gap: 14px; padding: 12px 18px 18px; }
+#botSettingsStatus.error { color: var(--red); }
+.bot-alias-list { display: grid; gap: 6px; }
+#addBotAliasBtn { flex-shrink: 0; white-space: nowrap; }
+.bot-alias-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 2fr) auto;
+  align-items: center;
+  gap: 8px;
+}
+.bot-template-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
+  gap: 10px;
+}
+.bot-template-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.bot-template-input {
+  height: auto;
+  min-height: 38px;
+  padding: 8px 10px;
+  font-family: inherit;
+  resize: vertical;
+  white-space: pre;
+}
+
 .group-list { display: grid; gap: 6px; }
 .group-row {
   display: grid;

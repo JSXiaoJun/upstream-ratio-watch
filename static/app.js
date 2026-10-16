@@ -12,6 +12,11 @@ const state = {
   refreshInFlight: false,
   dialogAvailableGroups: [],
   dialogNotifyAllGroups: true,
+  reportGroups: [],
+  reportLayout: null,
+  reportLayoutDirty: false,
+  botSettings: null,
+  botSettingsDirty: false,
 };
 
 const els = {
@@ -103,6 +108,17 @@ const els = {
   smtpTo: document.getElementById('smtpTo'),
   notifyStatus: document.getElementById('notifyStatus'),
   testEmailBtn: document.getElementById('testEmailBtn'),
+  siteReportGroup: document.getElementById('siteReportGroup'),
+  reportGroupForm: document.getElementById('reportGroupForm'),
+  reportGroupName: document.getElementById('reportGroupName'),
+  reportGroupsBoard: document.getElementById('reportGroupsBoard'),
+  reportLayoutStatus: document.getElementById('reportLayoutStatus'),
+  saveReportLayoutBtn: document.getElementById('saveReportLayoutBtn'),
+  botAliasList: document.getElementById('botAliasList'),
+  botTemplateList: document.getElementById('botTemplateList'),
+  addBotAliasBtn: document.getElementById('addBotAliasBtn'),
+  saveBotSettingsBtn: document.getElementById('saveBotSettingsBtn'),
+  botSettingsStatus: document.getElementById('botSettingsStatus'),
 };
 
 function fmtTime(value) {
@@ -180,6 +196,21 @@ function balanceLabel(site) {
   const currency = String(site.balance_currency || '').toUpperCase();
   const symbol = currency === 'USD' ? '$' : ['CNY', 'RMB'].includes(currency) ? '¥' : `${currency} `;
   return `${symbol}${value.toFixed(2)}`;
+}
+
+function safeHttpUrl(value) {
+  try {
+    const url = new URL(String(value || ''));
+    return ['http:', 'https:'].includes(url.protocol) ? url.href : '';
+  } catch {
+    return '';
+  }
+}
+
+function upstreamLink(baseUrl) {
+  const href = safeHttpUrl(baseUrl);
+  if (!href) return escapeHtml(baseUrl || '-');
+  return `<a class="upstream-link" href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer" title="在新标签页打开上游站点">${escapeHtml(baseUrl)} ↗</a>`;
 }
 
 function showToast(message, type = 'success') {
@@ -332,9 +363,173 @@ function renderActiveView() {
     renderNotificationSettings();
     return;
   }
+  if (state.activeView === 'botSettings') {
+    renderBotSettings();
+    return;
+  }
+  if (state.activeView === 'reportGroups') {
+    const editingSelect = document.activeElement?.matches?.('[data-report-site-group]');
+    if (!editingSelect || !state.reportLayout) renderReportBoard();
+    return;
+  }
   if (state.activeView === 'detail') {
     renderDetail(state.sites.find((s) => s.id === state.selectedSiteId));
   }
+}
+
+function buildReportLayout() {
+  const groups = state.reportGroups.map((group) => ({ id: group.id, name: group.name, siteIds: [] }));
+  const ungrouped = { id: null, name: '未分组', siteIds: [] };
+  const byId = new Map(groups.map((group) => [group.id, group]));
+  state.sites.forEach((site) => {
+    (byId.get(site.report_group_id) || ungrouped).siteIds.push(site.id);
+  });
+  return [...groups, ungrouped];
+}
+
+function setReportLayoutDirty(dirty) {
+  state.reportLayoutDirty = dirty;
+  els.reportLayoutStatus.textContent = dirty ? '排序已修改，尚未保存' : '调整后点击“保存排序”生效。';
+  els.reportLayoutStatus.classList.toggle('error', dirty);
+}
+
+function renderReportBoard() {
+  if (!state.reportLayout || !state.reportLayoutDirty) state.reportLayout = buildReportLayout();
+  const layout = state.reportLayout;
+  const siteById = new Map(state.sites.map((site) => [site.id, site]));
+  const placed = new Set();
+  layout.forEach((group) => {
+    group.siteIds = group.siteIds.filter((id) => siteById.has(id) && !placed.has(id) && placed.add(id));
+  });
+  state.sites.forEach((site) => {
+    if (!placed.has(site.id)) layout[layout.length - 1].siteIds.push(site.id);
+  });
+  const groupOptions = layout.map((group, index) => `<option value="${index}">${escapeHtml(group.name)}</option>`).join('');
+  const realGroupCount = layout.length - 1;
+  els.reportGroupsBoard.innerHTML = layout.map((group, groupIndex) => {
+    const isUngrouped = group.id === null;
+    const rows = group.siteIds.length
+      ? group.siteIds.map((siteId, siteIndex) => {
+          const site = siteById.get(siteId);
+          if (!site) return '';
+          return `
+            <div class="report-site-row">
+              <span class="report-site-order">${siteIndex + 1}</span>
+              <div class="report-site-name">
+                <strong>${escapeHtml(site.name)}</strong>
+                <span>${escapeHtml(platformLabel(site))}${site.enabled ? '' : ' · 已停用'}</span>
+              </div>
+              <div class="action-row">
+                <button class="btn btn-secondary btn-small" type="button" data-report-site-move="-1" data-group-index="${groupIndex}" data-site-index="${siteIndex}" ${siteIndex === 0 ? 'disabled' : ''} aria-label="上移 ${escapeHtml(site.name)}">↑</button>
+                <button class="btn btn-secondary btn-small" type="button" data-report-site-move="1" data-group-index="${groupIndex}" data-site-index="${siteIndex}" ${siteIndex === group.siteIds.length - 1 ? 'disabled' : ''} aria-label="下移 ${escapeHtml(site.name)}">↓</button>
+                <select class="input input-small" data-report-site-group data-group-index="${groupIndex}" data-site-index="${siteIndex}" aria-label="${escapeHtml(site.name)} 所属分组">
+                  ${groupOptions.replace(`value="${groupIndex}"`, `value="${groupIndex}" selected`)}
+                </select>
+              </div>
+            </div>
+          `;
+        }).join('')
+      : '<div class="empty-inline">暂无站点</div>';
+    return `
+      <section class="report-group-card${isUngrouped ? ' ungrouped' : ''}">
+        <div class="report-group-head">
+          <div>
+            <div class="section-title">${isUngrouped ? '' : `${groupIndex + 1}. `}${escapeHtml(group.name)}</div>
+            <span class="muted">${group.siteIds.length} 个站点</span>
+          </div>
+          ${isUngrouped ? '' : `
+            <div class="action-row">
+              <button class="btn btn-secondary btn-small" type="button" data-report-group-move="-1" data-group-index="${groupIndex}" ${groupIndex === 0 ? 'disabled' : ''} aria-label="上移分组 ${escapeHtml(group.name)}">↑</button>
+              <button class="btn btn-secondary btn-small" type="button" data-report-group-move="1" data-group-index="${groupIndex}" ${groupIndex === realGroupCount - 1 ? 'disabled' : ''} aria-label="下移分组 ${escapeHtml(group.name)}">↓</button>
+              <button class="btn btn-secondary btn-small" type="button" data-report-group-rename="${group.id}">改名</button>
+              <button class="btn btn-secondary btn-small" type="button" data-report-group-delete="${group.id}">删除</button>
+            </div>
+          `}
+        </div>
+        <div class="report-site-list">${rows}</div>
+      </section>
+    `;
+  }).join('');
+}
+
+const BOT_TEMPLATE_LABELS = {
+  profit_title: '查利润 · 标题',
+  profit_group_header: '查利润 · 分组标题',
+  profit_site_line: '查利润 · 站点行',
+  profit_site_failed: '查利润 · 查询失败的站点行',
+  profit_group_subtotal: '查利润 · 分组小计',
+  profit_separator: '查利润 · 汇总前分隔线',
+  profit_footer: '查利润 · 汇总',
+  profit_filter_title: '查利润 分组名 · 标题',
+  profit_filter_footer: '查利润 分组名 · 合计',
+  balance_title: '查余额 · 标题',
+  balance_filter_title: '查余额 分组名 · 标题',
+  balance_group_header: '查余额 · 分组标题',
+  balance_site_line: '查余额 · 站点行',
+  balance_site_missing: '查余额 · 无数据的站点行',
+  balance_group_subtotal: '查余额 · 分组小计',
+};
+
+function botAliasRow(alias = { alias: '', target: '' }) {
+  return `
+    <div class="bot-alias-row">
+      <input class="input" data-bot-alias-field="alias" maxlength="30" placeholder="别名，如：利润" value="${escapeHtml(alias.alias)}" aria-label="别名" />
+      <span class="muted">→</span>
+      <input class="input" data-bot-alias-field="target" maxlength="80" placeholder="实际执行，如：查利润 画图" value="${escapeHtml(alias.target)}" aria-label="实际执行" />
+      <button class="btn btn-secondary btn-small" type="button" data-bot-alias-remove>删除</button>
+    </div>
+  `;
+}
+
+function renderBotSettings(options = {}) {
+  const settings = state.botSettings;
+  if (!settings || (state.botSettingsDirty && !options.force)) return;
+  els.botAliasList.innerHTML = settings.aliases.length
+    ? settings.aliases.map(botAliasRow).join('')
+    : '<div class="empty-inline" data-bot-alias-empty>暂无别名</div>';
+  els.botTemplateList.innerHTML = Object.keys(settings.default_templates).map((key) => {
+    const variables = settings.template_variables[key] || [];
+    const value = settings.templates[key] ?? '';
+    const customized = key in (settings.template_overrides || {});
+    return `
+      <label class="field bot-template-item">
+        <span class="bot-template-label">
+          <span>${escapeHtml(BOT_TEMPLATE_LABELS[key] || key)}${customized ? ' <span class="tag strong">已自定义</span>' : ''}</span>
+          <button class="btn btn-secondary btn-small" type="button" data-bot-template-reset="${escapeHtml(key)}">恢复默认</button>
+        </span>
+        <textarea class="input bot-template-input" rows="${Math.max(1, value.split('\n').length)}" data-bot-template="${escapeHtml(key)}">${escapeHtml(value)}</textarea>
+        <small class="field-help">可用变量：${variables.length ? variables.map((name) => `{${escapeHtml(name)}}`).join(' ') : '无'} · 默认：${escapeHtml(settings.default_templates[key]).replaceAll('\n', ' ⏎ ')}</small>
+      </label>
+    `;
+  }).join('');
+}
+
+function setBotSettingsDirty(dirty) {
+  state.botSettingsDirty = dirty;
+  els.botSettingsStatus.textContent = dirty ? '有未保存的修改' : '';
+  els.botSettingsStatus.classList.toggle('error', dirty);
+}
+
+function collectBotSettings() {
+  const aliases = Array.from(els.botAliasList.querySelectorAll('.bot-alias-row'))
+    .map((row) => ({
+      alias: row.querySelector('[data-bot-alias-field="alias"]').value.trim(),
+      target: row.querySelector('[data-bot-alias-field="target"]').value.trim(),
+    }))
+    .filter((item) => item.alias || item.target);
+  const templates = {};
+  els.botTemplateList.querySelectorAll('[data-bot-template]').forEach((input) => {
+    templates[input.dataset.botTemplate] = input.value;
+  });
+  return { aliases, templates };
+}
+
+function renderReportGroupSelect(selectedId = null) {
+  els.siteReportGroup.innerHTML = [
+    '<option value="">未分组</option>',
+    ...state.reportGroups.map((group) => `<option value="${group.id}">${escapeHtml(group.name)}</option>`),
+  ].join('');
+  els.siteReportGroup.value = selectedId ? String(selectedId) : '';
 }
 
 function pruneInactiveViews() {
@@ -487,7 +682,7 @@ function renderDetail(site) {
     return;
   }
 
-  els.detailSubtitle.textContent = site.base_url;
+  els.detailSubtitle.innerHTML = upstreamLink(site.base_url);
   const publicGroupsObj = site.current_groups || {};
   const loginGroupsObj = site.current_login_groups || {};
   const activeGroupsObj = site.login_enabled && Object.keys(loginGroupsObj).length ? loginGroupsObj : publicGroupsObj;
@@ -535,7 +730,7 @@ function renderDetail(site) {
     <div class="detail-title-row">
       <div>
         <div class="detail-title">${escapeHtml(site.name)}</div>
-        <div class="muted">${escapeHtml(platformLabel(site))} · ${escapeHtml(site.base_url)}</div>
+        <div class="muted">${escapeHtml(platformLabel(site))} · ${upstreamLink(site.base_url)}${site.report_group_name ? ` · 汇报分组：${escapeHtml(site.report_group_name)}` : ''}</div>
       </div>
       <span class="badge ${badgeClass(site.status)}">${escapeHtml(site.status)}</span>
     </div>
@@ -634,6 +829,7 @@ function openDialog(site = null) {
     state.dialogNotifyAllGroups = site.notify_all_groups !== false;
     renderNotifyGroupPicker(availableGroupsForSite(site), site.notify_groups || [], state.dialogNotifyAllGroups);
     els.siteEnabled.checked = !!site.enabled;
+    renderReportGroupSelect(site.report_group_id);
     els.queryTodayUsageBtn.classList.remove('hidden');
   } else {
     els.dialogTitle.textContent = '添加站点';
@@ -658,6 +854,7 @@ function openDialog(site = null) {
     state.dialogNotifyAllGroups = true;
     renderNotifyGroupPicker([], [], true);
     els.siteEnabled.checked = true;
+    renderReportGroupSelect(null);
     els.queryTodayUsageBtn.classList.add('hidden');
   }
   updatePlatformFields();
@@ -681,13 +878,17 @@ async function refreshAll(options = {}) {
   if (state.refreshInFlight) return null;
   state.refreshInFlight = true;
   try {
-  const [overview, sitesResp, changesResp, notifyResp] = await Promise.all([
+  const [overview, sitesResp, changesResp, notifyResp, groupsResp, botResp] = await Promise.all([
     api('/api/overview'),
     api('/api/sites'),
     api('/api/changes?limit=50'),
     api('/api/notifications/settings'),
+    api('/api/report-groups'),
+    api('/api/bot-settings'),
   ]);
   state.sites = sitesResp.data || [];
+  state.reportGroups = groupsResp.data || [];
+  if (!state.botSettingsDirty) state.botSettings = botResp.data || null;
   state.changes = changesResp.data || [];
   state.notificationSettings = notifyResp.data || {};
   state.appVersion = overview.version || null;
@@ -829,6 +1030,167 @@ els.detailPane.addEventListener('click', async (event) => {
   }
 });
 
+els.addBotAliasBtn.addEventListener('click', () => {
+  els.botAliasList.querySelector('[data-bot-alias-empty]')?.remove();
+  els.botAliasList.insertAdjacentHTML('beforeend', botAliasRow());
+  els.botAliasList.lastElementChild.querySelector('input').focus();
+  setBotSettingsDirty(true);
+});
+
+els.botAliasList.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-bot-alias-remove]');
+  if (!button) return;
+  button.closest('.bot-alias-row').remove();
+  setBotSettingsDirty(true);
+});
+
+els.botTemplateList.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-bot-template-reset]');
+  if (!button) return;
+  const key = button.dataset.botTemplateReset;
+  const input = els.botTemplateList.querySelector(`[data-bot-template="${CSS.escape(key)}"]`);
+  input.value = state.botSettings.default_templates[key];
+  setBotSettingsDirty(true);
+});
+
+['input', 'change'].forEach((type) => {
+  els.botAliasList.addEventListener(type, () => setBotSettingsDirty(true));
+  els.botTemplateList.addEventListener(type, () => setBotSettingsDirty(true));
+});
+
+els.saveBotSettingsBtn.addEventListener('click', async () => {
+  els.saveBotSettingsBtn.disabled = true;
+  els.botSettingsStatus.textContent = '保存中...';
+  els.botSettingsStatus.classList.remove('error');
+  try {
+    const res = await api('/api/bot-settings', { method: 'PUT', body: JSON.stringify(collectBotSettings()) });
+    state.botSettings = res.data;
+    setBotSettingsDirty(false);
+    renderBotSettings({ force: true });
+    els.botSettingsStatus.textContent = '已保存，机器人最多 30 秒内生效';
+    showToast('机器人配置已保存');
+  } catch (err) {
+    els.botSettingsStatus.textContent = `保存失败：${err.message}`;
+    els.botSettingsStatus.classList.add('error');
+    showToast(`保存失败：${err.message}`, 'error');
+  } finally {
+    els.saveBotSettingsBtn.disabled = false;
+  }
+});
+
+function moveItem(list, from, to) {
+  if (to < 0 || to >= list.length) return;
+  const [item] = list.splice(from, 1);
+  list.splice(to, 0, item);
+}
+
+els.reportGroupsBoard.addEventListener('change', (event) => {
+  const select = event.target.closest('[data-report-site-group]');
+  if (!select) return;
+  const layout = state.reportLayout;
+  const fromGroup = layout[Number(select.dataset.groupIndex)];
+  const toGroup = layout[Number(select.value)];
+  if (!fromGroup || !toGroup || fromGroup === toGroup) return;
+  const [siteId] = fromGroup.siteIds.splice(Number(select.dataset.siteIndex), 1);
+  toGroup.siteIds.push(siteId);
+  setReportLayoutDirty(true);
+  renderReportBoard();
+});
+
+els.reportGroupsBoard.addEventListener('click', async (event) => {
+  const layout = state.reportLayout;
+  const siteMove = event.target.closest('[data-report-site-move]');
+  if (siteMove) {
+    const group = layout[Number(siteMove.dataset.groupIndex)];
+    const index = Number(siteMove.dataset.siteIndex);
+    moveItem(group.siteIds, index, index + Number(siteMove.dataset.reportSiteMove));
+    setReportLayoutDirty(true);
+    renderReportBoard();
+    return;
+  }
+  const groupMove = event.target.closest('[data-report-group-move]');
+  if (groupMove) {
+    const index = Number(groupMove.dataset.groupIndex);
+    const target = index + Number(groupMove.dataset.reportGroupMove);
+    if (target < 0 || target >= layout.length - 1) return;
+    moveItem(layout, index, target);
+    setReportLayoutDirty(true);
+    renderReportBoard();
+    return;
+  }
+  const renameBtn = event.target.closest('[data-report-group-rename]');
+  if (renameBtn) {
+    const groupId = Number(renameBtn.dataset.reportGroupRename);
+    const group = state.reportGroups.find((item) => item.id === groupId);
+    const name = window.prompt('新的分组名称', group?.name || '');
+    if (name === null || !name.trim()) return;
+    try {
+      await api(`/api/report-groups/${groupId}`, { method: 'PUT', body: JSON.stringify({ name: name.trim() }) });
+      layout.forEach((item) => { if (item.id === groupId) item.name = name.trim(); });
+      await refreshAll();
+      showToast('分组已改名');
+    } catch (err) {
+      showToast(`改名失败：${err.message}`, 'error');
+    }
+    return;
+  }
+  const deleteBtn = event.target.closest('[data-report-group-delete]');
+  if (deleteBtn) {
+    const groupId = Number(deleteBtn.dataset.reportGroupDelete);
+    const group = state.reportGroups.find((item) => item.id === groupId);
+    if (!confirm(`确认删除分组「${group?.name || ''}」？组内站点会移到“未分组”。`)) return;
+    try {
+      await api(`/api/report-groups/${groupId}`, { method: 'DELETE' });
+      state.reportLayout = null;
+      setReportLayoutDirty(false);
+      await refreshAll();
+      showToast('分组已删除');
+    } catch (err) {
+      showToast(`删除失败：${err.message}`, 'error');
+    }
+  }
+});
+
+els.reportGroupForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const name = els.reportGroupName.value.trim();
+  if (!name) return;
+  try {
+    const res = await api('/api/report-groups', { method: 'POST', body: JSON.stringify({ name }) });
+    els.reportGroupName.value = '';
+    if (state.reportLayout) {
+      state.reportLayout.splice(state.reportLayout.length - 1, 0, { id: res.id, name, siteIds: [] });
+    }
+    await refreshAll();
+    showToast('分组已添加');
+  } catch (err) {
+    showToast(`添加失败：${err.message}`, 'error');
+  }
+});
+
+els.saveReportLayoutBtn.addEventListener('click', async () => {
+  const layout = state.reportLayout || buildReportLayout();
+  els.saveReportLayoutBtn.disabled = true;
+  try {
+    await api('/api/report-groups/order', {
+      method: 'PUT',
+      body: JSON.stringify({ group_ids: layout.filter((group) => group.id !== null).map((group) => group.id) }),
+    });
+    await api('/api/sites/order', {
+      method: 'PUT',
+      body: JSON.stringify({ layout: layout.map((group) => ({ group_id: group.id, site_ids: group.siteIds })) }),
+    });
+    state.reportLayout = null;
+    setReportLayoutDirty(false);
+    await refreshAll();
+    showToast('排序已保存');
+  } catch (err) {
+    showToast(`保存失败：${err.message}`, 'error');
+  } finally {
+    els.saveReportLayoutBtn.disabled = false;
+  }
+});
+
 async function handleSiteTableClick(e) {
   const btn = e.target.closest('[data-act]');
   if (!btn) return;
@@ -875,6 +1237,7 @@ els.form.addEventListener('submit', async (e) => {
     token_expires_at: authMode === 'token' ? els.siteTokenExpiresAt.value.trim() : '',
     access_user_id: els.siteAccessUserId.value.trim(),
     enabled: els.siteEnabled.checked,
+    report_group_id: els.siteReportGroup.value ? Number(els.siteReportGroup.value) : null,
     balance_alert_enabled: els.siteBalanceAlertEnabled.checked,
     balance_alert_threshold: Math.max(0, Number(els.siteBalanceAlertThreshold.value || 0)),
     notify_all_groups: state.dialogAvailableGroups.length === 0

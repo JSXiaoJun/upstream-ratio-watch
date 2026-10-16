@@ -1,5 +1,6 @@
 import json
 import gc
+import re
 import sqlite3
 import tempfile
 import threading
@@ -91,6 +92,8 @@ class MockUpstreamHandler(BaseHTTPRequestHandler):
         if api_index > 0:
             path = path[api_index:]
         if path == "/api/v1/auth/login":
+            # Unread request bodies make Windows reset the socket (WinError 10053).
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
             self.send_json({"code": 0, "data": {"access_token": "mock-token"}})
         elif path == "/feishu":
             length = int(self.headers.get("Content-Length", "0"))
@@ -935,6 +938,137 @@ class BalanceMonitoringTest(unittest.TestCase):
         self.assertEqual("smtp.example.com", migrated["smtp_host"])
         self.assertEqual(0, migrated["qq_enabled"])
         self.assertIn("qq_api_token", migrated)
+
+    def api_request(self, path, method="GET", body=None):
+        request = urllib.request.Request(
+            f"{self.api_url}{path}",
+            data=None if body is None else json.dumps(body).encode(),
+            headers={"Content-Type": "application/json", "Cookie": self.session_cookie},
+            method=method,
+        )
+        with urllib.request.urlopen(request) as response:
+            return json.loads(response.read())
+
+    def test_report_groups_order_bot_balance_payload(self):
+        site_ids = []
+        for name in ("一号", "二号", "三号"):
+            site_id = self.add_site("newapi", 5, token="t")
+            app.db_execute("UPDATE sites SET name = ?, base_url = ? WHERE id = ?", (name, f"{self.base_url}/{name}", site_id))
+            site_ids.append(site_id)
+        first, second, third = site_ids
+
+        drawing = self.api_request("/api/report-groups", "POST", {"name": "画图"})["id"]
+        domestic = self.api_request("/api/report-groups", "POST", {"name": "国产"})["id"]
+        self.api_request("/api/report-groups/order", "PUT", {"group_ids": [domestic, drawing]})
+        self.api_request("/api/sites/order", "PUT", {"layout": [
+            {"group_id": domestic, "site_ids": [third]},
+            {"group_id": drawing, "site_ids": [second, first]},
+            {"group_id": None, "site_ids": []},
+        ]})
+
+        payload = app.bot_balance_payload()
+        self.assertEqual(["三号", "二号", "一号"], [site["name"] for site in payload])
+        self.assertEqual(["国产", "画图", "画图"], [site["group_name"] for site in payload])
+
+        self.api_request(f"/api/report-groups/{drawing}", "DELETE")
+        payload = app.bot_balance_payload()
+        self.assertEqual(["三号", "二号", "一号"], [site["name"] for site in payload])
+        self.assertEqual(["国产", None, None], [site["group_name"] for site in payload])
+
+    def test_report_group_validation_and_site_assignment(self):
+        group_id = self.api_request("/api/report-groups", "POST", {"name": "claude"})["id"]
+        for bad_name in ("", "带 空格", "claude"):
+            with self.assertRaises(urllib.error.HTTPError) as context:
+                self.api_request("/api/report-groups", "POST", {"name": bad_name})
+            self.assertEqual(400, context.exception.code)
+
+        site_id = self.add_site("newapi", 5, token="t")
+        self.api_request(f"/api/sites/{site_id}", "PUT", {"report_group_id": group_id})
+        summary = next(site for site in self.api_request("/api/sites")["data"] if site["id"] == site_id)
+        self.assertEqual(group_id, summary["report_group_id"])
+        self.assertEqual("claude", summary["report_group_name"])
+
+        with self.assertRaises(urllib.error.HTTPError) as context:
+            self.api_request(f"/api/sites/{site_id}", "PUT", {"report_group_id": 9999})
+        self.assertEqual(400, context.exception.code)
+        with self.assertRaises(urllib.error.HTTPError) as context:
+            self.api_request("/api/sites/order", "PUT", {"layout": [{"group_id": None, "site_ids": []}]})
+        self.assertEqual(400, context.exception.code)
+
+    def test_bot_settings_roundtrip_and_bot_config_endpoint(self):
+        saved = self.api_request("/api/bot-settings", "PUT", {
+            "aliases": [{"alias": "利润", "target": "  查利润   画图 "}],
+            "templates": {
+                "profit_title": "今日利润",
+                "balance_title": app.DEFAULT_BOT_TEMPLATES["balance_title"],
+                "profit_separator": "",
+            },
+        })["data"]
+        self.assertEqual([{"alias": "利润", "target": "查利润 画图"}], saved["aliases"])
+        self.assertEqual({"profit_title": "今日利润", "profit_separator": ""}, saved["template_overrides"])
+        self.assertEqual("今日利润", saved["templates"]["profit_title"])
+        self.assertEqual(app.DEFAULT_BOT_TEMPLATES["balance_title"], saved["templates"]["balance_title"])
+
+        self.api_request("/api/bot-settings", "PUT", {"aliases": []})
+        self.assertEqual("今日利润", app.bot_settings_payload()["templates"]["profit_title"])
+
+        app.update_notification_settings({
+            "qq_enabled": True,
+            "qq_api_url": f"{self.base_url}/qq-notify",
+            "qq_api_token": "config-secret",
+            "qq_group_id": "123456789",
+        })
+        with self.assertRaises(urllib.error.HTTPError) as context:
+            urllib.request.urlopen(f"{self.api_url}/api/bot/config")
+        self.assertEqual(401, context.exception.code)
+        request = urllib.request.Request(f"{self.api_url}/api/bot/config", headers={"Authorization": "Bearer config-secret"})
+        with urllib.request.urlopen(request) as response:
+            config = json.loads(response.read())["data"]
+        self.assertEqual([], config["aliases"])
+        self.assertEqual("今日利润", config["templates"]["profit_title"])
+        self.assertEqual(set(app.DEFAULT_BOT_TEMPLATES), set(config["templates"]))
+
+    def test_bot_settings_validation(self):
+        invalid_bodies = [
+            {"aliases": [{"alias": "带 空格", "target": "查利润"}]},
+            {"aliases": [{"alias": "利润", "target": ""}]},
+            {"aliases": [{"alias": "利润", "target": "查利润"}, {"alias": "利润", "target": "查余额"}]},
+            {"aliases": [{"alias": "查利润", "target": "查利润 画图"}]},
+            {"templates": {"unknown_key": "x"}},
+            {"templates": {"profit_footer": "利润 {profitt}"}},
+            {"templates": {"profit_title": "x" * (app.MAX_BOT_TEMPLATE_LENGTH + 1)}},
+        ]
+        for body in invalid_bodies:
+            with self.subTest(body=body):
+                with self.assertRaises(urllib.error.HTTPError) as context:
+                    self.api_request("/api/bot-settings", "PUT", body)
+                self.assertEqual(400, context.exception.code)
+        self.assertEqual([], app.bot_settings_payload()["aliases"])
+
+    def test_default_templates_match_bot_project(self):
+        bot_source = Path(app.APP_DIR).parent / "qq-monitor-bot" / "src" / "notification-api.mjs"
+        if not bot_source.exists():
+            self.skipTest("qq-monitor-bot checkout not found next to this project")
+        text = bot_source.read_text(encoding="utf-8")
+        block = text.split("export const DEFAULT_TEMPLATES = Object.freeze({", 1)[1].split("})", 1)[0]
+        bot_defaults = {
+            key: value.encode("utf-8").decode("unicode_escape").encode("latin-1").decode("utf-8")
+            for key, value in re.findall(r"^\s*(\w+): '((?:[^'\\]|\\.)*)',?$", block, re.MULTILINE)
+        }
+        self.assertEqual(app.DEFAULT_BOT_TEMPLATES, bot_defaults)
+        for key, template in app.DEFAULT_BOT_TEMPLATES.items():
+            self.assertEqual([], [n for n in app.TEMPLATE_PLACEHOLDER_PATTERN.findall(template) if n not in app.BOT_TEMPLATE_VARIABLES[key]])
+
+    def test_low_balance_notification_includes_upstream_site(self):
+        site_id = self.add_site("newapi", 10, token="system-token")
+        site = app.db_query_one("SELECT * FROM sites WHERE id = ?", (site_id,))
+        with patch.object(app, "send_qq_message") as send_qq, \
+                patch.object(app, "send_email_message"), \
+                patch.object(app, "send_wecom_message"), \
+                patch.object(app, "send_feishu_message"):
+            app.record_balance_event(site, "balance_low", 8.0, 10.0, app.utc_now_iso())
+        body = send_qq.call_args[0][1]
+        self.assertIn(f"上游站点：{site['base_url']}", body)
 
 
 if __name__ == "__main__":
