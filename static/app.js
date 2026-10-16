@@ -393,17 +393,48 @@ function setReportLayoutDirty(dirty) {
   els.reportLayoutStatus.classList.toggle('error', dirty);
 }
 
-function renderReportBoard() {
-  if (!state.reportLayout || !state.reportLayoutDirty) state.reportLayout = buildReportLayout();
-  const layout = state.reportLayout;
-  const siteById = new Map(state.sites.map((site) => [site.id, site]));
+// Keeps an unsaved draft consistent with the latest server data: groups added, renamed or
+// deleted elsewhere are reflected, and a site whose group changed on the server (site dialog,
+// new site) follows the server instead of being reverted by the draft on save.
+function reconcileReportLayout(draft) {
+  const fresh = buildReportLayout();
+  const freshById = new Map(fresh.map((group) => [group.id, group]));
+  const serverGroupOf = new Map(state.sites.map((site) => [site.id, site.report_group_id ?? null]));
+  const baseline = state.reportLayoutBaseline || new Map();
+
+  const kept = draft.filter((group) => freshById.has(group.id));
+  const keptIds = new Set(kept.map((group) => group.id));
+  const merged = kept.filter((group) => group.id !== null).map((group) => ({ ...group, name: freshById.get(group.id).name, siteIds: [...group.siteIds] }));
+  fresh.forEach((group) => { if (group.id !== null && !keptIds.has(group.id)) merged.push({ ...group, siteIds: [] }); });
+  merged.push({ ...(kept.find((group) => group.id === null) || fresh[fresh.length - 1]), siteIds: [...(kept.find((group) => group.id === null)?.siteIds || [])] });
+  const byId = new Map(merged.map((group) => [group.id, group]));
+
   const placed = new Set();
-  layout.forEach((group) => {
-    group.siteIds = group.siteIds.filter((id) => siteById.has(id) && !placed.has(id) && placed.add(id));
+  merged.forEach((group) => {
+    group.siteIds = group.siteIds.filter((siteId) => {
+      if (!serverGroupOf.has(siteId) || placed.has(siteId)) return false;
+      const serverGroup = serverGroupOf.get(siteId);
+      if (baseline.has(siteId) && baseline.get(siteId) !== serverGroup && group.id !== serverGroup) return false;
+      placed.add(siteId);
+      return true;
+    });
   });
   state.sites.forEach((site) => {
-    if (!placed.has(site.id)) layout[layout.length - 1].siteIds.push(site.id);
+    if (placed.has(site.id)) return;
+    (byId.get(site.report_group_id ?? null) || merged[merged.length - 1]).siteIds.push(site.id);
   });
+  return merged;
+}
+
+function renderReportBoard() {
+  if (!state.reportLayout || !state.reportLayoutDirty) {
+    state.reportLayout = buildReportLayout();
+  } else {
+    state.reportLayout = reconcileReportLayout(state.reportLayout);
+  }
+  state.reportLayoutBaseline = new Map(state.sites.map((site) => [site.id, site.report_group_id ?? null]));
+  const layout = state.reportLayout;
+  const siteById = new Map(state.sites.map((site) => [site.id, site]));
   const groupOptions = layout.map((group, index) => `<option value="${index}">${escapeHtml(group.name)}</option>`).join('');
   const realGroupCount = layout.length - 1;
   els.reportGroupsBoard.innerHTML = layout.map((group, groupIndex) => {
@@ -492,14 +523,14 @@ function renderBotSettings(options = {}) {
     const value = settings.templates[key] ?? '';
     const customized = key in (settings.template_overrides || {});
     return `
-      <label class="field bot-template-item">
-        <span class="bot-template-label">
-          <span>${escapeHtml(BOT_TEMPLATE_LABELS[key] || key)}${customized ? ' <span class="tag strong">已自定义</span>' : ''}</span>
+      <div class="field bot-template-item">
+        <div class="bot-template-label">
+          <label for="botTemplate-${escapeHtml(key)}">${escapeHtml(BOT_TEMPLATE_LABELS[key] || key)}${customized ? ' <span class="tag strong">已自定义</span>' : ''}</label>
           <button class="btn btn-secondary btn-small" type="button" data-bot-template-reset="${escapeHtml(key)}">恢复默认</button>
-        </span>
-        <textarea class="input bot-template-input" rows="${Math.max(1, value.split('\n').length)}" data-bot-template="${escapeHtml(key)}">${escapeHtml(value)}</textarea>
-        <small class="field-help">可用变量：${variables.length ? variables.map((name) => `{${escapeHtml(name)}}`).join(' ') : '无'} · 默认：${escapeHtml(settings.default_templates[key]).replaceAll('\n', ' ⏎ ')}</small>
-      </label>
+        </div>
+        <textarea id="botTemplate-${escapeHtml(key)}" class="input bot-template-input" rows="${Math.max(1, value.split('\n').length)}" data-bot-template="${escapeHtml(key)}" aria-describedby="botTemplateHelp-${escapeHtml(key)}">${escapeHtml(value)}</textarea>
+        <small id="botTemplateHelp-${escapeHtml(key)}" class="field-help">可用变量：${variables.length ? variables.map((name) => `{${escapeHtml(name)}}`).join(' ') : '无'} · 默认：${escapeHtml(settings.default_templates[key]).replaceAll('\n', ' ⏎ ')}</small>
+      </div>
     `;
   }).join('');
 }
@@ -874,10 +905,24 @@ function renderAll() {
   renderActiveView();
 }
 
+// A refresh requested while one is running waits for it, then refetches, so data
+// written just before the call (save/rename/delete) is never hidden by an older response.
 async function refreshAll(options = {}) {
-  if (state.refreshInFlight) return null;
-  state.refreshInFlight = true;
+  if (state.refreshPromise) {
+    if (options.background) return state.refreshPromise;
+    await state.refreshPromise.catch(() => {});
+    if (state.refreshPromise) return refreshAll(options);
+  }
+  state.refreshPromise = doRefreshAll(options);
   try {
+    return await state.refreshPromise;
+  } finally {
+    state.refreshPromise = null;
+  }
+}
+
+async function doRefreshAll(options = {}) {
+  {
   const [overview, sitesResp, changesResp, notifyResp, groupsResp, botResp] = await Promise.all([
     api('/api/overview'),
     api('/api/sites'),
@@ -902,8 +947,6 @@ async function refreshAll(options = {}) {
   }
   renderAll();
   return overview;
-  } finally {
-    state.refreshInFlight = false;
   }
 }
 
@@ -1126,7 +1169,6 @@ els.reportGroupsBoard.addEventListener('click', async (event) => {
     if (name === null || !name.trim()) return;
     try {
       await api(`/api/report-groups/${groupId}`, { method: 'PUT', body: JSON.stringify({ name: name.trim() }) });
-      layout.forEach((item) => { if (item.id === groupId) item.name = name.trim(); });
       await refreshAll();
       showToast('分组已改名');
     } catch (err) {
@@ -1141,8 +1183,11 @@ els.reportGroupsBoard.addEventListener('click', async (event) => {
     if (!confirm(`确认删除分组「${group?.name || ''}」？组内站点会移到“未分组”。`)) return;
     try {
       await api(`/api/report-groups/${groupId}`, { method: 'DELETE' });
-      state.reportLayout = null;
-      setReportLayoutDirty(false);
+      const removed = layout.find((item) => item.id === groupId);
+      if (removed) {
+        layout[layout.length - 1].siteIds.push(...removed.siteIds);
+        removed.siteIds = [];
+      }
       await refreshAll();
       showToast('分组已删除');
     } catch (err) {
@@ -1156,11 +1201,8 @@ els.reportGroupForm.addEventListener('submit', async (event) => {
   const name = els.reportGroupName.value.trim();
   if (!name) return;
   try {
-    const res = await api('/api/report-groups', { method: 'POST', body: JSON.stringify({ name }) });
+    await api('/api/report-groups', { method: 'POST', body: JSON.stringify({ name }) });
     els.reportGroupName.value = '';
-    if (state.reportLayout) {
-      state.reportLayout.splice(state.reportLayout.length - 1, 0, { id: res.id, name, siteIds: [] });
-    }
     await refreshAll();
     showToast('分组已添加');
   } catch (err) {
@@ -1172,13 +1214,12 @@ els.saveReportLayoutBtn.addEventListener('click', async () => {
   const layout = state.reportLayout || buildReportLayout();
   els.saveReportLayoutBtn.disabled = true;
   try {
-    await api('/api/report-groups/order', {
-      method: 'PUT',
-      body: JSON.stringify({ group_ids: layout.filter((group) => group.id !== null).map((group) => group.id) }),
-    });
     await api('/api/sites/order', {
       method: 'PUT',
-      body: JSON.stringify({ layout: layout.map((group) => ({ group_id: group.id, site_ids: group.siteIds })) }),
+      body: JSON.stringify({
+        group_ids: layout.filter((group) => group.id !== null).map((group) => group.id),
+        layout: layout.map((group) => ({ group_id: group.id, site_ids: group.siteIds })),
+      }),
     });
     state.reportLayout = null;
     setReportLayoutDirty(false);
@@ -1632,5 +1673,5 @@ refreshAll().catch((err) => {
 });
 
 setInterval(() => {
-  refreshAll().catch(() => {});
+  refreshAll({ background: true }).catch(() => {});
 }, 15000);

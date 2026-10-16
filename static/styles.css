@@ -347,6 +347,7 @@ body {
   grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
   gap: 10px;
 }
+.bot-template-label label { font-size: 12px; color: var(--muted); }
 .bot-template-label {
   display: flex;
   align-items: center;

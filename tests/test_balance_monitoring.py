@@ -977,7 +977,7 @@ class BalanceMonitoringTest(unittest.TestCase):
 
     def test_report_group_validation_and_site_assignment(self):
         group_id = self.api_request("/api/report-groups", "POST", {"name": "claude"})["id"]
-        for bad_name in ("", "带 空格", "claude"):
+        for bad_name in ("", "带 空格", "claude", "Claude", "未分组"):
             with self.assertRaises(urllib.error.HTTPError) as context:
                 self.api_request("/api/report-groups", "POST", {"name": bad_name})
             self.assertEqual(400, context.exception.code)
@@ -1037,6 +1037,9 @@ class BalanceMonitoringTest(unittest.TestCase):
             {"templates": {"unknown_key": "x"}},
             {"templates": {"profit_footer": "利润 {profitt}"}},
             {"templates": {"profit_title": "x" * (app.MAX_BOT_TEMPLATE_LENGTH + 1)}},
+            {"templates": {"profit_title": 5}},
+            {"aliases": [{"alias": "查余额", "target": "查利润"}]},
+            {"aliases": [{"alias": "余额", "target": "看余额"}]},
         ]
         for body in invalid_bodies:
             with self.subTest(body=body):
@@ -1058,6 +1061,47 @@ class BalanceMonitoringTest(unittest.TestCase):
         self.assertEqual(app.DEFAULT_BOT_TEMPLATES, bot_defaults)
         for key, template in app.DEFAULT_BOT_TEMPLATES.items():
             self.assertEqual([], [n for n in app.TEMPLATE_PLACEHOLDER_PATTERN.findall(template) if n not in app.BOT_TEMPLATE_VARIABLES[key]])
+
+    def test_report_order_saves_groups_and_sites_atomically(self):
+        site_id = self.add_site("newapi", 5, token="t")
+        first = self.api_request("/api/report-groups", "POST", {"name": "A"})["id"]
+        second = self.api_request("/api/report-groups", "POST", {"name": "B"})["id"]
+        with self.assertRaises(urllib.error.HTTPError) as context:
+            self.api_request("/api/sites/order", "PUT", {
+                "group_ids": [second, first],
+                "layout": [{"group_id": first, "site_ids": []}],
+            })
+        self.assertEqual(400, context.exception.code)
+        self.assertEqual([first, second], [group["id"] for group in app.list_report_groups()])
+
+        saved = self.api_request("/api/sites/order", "PUT", {
+            "group_ids": [second, first],
+            "layout": [{"group_id": second, "site_ids": [site_id]}, {"group_id": first, "site_ids": []}],
+        })["data"]
+        self.assertEqual([second, first], [group["id"] for group in saved])
+        self.assertEqual(second, app.db_query_one("SELECT report_group_id FROM sites WHERE id = ?", (site_id,))["report_group_id"])
+
+    def test_malformed_put_and_delete_bodies_return_400(self):
+        group_id = self.api_request("/api/report-groups", "POST", {"name": "A"})["id"]
+        cases = [
+            ("/api/sites/order", b"not json"),
+            ("/api/sites/order", b"[]"),
+            ("/api/sites/order", json.dumps({"layout": [{"group_id": [1], "site_ids": []}]}).encode()),
+            (f"/api/report-groups/{group_id}", b"[]"),
+            ("/api/bot-settings", b"not json"),
+        ]
+        for path, raw in cases:
+            with self.subTest(path=path, raw=raw):
+                request = urllib.request.Request(
+                    f"{self.api_url}{path}",
+                    data=raw,
+                    headers={"Content-Type": "application/json", "Cookie": self.session_cookie},
+                    method="PUT",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as context:
+                    urllib.request.urlopen(request)
+                self.assertEqual(400, context.exception.code)
+                self.assertFalse(json.loads(context.exception.read())["success"])
 
     def test_low_balance_notification_includes_upstream_site(self):
         site_id = self.add_site("newapi", 10, token="system-token")

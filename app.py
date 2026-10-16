@@ -32,7 +32,7 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 STATIC_DIR = APP_DIR / "static"
 DB_PATH = DATA_DIR / "app.db"
-APP_VERSION = "1.12.0"
+APP_VERSION = "1.12.1"
 AUTH_CONFIG_PATH = Path(os.getenv("AUTH_CONFIG_PATH") or (DATA_DIR / "auth.json"))
 AUTH_COOKIE_NAME = "upstream_watch_session"
 DEFAULT_SESSION_DAYS = 30
@@ -1662,6 +1662,7 @@ REPORT_GROUP_JOIN = "LEFT JOIN report_groups rg ON rg.id = sites.report_group_id
 REPORT_ORDER_BY = "ORDER BY (rg.id IS NULL) ASC, rg.sort_order ASC, rg.id ASC, sites.report_sort_order ASC, sites.id ASC"
 REPORT_GROUP_COLUMNS = "rg.name AS group_name, rg.sort_order AS group_order"
 MAX_REPORT_GROUP_NAME_LENGTH = 40
+UNGROUPED_REPORT_GROUP_NAME = "未分组"
 
 
 def ordered_sites(where: str = "", params: Iterable[Any] = ()) -> List[Dict[str, Any]]:
@@ -1691,7 +1692,14 @@ def validate_report_group_name(value: Any) -> str:
         raise ValueError(f"分组名称不能超过 {MAX_REPORT_GROUP_NAME_LENGTH} 个字符")
     if any(ch.isspace() for ch in name):
         raise ValueError("分组名称不能包含空格，方便在 QQ 指令中使用")
+    if name == UNGROUPED_REPORT_GROUP_NAME:
+        raise ValueError(f"“{UNGROUPED_REPORT_GROUP_NAME}”是保留名称，请换一个分组名")
     return name
+
+
+def find_report_group_by_name(name: str) -> Optional[Dict[str, Any]]:
+    # The bot matches group names case-insensitively, so names must be unique that way too.
+    return db_query_one("SELECT id FROM report_groups WHERE lower(name) = lower(?)", (name,))
 
 
 def validate_report_group_id(value: Any) -> Optional[int]:
@@ -1716,7 +1724,7 @@ def next_report_sort_order(group_id: Optional[int]) -> int:
 
 def create_report_group(name: Any) -> int:
     group_name = validate_report_group_name(name)
-    if db_query_one("SELECT id FROM report_groups WHERE name = ?", (group_name,)):
+    if find_report_group_by_name(group_name):
         raise ValueError("分组名称已存在")
     row = db_query_one("SELECT COALESCE(MAX(sort_order), 0) AS max_order FROM report_groups")
     now = utc_now_iso()
@@ -1728,7 +1736,7 @@ def create_report_group(name: Any) -> int:
 
 def rename_report_group(group_id: int, name: Any) -> None:
     group_name = validate_report_group_name(name)
-    existing = db_query_one("SELECT id FROM report_groups WHERE name = ?", (group_name,))
+    existing = find_report_group_by_name(group_name)
     if existing and int(existing["id"]) != group_id:
         raise ValueError("分组名称已存在")
     if not db_query_one("SELECT id FROM report_groups WHERE id = ?", (group_id,)):
@@ -1754,47 +1762,80 @@ def parse_id_list(value: Any, label: str) -> List[int]:
     return ids
 
 
-def reorder_report_groups(group_ids: Any) -> None:
+def validated_group_order(conn: sqlite3.Connection, group_ids: Any) -> List[int]:
     ids = parse_id_list(group_ids, "分组顺序")
-    existing = {int(row["id"]) for row in db_query_all("SELECT id FROM report_groups")}
+    existing = {int(row["id"]) for row in conn.execute("SELECT id FROM report_groups").fetchall()}
     if set(ids) != existing:
-        raise ValueError("分组顺序必须包含全部分组")
-    now = utc_now_iso()
-    db_execute_many(
-        "UPDATE report_groups SET sort_order = ?, updated_at = ? WHERE id = ?",
-        [(index + 1, now, group_id) for index, group_id in enumerate(ids)],
-    )
+        raise ValueError("分组列表已变化，请刷新页面后重新调整")
+    return ids
 
 
-def reorder_report_sites(layout: Any) -> None:
+def validated_site_layout(conn: sqlite3.Connection, layout: Any) -> List[Tuple[Optional[int], int, int]]:
     """layout: [{"group_id": int | None, "site_ids": [int, ...]}, ...] covering every site."""
     if not isinstance(layout, list):
         raise ValueError("站点排序数据无效")
-    existing_groups = {int(row["id"]) for row in db_query_all("SELECT id FROM report_groups")}
-    existing_sites = {int(row["id"]) for row in db_query_all("SELECT id FROM sites")}
+    existing_groups = {int(row["id"]) for row in conn.execute("SELECT id FROM report_groups").fetchall()}
+    existing_sites = {int(row["id"]) for row in conn.execute("SELECT id FROM sites").fetchall()}
     updates: List[Tuple[Optional[int], int, int]] = []
     seen: set = set()
     for entry in layout:
         if not isinstance(entry, dict):
             raise ValueError("站点排序数据无效")
-        group_id = entry.get("group_id")
-        group_id = None if group_id in (None, "", 0) else int(group_id)
+        raw_group_id = entry.get("group_id")
+        if raw_group_id in (None, "", 0):
+            group_id = None
+        elif isinstance(raw_group_id, bool) or not isinstance(raw_group_id, (int, str)):
+            raise ValueError("站点排序包含无效分组")
+        else:
+            try:
+                group_id = int(raw_group_id)
+            except ValueError:
+                raise ValueError("站点排序包含无效分组")
         if group_id is not None and group_id not in existing_groups:
-            raise ValueError("站点排序包含不存在的分组")
+            raise ValueError("分组列表已变化，请刷新页面后重新调整")
         for index, site_id in enumerate(parse_id_list(entry.get("site_ids"), "站点顺序")):
             if site_id in seen:
                 raise ValueError("站点排序包含重复站点")
             seen.add(site_id)
             updates.append((group_id, index + 1, site_id))
     if seen != existing_sites:
-        raise ValueError("站点排序必须包含全部站点")
-    db_execute_many("UPDATE sites SET report_group_id = ?, report_sort_order = ? WHERE id = ?", updates)
+        raise ValueError("站点列表已变化，请刷新页面后重新调整")
+    return updates
+
+
+def save_report_order(group_ids: Any = None, layout: Any = None) -> None:
+    """Validates and writes group order and/or site layout in one transaction."""
+    now = utc_now_iso()
+    with DB_LOCK, connect_db() as conn:
+        group_order = validated_group_order(conn, group_ids) if group_ids is not None else None
+        site_updates = validated_site_layout(conn, layout) if layout is not None else None
+        if group_order is not None:
+            conn.executemany(
+                "UPDATE report_groups SET sort_order = ?, updated_at = ? WHERE id = ?",
+                [(index + 1, now, group_id) for index, group_id in enumerate(group_order)],
+            )
+        if site_updates is not None:
+            conn.executemany("UPDATE sites SET report_group_id = ?, report_sort_order = ? WHERE id = ?", site_updates)
+
+
+def reorder_report_groups(group_ids: Any) -> None:
+    save_report_order(group_ids=group_ids)
+
+
+def reorder_report_sites(layout: Any) -> None:
+    save_report_order(layout=layout)
 
 
 MAX_BOT_ALIASES = 100
 MAX_BOT_ALIAS_LENGTH = 30
 MAX_BOT_ALIAS_TARGET_LENGTH = 80
 MAX_BOT_TEMPLATE_LENGTH = 500
+# Default command words of qq-monitor-bot; override with BOT_COMMANDS if the bot's *_COMMAND env vars are changed.
+BOT_BUILTIN_COMMANDS: List[str] = [
+    item.strip()
+    for item in (os.getenv("BOT_COMMANDS") or "查利润,查余额,查倍率,查充值,查分组,查监控").split(",")
+    if item.strip()
+]
 
 # Must stay identical to DEFAULT_TEMPLATES in qq-monitor-bot/src/notification-api.mjs.
 DEFAULT_BOT_TEMPLATES: Dict[str, str] = {
@@ -1893,6 +1934,10 @@ def validate_bot_aliases(value: Any) -> List[Dict[str, str]]:
             raise ValueError(f"别名「{alias}」的实际执行内容不能超过 {MAX_BOT_ALIAS_TARGET_LENGTH} 个字符")
         if target == alias or target.split(" ", 1)[0] == alias:
             raise ValueError(f"别名「{alias}」不能指向自己")
+        if alias in BOT_BUILTIN_COMMANDS:
+            raise ValueError(f"「{alias}」是机器人自带指令，不能用作别名")
+        if target.split(" ", 1)[0] not in BOT_BUILTIN_COMMANDS:
+            raise ValueError(f"别名「{alias}」的实际执行必须以机器人指令开头：{'、'.join(BOT_BUILTIN_COMMANDS)}")
         if alias in seen:
             raise ValueError(f"别名「{alias}」重复")
         seen.add(alias)
@@ -1917,6 +1962,8 @@ def validate_bot_templates(value: Any) -> Dict[str, str]:
         if unknown:
             allowed_text = "、".join(f"{{{name}}}" for name in BOT_TEMPLATE_VARIABLES[key]) or "无"
             raise ValueError(f"模板「{key}」包含不支持的变量 {'、'.join(f'{{{n}}}' for n in unknown)}，可用变量：{allowed_text}")
+        if not isinstance(raw, str):
+            raise ValueError(f"模板「{key}」必须是文本")
         if text != DEFAULT_BOT_TEMPLATES[key]:
             overrides[key] = text
     return overrides
@@ -3115,6 +3162,13 @@ def read_json_body(handler: BaseHTTPRequestHandler) -> Any:
     return json.loads(raw or "{}")
 
 
+def read_json_object(handler: BaseHTTPRequestHandler) -> Dict[str, Any]:
+    body = read_json_body(handler)
+    if not isinstance(body, dict):
+        raise ValueError("请求体必须是 JSON 对象")
+    return body
+
+
 def site_summary(site: Dict[str, Any]) -> Dict[str, Any]:
     groups = {}
     login_groups = {}
@@ -3522,8 +3576,8 @@ class Handler(BaseHTTPRequestHandler):
                 return json_response(self, {"success": True, "id": site_id})
 
             if path == "/api/report-groups":
-                body = read_json_body(self)
                 try:
+                    body = read_json_object(self)
                     group_id = create_report_group(body.get("name"))
                 except ValueError as exc:
                     return json_response(self, {"success": False, "message": str(exc)}, 400)
@@ -3593,19 +3647,36 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             return json_response(self, {"success": False, "message": str(exc)}, 500)
 
+    def _handle_safely(self, handler: Any) -> None:
+        try:
+            handler()
+        except json.JSONDecodeError:
+            json_response(self, {"success": False, "message": "请求体不是有效 JSON"}, 400)
+        except (AttributeError, TypeError, ValueError) as exc:
+            json_response(self, {"success": False, "message": f"请求数据格式无效：{exc}"}, 400)
+        except Exception as exc:
+            traceback.print_exc()
+            json_response(self, {"success": False, "message": str(exc)}, 500)
+
     def do_PUT(self) -> None:
+        self._handle_safely(self._do_put)
+
+    def do_DELETE(self) -> None:
+        self._handle_safely(self._do_delete)
+
+    def _do_put(self) -> None:
         path = urlparse(self.path).path
         if not self._require_auth(api_request=True):
             return
         if path == "/api/bot-settings":
             try:
-                update_bot_settings(read_json_body(self))
+                update_bot_settings(read_json_object(self))
             except ValueError as exc:
                 return json_response(self, {"success": False, "message": str(exc)}, 400)
             return json_response(self, {"success": True, "data": bot_settings_payload()})
 
         if path == "/api/report-groups/order":
-            body = read_json_body(self)
+            body = read_json_object(self)
             try:
                 reorder_report_groups(body.get("group_ids"))
             except ValueError as exc:
@@ -3613,19 +3684,19 @@ class Handler(BaseHTTPRequestHandler):
             return json_response(self, {"success": True, "data": list_report_groups()})
 
         if path == "/api/sites/order":
-            body = read_json_body(self)
+            body = read_json_object(self)
             try:
-                reorder_report_sites(body.get("layout"))
+                save_report_order(group_ids=body.get("group_ids"), layout=body.get("layout"))
             except ValueError as exc:
                 return json_response(self, {"success": False, "message": str(exc)}, 400)
-            return json_response(self, {"success": True})
+            return json_response(self, {"success": True, "data": list_report_groups()})
 
         if path.startswith("/api/report-groups/"):
             try:
                 group_id = int(path.split("/")[3])
             except Exception:
                 return json_response(self, {"success": False, "message": "invalid group id"}, 400)
-            body = read_json_body(self)
+            body = read_json_object(self)
             try:
                 rename_report_group(group_id, body.get("name"))
             except ValueError as exc:
@@ -3812,7 +3883,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self.send_error(HTTPStatus.NOT_FOUND)
 
-    def do_DELETE(self) -> None:
+    def _do_delete(self) -> None:
         path = urlparse(self.path).path
         if not self._require_auth(api_request=True):
             return
