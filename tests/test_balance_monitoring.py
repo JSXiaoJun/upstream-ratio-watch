@@ -1009,8 +1009,15 @@ class BalanceMonitoringTest(unittest.TestCase):
         self.assertEqual("今日利润", saved["templates"]["profit_title"])
         self.assertEqual(app.DEFAULT_BOT_TEMPLATES["balance_title"], saved["templates"]["balance_title"])
 
+        self.assertEqual(5.0, saved["negative_quota_threshold"])
+
+        saved = self.api_request("/api/bot-settings", "PUT", {"negative_quota_threshold": "12.5"})["data"]
+        self.assertEqual(12.5, saved["negative_quota_threshold"])
+        self.assertEqual([{"alias": "利润", "target": "查利润 画图"}], saved["aliases"])
+
         self.api_request("/api/bot-settings", "PUT", {"aliases": []})
         self.assertEqual("今日利润", app.bot_settings_payload()["templates"]["profit_title"])
+        self.assertEqual(12.5, app.bot_settings_payload()["negative_quota_threshold"])
 
         app.update_notification_settings({
             "qq_enabled": True,
@@ -1027,6 +1034,7 @@ class BalanceMonitoringTest(unittest.TestCase):
         self.assertEqual([], config["aliases"])
         self.assertEqual("今日利润", config["templates"]["profit_title"])
         self.assertEqual(set(app.DEFAULT_BOT_TEMPLATES), set(config["templates"]))
+        self.assertEqual(12.5, config["negative_quota_threshold"])
 
     def test_bot_settings_validation(self):
         invalid_bodies = [
@@ -1040,6 +1048,11 @@ class BalanceMonitoringTest(unittest.TestCase):
             {"templates": {"profit_title": 5}},
             {"aliases": [{"alias": "查余额", "target": "查利润"}]},
             {"aliases": [{"alias": "余额", "target": "看余额"}]},
+            {"negative_quota_threshold": -1},
+            {"negative_quota_threshold": "abc"},
+            {"negative_quota_threshold": None},
+            {"negative_quota_threshold": True},
+            {"negative_quota_threshold": app.MAX_NEGATIVE_QUOTA_THRESHOLD + 1},
         ]
         for body in invalid_bodies:
             with self.subTest(body=body):
@@ -1047,6 +1060,7 @@ class BalanceMonitoringTest(unittest.TestCase):
                     self.api_request("/api/bot-settings", "PUT", body)
                 self.assertEqual(400, context.exception.code)
         self.assertEqual([], app.bot_settings_payload()["aliases"])
+        self.assertEqual(app.DEFAULT_NEGATIVE_QUOTA_THRESHOLD, app.bot_settings_payload()["negative_quota_threshold"])
 
     def test_default_templates_match_bot_project(self):
         bot_source = Path(app.APP_DIR).parent / "qq-monitor-bot" / "src" / "notification-api.mjs"

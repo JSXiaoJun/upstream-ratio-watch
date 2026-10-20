@@ -176,11 +176,19 @@
               <div class="group-picker-head">
                 <div>
                   <h3>指令别名</h3>
-                  <p class="field-help">群里发送“别名”时，机器人按“实际执行”处理；别名后面的内容会接在后面，例如别名“利润”→“查利润”，发送“利润 画图”等于“查利润 画图”。可用指令：查利润、查余额、查倍率、查充值、查分组、查监控（以机器人环境变量为准）。</p>
+                  <p class="field-help">群里发送“别名”时，机器人按“实际执行”处理；别名后面的内容会接在后面，例如别名“利润”→“查利润”，发送“利润 画图”等于“查利润 画图”。可用指令：查利润、查余额、查倍率、查充值、查总量、查负数、查分组、查监控（以机器人环境变量为准）。</p>
                 </div>
                 <button id="addBotAliasBtn" class="btn btn-secondary btn-small" type="button">添加别名</button>
               </div>
               <div id="botAliasList" class="bot-alias-list"></div>
+            </section>
+            <section class="form-section">
+              <h3>查负数</h3>
+              <div class="field">
+                <label for="botNegativeQuotaThreshold">欠费阈值</label>
+                <input id="botNegativeQuotaThreshold" class="input" type="number" min="0" max="1000000" step="0.01" inputmode="decimal" aria-describedby="botNegativeQuotaThresholdHelp" />
+                <small id="botNegativeQuotaThresholdHelp" class="field-help">“查负数”列出额度低于“负的该值”的用户 ID，例如填 5 表示欠费超过 5（按本站额度换算后的金额）。默认 5。</small>
+              </div>
             </section>
             <section class="form-section">
               <h3>消息模板</h3>

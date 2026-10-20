@@ -116,6 +116,7 @@ const els = {
   saveReportLayoutBtn: document.getElementById('saveReportLayoutBtn'),
   botAliasList: document.getElementById('botAliasList'),
   botTemplateList: document.getElementById('botTemplateList'),
+  botNegativeQuotaThreshold: document.getElementById('botNegativeQuotaThreshold'),
   addBotAliasBtn: document.getElementById('addBotAliasBtn'),
   saveBotSettingsBtn: document.getElementById('saveBotSettingsBtn'),
   botSettingsStatus: document.getElementById('botSettingsStatus'),
@@ -518,6 +519,7 @@ function renderBotSettings(options = {}) {
   els.botAliasList.innerHTML = settings.aliases.length
     ? settings.aliases.map(botAliasRow).join('')
     : '<div class="empty-inline" data-bot-alias-empty>暂无别名</div>';
+  els.botNegativeQuotaThreshold.value = String(settings.negative_quota_threshold ?? settings.default_negative_quota_threshold ?? 5);
   els.botTemplateList.innerHTML = Object.keys(settings.default_templates).map((key) => {
     const variables = settings.template_variables[key] || [];
     const value = settings.templates[key] ?? '';
@@ -552,7 +554,9 @@ function collectBotSettings() {
   els.botTemplateList.querySelectorAll('[data-bot-template]').forEach((input) => {
     templates[input.dataset.botTemplate] = input.value;
   });
-  return { aliases, templates };
+  const thresholdText = els.botNegativeQuotaThreshold.value.trim();
+  const negative_quota_threshold = thresholdText === '' ? state.botSettings.default_negative_quota_threshold : Number(thresholdText);
+  return { aliases, templates, negative_quota_threshold };
 }
 
 function renderReportGroupSelect(selectedId = null) {
@@ -1099,6 +1103,7 @@ els.botTemplateList.addEventListener('click', (event) => {
 ['input', 'change'].forEach((type) => {
   els.botAliasList.addEventListener(type, () => setBotSettingsDirty(true));
   els.botTemplateList.addEventListener(type, () => setBotSettingsDirty(true));
+  els.botNegativeQuotaThreshold.addEventListener(type, () => setBotSettingsDirty(true));
 });
 
 els.saveBotSettingsBtn.addEventListener('click', async () => {

@@ -32,7 +32,7 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 STATIC_DIR = APP_DIR / "static"
 DB_PATH = DATA_DIR / "app.db"
-APP_VERSION = "1.12.1"
+APP_VERSION = "1.13.0"
 AUTH_CONFIG_PATH = Path(os.getenv("AUTH_CONFIG_PATH") or (DATA_DIR / "auth.json"))
 AUTH_COOKIE_NAME = "upstream_watch_session"
 DEFAULT_SESSION_DAYS = 30
@@ -508,6 +508,12 @@ def init_db() -> None:
         for column_name, column_type in notification_columns.items():
             if column_name not in setting_columns:
                 conn.execute(f"ALTER TABLE notification_settings ADD COLUMN {column_name} {column_type}")
+        bot_setting_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(bot_settings)").fetchall()
+        }
+        if "negative_quota_threshold" not in bot_setting_columns:
+            conn.execute("ALTER TABLE bot_settings ADD COLUMN negative_quota_threshold REAL")
         setting = conn.execute("SELECT id FROM notification_settings WHERE id = 1").fetchone()
         if not setting:
             now = utc_now_iso()
@@ -1881,10 +1887,12 @@ MAX_BOT_ALIASES = 100
 MAX_BOT_ALIAS_LENGTH = 30
 MAX_BOT_ALIAS_TARGET_LENGTH = 80
 MAX_BOT_TEMPLATE_LENGTH = 500
+DEFAULT_NEGATIVE_QUOTA_THRESHOLD = 5.0
+MAX_NEGATIVE_QUOTA_THRESHOLD = 1000000.0
 # Default command words of qq-monitor-bot; override with BOT_COMMANDS if the bot's *_COMMAND env vars are changed.
 BOT_BUILTIN_COMMANDS: List[str] = [
     item.strip()
-    for item in (os.getenv("BOT_COMMANDS") or "查利润,查余额,查倍率,查充值,查分组,查监控").split(",")
+    for item in (os.getenv("BOT_COMMANDS") or "查利润,查余额,查倍率,查充值,查总量,查负数,查分组,查监控").split(",")
     if item.strip()
 ]
 
@@ -1929,7 +1937,9 @@ TEMPLATE_PLACEHOLDER_PATTERN = re.compile(r"\{([A-Za-z_]+)\}")
 
 
 def load_bot_settings_row() -> Dict[str, Any]:
-    row = db_query_one("SELECT aliases_json, templates_json, updated_at FROM bot_settings WHERE id = 1") or {}
+    row = db_query_one(
+        "SELECT aliases_json, templates_json, negative_quota_threshold, updated_at FROM bot_settings WHERE id = 1"
+    ) or {}
 
     def parse(raw: Any, fallback: Any) -> Any:
         try:
@@ -1941,6 +1951,11 @@ def load_bot_settings_row() -> Dict[str, Any]:
     return {
         "aliases": parse(row.get("aliases_json"), []),
         "templates": parse(row.get("templates_json"), {}),
+        "negative_quota_threshold": (
+            DEFAULT_NEGATIVE_QUOTA_THRESHOLD
+            if row.get("negative_quota_threshold") is None
+            else float(row["negative_quota_threshold"])
+        ),
         "updated_at": row.get("updated_at"),
     }
 
@@ -1954,13 +1969,32 @@ def bot_settings_payload() -> Dict[str, Any]:
         "templates": {**DEFAULT_BOT_TEMPLATES, **overrides},
         "default_templates": DEFAULT_BOT_TEMPLATES,
         "template_variables": BOT_TEMPLATE_VARIABLES,
+        "negative_quota_threshold": stored["negative_quota_threshold"],
+        "default_negative_quota_threshold": DEFAULT_NEGATIVE_QUOTA_THRESHOLD,
         "updated_at": stored["updated_at"],
     }
 
 
 def bot_config_payload() -> Dict[str, Any]:
     payload = bot_settings_payload()
-    return {"aliases": payload["aliases"], "templates": payload["templates"], "updated_at": payload["updated_at"]}
+    return {
+        "aliases": payload["aliases"],
+        "templates": payload["templates"],
+        "negative_quota_threshold": payload["negative_quota_threshold"],
+        "updated_at": payload["updated_at"],
+    }
+
+
+def validate_negative_quota_threshold(value: Any) -> float:
+    if isinstance(value, bool):
+        raise ValueError("负额度阈值必须是数字")
+    try:
+        threshold = float(value)
+    except (TypeError, ValueError):
+        raise ValueError("负额度阈值必须是数字") from None
+    if not math.isfinite(threshold) or threshold < 0 or threshold > MAX_NEGATIVE_QUOTA_THRESHOLD:
+        raise ValueError(f"负额度阈值必须在 0 到 {MAX_NEGATIVE_QUOTA_THRESHOLD:.0f} 之间")
+    return threshold
 
 
 def validate_bot_aliases(value: Any) -> List[Dict[str, str]]:
@@ -2026,16 +2060,27 @@ def update_bot_settings(body: Any) -> None:
     current = load_bot_settings_row()
     aliases = validate_bot_aliases(body["aliases"]) if "aliases" in body else current["aliases"]
     templates = validate_bot_templates(body["templates"]) if "templates" in body else current["templates"]
+    negative_quota_threshold = (
+        validate_negative_quota_threshold(body["negative_quota_threshold"])
+        if "negative_quota_threshold" in body
+        else current["negative_quota_threshold"]
+    )
     db_execute(
         """
-        INSERT INTO bot_settings (id, aliases_json, templates_json, updated_at)
-        VALUES (1, ?, ?, ?)
+        INSERT INTO bot_settings (id, aliases_json, templates_json, negative_quota_threshold, updated_at)
+        VALUES (1, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             aliases_json = excluded.aliases_json,
             templates_json = excluded.templates_json,
+            negative_quota_threshold = excluded.negative_quota_threshold,
             updated_at = excluded.updated_at
         """,
-        (json.dumps(aliases, ensure_ascii=False), json.dumps(templates, ensure_ascii=False), utc_now_iso()),
+        (
+            json.dumps(aliases, ensure_ascii=False),
+            json.dumps(templates, ensure_ascii=False),
+            negative_quota_threshold,
+            utc_now_iso(),
+        ),
     )
 
 
