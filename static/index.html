@@ -513,6 +513,13 @@
               <div id="siteNotifyGroupsList" class="group-picker"></div>
             </div>
           </div>
+          <div class="dialog-section">
+            <label class="field switch-field">
+              <span>推送分组倍率变化</span>
+              <input id="siteNotifyPublicRatio" type="checkbox" checked />
+            </label>
+            <small class="field-help">同一上游挂了多个账号时，只在一个账号上开启，避免同一次倍率变化重复推送。NewAPI 认证增强的专属分组变化不受此开关影响；变化记录照常保存。</small>
+          </div>
           <div class="dialog-section balance-dialog-section">
             <label class="field switch-field">
               <span>启用低余额预警</span>
@@ -528,6 +535,7 @@
       <footer class="dialog-footer">
         <div id="dialogMsg" class="dialog-msg"></div>
         <div class="dialog-actions">
+          <button id="addSiblingAccountBtn" type="button" class="btn btn-secondary hidden" title="复制当前上游的配置，新增一个账号（如小号）">新增账号</button>
           <button id="queryTodayUsageBtn" type="button" class="btn btn-secondary hidden">查询今日消耗</button>
           <button id="testConnBtn" type="button" class="btn btn-secondary">测试连接</button>
           <button id="testLoginBtn" type="button" class="btn btn-secondary">测试认证</button>

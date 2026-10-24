@@ -270,6 +270,64 @@ def connect_db() -> sqlite3.Connection:
     return conn
 
 
+def sites_base_url_is_unique(conn: sqlite3.Connection) -> bool:
+    for index in conn.execute("PRAGMA index_list(sites)").fetchall():
+        if not index["unique"]:
+            continue
+        columns = [row["name"] for row in conn.execute(f"PRAGMA index_info({quote_sql_identifier(index['name'])})").fetchall()]
+        if columns == ["base_url"]:
+            return True
+    return False
+
+
+def quote_sql_identifier(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def drop_sites_base_url_unique(conn: sqlite3.Connection) -> None:
+    # SQLite cannot drop a column constraint, so the table is rebuilt.
+    # foreign_keys must be OFF during the rebuild, otherwise DROP TABLE cascades into snapshots/changes.
+    conn.commit()
+    backup_path = DB_PATH.with_name(f"{DB_PATH.stem}.before-multi-account-{datetime.now().strftime('%Y%m%d%H%M%S')}{DB_PATH.suffix}")
+    backup_conn = sqlite3.connect(backup_path)
+    try:
+        conn.backup(backup_conn)
+    finally:
+        backup_conn.close()
+    table_sql = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'sites'").fetchone()["sql"]
+    new_sql, replaced = re.subn(r"(\bbase_url\s+TEXT\s+NOT\s+NULL)\s+UNIQUE\b", r"\1", table_sql, count=1, flags=re.IGNORECASE)
+    if not replaced:
+        new_sql, replaced = re.subn(r",\s*UNIQUE\s*\(\s*base_url\s*\)", "", table_sql, count=1, flags=re.IGNORECASE)
+    if not replaced:
+        raise RuntimeError(f"无法解除 sites.base_url 的唯一约束，请手动迁移；数据库已备份到 {backup_path}")
+    new_sql = re.sub(r"^\s*CREATE\s+TABLE\s+(IF\s+NOT\s+EXISTS\s+)?[\"`\[]?sites[\"`\]]?", "CREATE TABLE sites__new", new_sql, count=1, flags=re.IGNORECASE)
+    dependent_sql = [
+        row["sql"]
+        for row in conn.execute(
+            "SELECT sql FROM sqlite_master WHERE tbl_name = 'sites' AND type IN ('index', 'trigger') AND sql IS NOT NULL"
+        ).fetchall()
+    ]
+    columns = ", ".join(quote_sql_identifier(row["name"]) for row in conn.execute("PRAGMA table_info(sites)").fetchall())
+    row_count = conn.execute("SELECT COUNT(*) AS n FROM sites").fetchone()["n"]
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.execute("BEGIN")
+        conn.execute(new_sql)
+        conn.execute(f"INSERT INTO sites__new ({columns}) SELECT {columns} FROM sites")
+        conn.execute("DROP TABLE sites")
+        conn.execute("ALTER TABLE sites__new RENAME TO sites")
+        for sql in dependent_sql:
+            conn.execute(sql)
+        if conn.execute("SELECT COUNT(*) AS n FROM sites").fetchone()["n"] != row_count:
+            raise RuntimeError("迁移后站点数量不一致")
+        conn.execute("COMMIT")
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
+
+
 def init_db() -> None:
     with DB_LOCK, connect_db() as conn:
         conn.executescript(
@@ -277,7 +335,7 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS sites (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
-                base_url TEXT NOT NULL UNIQUE,
+                base_url TEXT NOT NULL,
                 platform TEXT NOT NULL DEFAULT 'newapi',
                 enabled INTEGER NOT NULL DEFAULT 1,
                 interval_minutes INTEGER NOT NULL DEFAULT 3,
@@ -470,10 +528,13 @@ def init_db() -> None:
             "balance_alert_active": "INTEGER NOT NULL DEFAULT 0",
             "report_group_id": "INTEGER",
             "report_sort_order": "INTEGER NOT NULL DEFAULT 0",
+            "notify_public_ratio": "INTEGER NOT NULL DEFAULT 1",
         }
         for column_name, column_type in site_columns.items():
             if column_name not in columns:
                 conn.execute(f"ALTER TABLE sites ADD COLUMN {column_name} {column_type}")
+        if sites_base_url_is_unique(conn):
+            drop_sites_base_url_unique(conn)
         setting_columns = {
             row["name"]
             for row in conn.execute("PRAGMA table_info(notification_settings)").fetchall()
@@ -2779,6 +2840,80 @@ def notification_groups_for_site(site: Dict[str, Any]) -> List[str]:
     return normalize_notify_groups(site.get("notify_groups_json"))
 
 
+def site_notifies_public_ratio(site: Dict[str, Any]) -> bool:
+    value = site.get("notify_public_ratio")
+    return True if value is None else bool(value)
+
+
+def site_account_key(site: Dict[str, Any]) -> Tuple[str, str]:
+    platform = str(site.get("platform") or "newapi").strip().lower()
+    if platform == "sub2api":
+        if str(site.get("auth_mode") or "password").strip().lower() == "token":
+            return ("sub2api-token", "")
+        return ("sub2api-user", str(site.get("login_username") or "").strip().lower())
+    if site.get("login_enabled") and str(site.get("access_user_id") or "").strip():
+        return ("newapi-user", str(site.get("access_user_id") or "").strip())
+    return ("newapi-public", "")
+
+
+def same_site_account(candidate: Dict[str, Any], existing: Dict[str, Any]) -> bool:
+    candidate_key = site_account_key(candidate)
+    if candidate_key != site_account_key(existing):
+        return False
+    if candidate_key[0] != "sub2api-token":
+        return True
+    candidate_tokens = {str(candidate.get(key) or "").strip() for key in ("access_token", "refresh_token")} - {""}
+    existing_tokens = {str(existing.get(key) or "").strip() for key in ("access_token", "refresh_token")} - {""}
+    return bool(candidate_tokens & existing_tokens)
+
+
+def find_duplicate_site_account(candidate: Dict[str, Any], exclude_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    base_url = normalize_base_url(str(candidate.get("base_url") or "")).lower()
+    for existing in db_query_all("SELECT * FROM sites WHERE lower(base_url) = ? ORDER BY id", (base_url,)):
+        if exclude_id is not None and int(existing["id"]) == int(exclude_id):
+            continue
+        if str(existing.get("platform") or "newapi") != str(candidate.get("platform") or "newapi"):
+            continue
+        if same_site_account(candidate, existing):
+            return existing
+    return None
+
+
+def merged_site_account(site: Dict[str, Any], body: Dict[str, Any], platform: str) -> Dict[str, Any]:
+    if "login_enabled" not in body:
+        return {
+            **site,
+            "base_url": normalize_base_url(str(body["base_url"])) if "base_url" in body else site.get("base_url"),
+            "platform": platform,
+        }
+    auth_mode = str(body.get("auth_mode") or site.get("auth_mode") or "password").strip().lower() if platform == "sub2api" else "password"
+    login_enabled = bool(body["login_enabled"]) or platform == "sub2api"
+    supplied_token = str(body.get("access_token") or "").strip()
+    supplied_refresh = str(body.get("refresh_token") or "").strip()
+    return {
+        "base_url": normalize_base_url(str(body["base_url"])) if "base_url" in body else site.get("base_url"),
+        "platform": platform,
+        "login_enabled": login_enabled,
+        "auth_mode": auth_mode,
+        "login_username": str(body.get("login_username") or "").strip() or site.get("login_username") or "",
+        "access_user_id": (str(body.get("access_user_id") or "").strip() or site.get("access_user_id") or "") if login_enabled else "",
+        "access_token": supplied_token or site.get("access_token") or "",
+        "refresh_token": supplied_refresh or site.get("refresh_token") or "",
+    }
+
+
+def duplicate_site_account_message(candidate: Dict[str, Any], existing: Dict[str, Any]) -> str:
+    kind, _ = site_account_key(candidate)
+    name = existing.get("name") or f"#{existing['id']}"
+    if kind == "newapi-public":
+        return f"该上游已有未开启认证的公开倍率监控「{name}」，不需要重复添加；如需监控小号，请开启认证增强并填写该账号的用户 ID"
+    if kind == "newapi-user":
+        return f"该上游的用户 ID {str(candidate.get('access_user_id') or '').strip()} 已在「{name}」中监控，不能重复添加同一账号"
+    if kind == "sub2api-user":
+        return f"该上游的账号 {str(candidate.get('login_username') or '').strip()} 已在「{name}」中监控，不能重复添加同一账号"
+    return f"这份登录态已在「{name}」中使用，不能重复添加同一账号"
+
+
 def filter_notification_changes(site: Dict[str, Any], changes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     selected_groups = notification_groups_for_site(site)
     if not selected_groups:
@@ -3010,6 +3145,7 @@ def _detect_site(site_id: int) -> Dict[str, Any]:
                 changes = diff_groups(old_groups, new_groups)
         except Exception:
             changes = []
+    public_change_count = len(changes)
 
     if (site.get("platform") or "newapi") == "newapi" and site.get("login_enabled") and site.get("access_token") and site.get("access_user_id"):
         login_ok, login_payload, login_error_message = fetch_newapi_groups_with_access_token(
@@ -3064,7 +3200,8 @@ def _detect_site(site_id: int) -> Dict[str, Any]:
         change["severity"] = severity
 
     notification_site = remap_notification_group_names(site, changes)
-    notify_changes(notification_site, filter_notification_changes(notification_site, changes), checked_at)
+    pushed_changes = changes if site_notifies_public_ratio(site) else changes[public_change_count:]
+    notify_changes(notification_site, filter_notification_changes(notification_site, pushed_changes), checked_at)
 
     balance_attempted = False
     balance_info: Optional[Dict[str, Any]] = None
@@ -3303,6 +3440,7 @@ def site_summary(site: Dict[str, Any]) -> Dict[str, Any]:
         "sub2api_usage_endpoint": site_sub2api_usage_endpoint(site),
         "notify_all_groups": not bool(notify_groups),
         "notify_groups": notify_groups,
+        "notify_public_ratio": site_notifies_public_ratio(site),
         "login_enabled": bool(site.get("login_enabled")),
         "auth_mode": site.get("auth_mode") or "password",
         "login_username": site.get("login_username") or "",
@@ -3636,6 +3774,20 @@ class Handler(BaseHTTPRequestHandler):
                     report_group_id = validate_report_group_id(body.get("report_group_id"))
                 except ValueError as exc:
                     return json_response(self, {"success": False, "message": str(exc)}, 400)
+                notify_public_ratio = bool(body.get("notify_public_ratio", True))
+                candidate = {
+                    "base_url": base_url,
+                    "platform": platform,
+                    "login_enabled": login_enabled or platform == "sub2api",
+                    "auth_mode": auth_mode if platform == "sub2api" else "password",
+                    "login_username": login_username,
+                    "access_user_id": access_user_id if platform == "newapi" and login_enabled else "",
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                }
+                duplicate = find_duplicate_site_account(candidate)
+                if duplicate:
+                    return json_response(self, {"success": False, "message": duplicate_site_account_message(candidate, duplicate)}, 409)
                 now = utc_now_iso()
                 site_id = db_execute(
                     """
@@ -3668,8 +3820,8 @@ class Handler(BaseHTTPRequestHandler):
                     ),
                 )
                 db_execute(
-                    "UPDATE sites SET report_group_id = ?, report_sort_order = ? WHERE id = ?",
-                    (report_group_id, next_report_sort_order(report_group_id), site_id),
+                    "UPDATE sites SET report_group_id = ?, report_sort_order = ?, notify_public_ratio = ? WHERE id = ?",
+                    (report_group_id, next_report_sort_order(report_group_id), 1 if notify_public_ratio else 0, site_id),
                 )
                 return json_response(self, {"success": True, "id": site_id})
 
@@ -3959,12 +4111,20 @@ class Handler(BaseHTTPRequestHandler):
                     params.append(report_group_id)
                     fields.append("report_sort_order = ?")
                     params.append(next_report_sort_order(report_group_id))
+            if "notify_public_ratio" in body:
+                fields.append("notify_public_ratio = ?")
+                params.append(1 if body["notify_public_ratio"] else 0)
             if "status" in body:
                 fields.append("status = ?")
                 params.append(str(body["status"]))
 
             if not fields:
                 return json_response(self, {"success": False, "message": "no fields"}, 400)
+
+            candidate = merged_site_account(site, body, target_platform)
+            duplicate = find_duplicate_site_account(candidate, exclude_id=site_id)
+            if duplicate:
+                return json_response(self, {"success": False, "message": duplicate_site_account_message(candidate, duplicate)}, 409)
 
             fields.append("updated_at = ?")
             params.append(utc_now_iso())

@@ -1128,6 +1128,145 @@ class BalanceMonitoringTest(unittest.TestCase):
         body = send_qq.call_args[0][1]
         self.assertIn(f"上游站点：{site['base_url']}", body)
 
+    def api_error(self, path, method, body):
+        with self.assertRaises(urllib.error.HTTPError) as context:
+            self.api_request(path, method, body)
+        payload = json.loads(context.exception.read())
+        context.exception.close()
+        return context.exception.code, payload["message"]
+
+    def test_legacy_unique_base_url_is_migrated_without_losing_history(self):
+        legacy_path = Path(self.temp_dir.name) / "legacy.db"
+        conn = sqlite3.connect(legacy_path)
+        conn.executescript(
+            """
+            CREATE TABLE sites (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                base_url TEXT NOT NULL UNIQUE,
+                platform TEXT NOT NULL DEFAULT 'newapi',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                interval_minutes INTEGER NOT NULL DEFAULT 3,
+                status TEXT NOT NULL DEFAULT 'unknown',
+                last_error TEXT,
+                last_check_at TEXT,
+                next_check_at TEXT,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                current_groups_json TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                site_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT '/api/user/groups',
+                groups_json TEXT,
+                raw_json TEXT,
+                hash TEXT,
+                error_message TEXT,
+                checked_at TEXT NOT NULL,
+                FOREIGN KEY(site_id) REFERENCES sites(id) ON DELETE CASCADE
+            );
+            INSERT INTO sites (id, name, base_url, created_at, updated_at) VALUES (7, '主号', 'https://up.example.com', 'x', 'x');
+            INSERT INTO snapshots (site_id, status, checked_at) VALUES (7, 'success', 'x');
+            """
+        )
+        conn.commit()
+        conn.close()
+        app.DB_PATH = legacy_path
+        app.init_db()
+        app.init_db()
+        check = app.connect_db()
+        try:
+            self.assertFalse(app.sites_base_url_is_unique(check))
+            indexes = {row["name"] for row in check.execute("PRAGMA index_list(sites)").fetchall()}
+        finally:
+            check.close()
+        self.assertIn("idx_sites_enabled_next_check", indexes)
+        self.assertEqual(1, len(list(Path(self.temp_dir.name).glob("legacy.before-multi-account-*.db"))))
+        site = app.db_query_one("SELECT * FROM sites WHERE id = 7")
+        self.assertEqual("主号", site["name"])
+        self.assertEqual(1, site["notify_public_ratio"])
+        self.assertEqual(1, len(app.db_query_all("SELECT id FROM snapshots WHERE site_id = 7")))
+        app.db_execute(
+            "INSERT INTO sites (name, base_url, created_at, updated_at) VALUES ('小号', 'https://up.example.com', 'x', 'x')"
+        )
+        self.assertEqual(2, len(app.db_query_all("SELECT id FROM sites WHERE base_url = 'https://up.example.com'")))
+        app.db_execute("DELETE FROM sites WHERE id = 7")
+        self.assertEqual([], app.db_query_all("SELECT id FROM snapshots WHERE site_id = 7"))
+
+    def newapi_account(self, name, user_id=None, **extra):
+        body = {"name": name, "base_url": self.base_url, "platform": "newapi"}
+        if user_id is not None:
+            body.update({"login_enabled": True, "access_token": f"token-{user_id}", "access_user_id": user_id})
+        body.update(extra)
+        return body
+
+    def test_same_upstream_allows_different_accounts_but_rejects_same_account(self):
+        main_id = self.api_request("/api/sites", "POST", self.newapi_account("主号", "1"))["id"]
+        alt_id = self.api_request("/api/sites", "POST", self.newapi_account("小号", "2"))["id"]
+        public_id = self.api_request("/api/sites", "POST", self.newapi_account("公开"))["id"]
+        self.assertEqual(3, len({main_id, alt_id, public_id}))
+
+        code, message = self.api_error("/api/sites", "POST", self.newapi_account("重复", "1"))
+        self.assertEqual(409, code)
+        self.assertIn("用户 ID 1", message)
+        self.assertIn("主号", message)
+        self.assertIn("重复添加", message)
+
+        code, message = self.api_error("/api/sites", "POST", self.newapi_account("公开2", base_url=f"{self.base_url}/"))
+        self.assertEqual(409, code)
+        self.assertIn("公开", message)
+
+        code, message = self.api_error(f"/api/sites/{alt_id}", "PUT", self.newapi_account("小号", "1"))
+        self.assertEqual(409, code)
+        self.assertEqual("2", app.db_query_one("SELECT access_user_id FROM sites WHERE id = ?", (alt_id,))["access_user_id"])
+
+        self.api_request(f"/api/sites/{alt_id}", "PUT", {"name": "小号改名", "enabled": False})
+        self.api_request(f"/api/sites/{alt_id}", "PUT", self.newapi_account("小号改名", "3"))
+        self.assertEqual("3", app.db_query_one("SELECT access_user_id FROM sites WHERE id = ?", (alt_id,))["access_user_id"])
+
+    def test_sub2api_duplicate_accounts_match_username_and_token(self):
+        def sub2api(name, **extra):
+            return {"name": name, "base_url": self.base_url, "platform": "sub2api", **extra}
+
+        self.api_request("/api/sites", "POST", sub2api("主号", login_username="Main@Example.com", login_password="p"))
+        self.api_request("/api/sites", "POST", sub2api("小号", login_username="alt@example.com", login_password="p"))
+        code, message = self.api_error("/api/sites", "POST", sub2api("重复", login_username="main@example.com", login_password="p"))
+        self.assertEqual(409, code)
+        self.assertIn("主号", message)
+
+        self.api_request("/api/sites", "POST", sub2api("令牌号", auth_mode="token", access_token="tok-a", refresh_token="ref-a"))
+        self.api_request("/api/sites", "POST", sub2api("令牌号2", auth_mode="token", access_token="tok-b"))
+        code, message = self.api_error("/api/sites", "POST", sub2api("令牌重复", auth_mode="token", access_token="tok-c", refresh_token="ref-a"))
+        self.assertEqual(409, code)
+        self.assertIn("令牌号", message)
+        self.assertEqual(4, len(app.db_query_all("SELECT id FROM sites")))
+
+    def test_public_ratio_toggle_mutes_shared_changes_only(self):
+        site_id = self.api_request("/api/sites", "POST", self.newapi_account("小号", "2", notify_public_ratio=False))["id"]
+        self.assertFalse(app.site_summary(app.db_query_one("SELECT * FROM sites WHERE id = ?", (site_id,)))["notify_public_ratio"])
+        app.detect_site(site_id)
+        stale = json.dumps({"default": {"ratio": 2, "ratio_type": "number", "desc": ""}})
+        app.db_execute("UPDATE snapshots SET groups_json = ? WHERE site_id = ?", (stale, site_id))
+        app.db_execute("UPDATE sites SET current_login_groups_json = ? WHERE id = ?", (stale, site_id))
+
+        with patch.object(app, "notify_changes") as notify:
+            app.detect_site(site_id)
+        pushed = notify.call_args.args[1]
+        self.assertEqual(1, len(pushed))
+        self.assertTrue(pushed[0]["message"].startswith("认证增强"))
+        self.assertEqual(2, len(app.db_query_all("SELECT id FROM changes WHERE site_id = ? AND change_type = 'ratio_changed'", (site_id,))))
+
+        self.api_request(f"/api/sites/{site_id}", "PUT", {"notify_public_ratio": True})
+        app.db_execute("UPDATE snapshots SET groups_json = ? WHERE site_id = ?", (stale, site_id))
+        app.db_execute("UPDATE sites SET current_login_groups_json = ? WHERE id = ?", (stale, site_id))
+        with patch.object(app, "notify_changes") as notify:
+            app.detect_site(site_id)
+        self.assertEqual(2, len(notify.call_args.args[1]))
+
+
 
 class NewApiAuthErrorMessageTest(unittest.TestCase):
     def test_scope_denied_names_missing_scope(self):

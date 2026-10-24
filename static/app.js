@@ -80,6 +80,8 @@ const els = {
   testConnBtn: document.getElementById('testConnBtn'),
   testLoginBtn: document.getElementById('testLoginBtn'),
   queryTodayUsageBtn: document.getElementById('queryTodayUsageBtn'),
+  addSiblingAccountBtn: document.getElementById('addSiblingAccountBtn'),
+  siteNotifyPublicRatio: document.getElementById('siteNotifyPublicRatio'),
   closeDialogBtn: document.getElementById('closeDialogBtn'),
   notifyForm: document.getElementById('notifyForm'),
   wecomEnabled: document.getElementById('wecomEnabled'),
@@ -864,8 +866,10 @@ function openDialog(site = null) {
     state.dialogNotifyAllGroups = site.notify_all_groups !== false;
     renderNotifyGroupPicker(availableGroupsForSite(site), site.notify_groups || [], state.dialogNotifyAllGroups);
     els.siteEnabled.checked = !!site.enabled;
+    els.siteNotifyPublicRatio.checked = site.notify_public_ratio !== false;
     renderReportGroupSelect(site.report_group_id);
     els.queryTodayUsageBtn.classList.remove('hidden');
+    els.addSiblingAccountBtn.classList.remove('hidden');
   } else {
     els.dialogTitle.textContent = '添加站点';
     els.siteId.value = '';
@@ -889,11 +893,35 @@ function openDialog(site = null) {
     state.dialogNotifyAllGroups = true;
     renderNotifyGroupPicker([], [], true);
     els.siteEnabled.checked = true;
+    els.siteNotifyPublicRatio.checked = true;
     renderReportGroupSelect(null);
     els.queryTodayUsageBtn.classList.add('hidden');
+    els.addSiblingAccountBtn.classList.add('hidden');
   }
   updatePlatformFields();
-  els.dialog.showModal();
+  if (!els.dialog.open) els.dialog.showModal();
+}
+
+function openSiblingAccountDialog(site) {
+  openDialog(null);
+  els.dialogTitle.textContent = `为「${site.name}」的上游新增账号`;
+  els.siteName.value = `${site.name}-小号`;
+  els.sitePlatform.value = site.platform || 'newapi';
+  els.siteBaseUrl.value = site.base_url;
+  els.siteInterval.value = site.interval_minutes;
+  els.siteUsageDivisor.value = site.usage_divisor ?? 1;
+  els.siteSub2apiUsageEndpoint.value = site.sub2api_usage_endpoint || 'dashboard';
+  els.siteAuthMode.value = site.auth_mode || 'password';
+  els.siteLoginEnabled.checked = true;
+  els.siteBalanceAlertEnabled.checked = !!site.balance_alert_enabled;
+  els.siteBalanceAlertThreshold.value = site.balance_alert_threshold ?? 10;
+  els.siteNotifyPublicRatio.checked = false;
+  state.dialogNotifyAllGroups = site.notify_all_groups !== false;
+  renderNotifyGroupPicker(availableGroupsForSite(site), site.notify_groups || [], state.dialogNotifyAllGroups);
+  renderReportGroupSelect(site.report_group_id);
+  updatePlatformFields();
+  setSiteDialogTab('auth');
+  els.dialogMsg.textContent = '已复制上游配置，请填写这个账号的认证信息；分组倍率推送默认关闭，避免与原账号重复。';
 }
 
 async function loadSelectedSiteChanges() {
@@ -990,6 +1018,10 @@ async function deleteSite(id) {
 
 els.addSiteBtn.addEventListener('click', () => openDialog());
 els.closeDialogBtn.addEventListener('click', () => els.dialog.close());
+els.addSiblingAccountBtn.addEventListener('click', () => {
+  const site = state.sites.find((s) => String(s.id) === els.siteId.value);
+  if (site) openSiblingAccountDialog(site);
+});
 els.logoutBtn.addEventListener('click', async () => {
   try {
     await api('/api/auth/logout', { method: 'POST', body: '{}' });
@@ -1283,6 +1315,7 @@ els.form.addEventListener('submit', async (e) => {
     token_expires_at: authMode === 'token' ? els.siteTokenExpiresAt.value.trim() : '',
     access_user_id: els.siteAccessUserId.value.trim(),
     enabled: els.siteEnabled.checked,
+    notify_public_ratio: els.siteNotifyPublicRatio.checked,
     report_group_id: els.siteReportGroup.value ? Number(els.siteReportGroup.value) : null,
     balance_alert_enabled: els.siteBalanceAlertEnabled.checked,
     balance_alert_threshold: Math.max(0, Number(els.siteBalanceAlertThreshold.value || 0)),
@@ -1330,7 +1363,7 @@ els.form.addEventListener('submit', async (e) => {
     els.saveSiteBtn.textContent = '保存配置';
     els.dialogMsg.textContent = err.message;
     els.dialogMsg.classList.add('error');
-    if (/登录|令牌|用户 ID|auth_token/.test(err.message)) setSiteDialogTab('auth');
+    if (/登录|令牌|用户 ID|auth_token|重复添加/.test(err.message)) setSiteDialogTab('auth');
     showToast(`保存失败：${err.message}`, 'error');
   }
 });
