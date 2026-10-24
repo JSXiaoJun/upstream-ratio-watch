@@ -451,52 +451,12 @@
               <span>认证增强监控</span>
               <input id="siteLoginEnabled" type="checkbox" />
             </label>
-            <p class="field-help">填写系统访问令牌和 NewAPI 用户 ID 后，可查看隐藏或专属分组。</p>
-            <div id="loginFields" class="dialog-grid hidden">
-              <label class="field span-2">
-                <span>系统访问令牌</span>
-                <input id="siteAccessToken" class="input" type="password" autocomplete="off" placeholder="留空保留；测试认证使用已保存令牌" />
-              </label>
-              <label class="field">
-                <span>NewAPI 用户 ID</span>
-                <input id="siteAccessUserId" class="input" inputmode="numeric" placeholder="例如：4" />
-              </label>
-            </div>
+            <p class="field-help">为每个账号填写系统访问令牌和 NewAPI 用户 ID。主账号负责采集隐藏或专属分组倍率，所有账号共用余额预警阈值，余额和登录态按账号汇报。</p>
           </div>
-          <div id="sub2apiAuthSection" class="hidden">
-            <div class="dialog-grid">
-              <label class="field span-2">
-                <span>认证方式</span>
-                <select id="siteAuthMode" class="input">
-                  <option value="password">账号密码登录</option>
-                  <option value="token">导入登录态</option>
-                </select>
-              </label>
-              <div id="sub2apiPasswordFields" class="dialog-grid span-2">
-                <label class="field">
-                  <span>用户邮箱</span>
-                  <input id="siteLoginUsername" class="input" autocomplete="username" placeholder="user@example.com" />
-                </label>
-                <label class="field">
-                  <span>用户密码</span>
-                  <input id="siteLoginPassword" class="input" type="password" autocomplete="current-password" placeholder="留空保留；测试登录使用已保存密码" />
-                </label>
-              </div>
-              <div id="sub2apiTokenFields" class="dialog-grid span-2 hidden">
-                <label class="field span-2">
-                  <span>auth_token</span>
-                  <input id="siteSub2apiAccessToken" class="input" type="password" autocomplete="off" placeholder="留空保留；测试登录态使用已保存令牌" />
-                </label>
-                <label class="field">
-                  <span>refresh_token</span>
-                  <input id="siteRefreshToken" class="input" type="password" autocomplete="off" placeholder="可选" />
-                </label>
-                <label class="field">
-                  <span>token_expires_at</span>
-                  <input id="siteTokenExpiresAt" class="input" autocomplete="off" placeholder="可选" />
-                </label>
-              </div>
-            </div>
+          <p id="sub2apiAuthHelp" class="field-help hidden">每个账号单独登录。主账号负责检测分组倍率，所有账号共用余额预警阈值，余额和登录态按账号汇报。</p>
+          <div id="siteAccountsSection" class="account-section">
+            <div id="siteAccountsList" class="account-list"></div>
+            <button id="addAccountBtn" type="button" class="btn btn-secondary">添加账号</button>
           </div>
         </section>
 
@@ -513,13 +473,6 @@
               <div id="siteNotifyGroupsList" class="group-picker"></div>
             </div>
           </div>
-          <div class="dialog-section">
-            <label class="field switch-field">
-              <span>推送分组倍率变化</span>
-              <input id="siteNotifyPublicRatio" type="checkbox" checked />
-            </label>
-            <small class="field-help">同一上游挂了多个账号时，只在一个账号上开启，避免同一次倍率变化重复推送。NewAPI 认证增强的专属分组变化不受此开关影响；变化记录照常保存。</small>
-          </div>
           <div class="dialog-section balance-dialog-section">
             <label class="field switch-field">
               <span>启用低余额预警</span>
@@ -535,10 +488,7 @@
       <footer class="dialog-footer">
         <div id="dialogMsg" class="dialog-msg"></div>
         <div class="dialog-actions">
-          <button id="addSiblingAccountBtn" type="button" class="btn btn-secondary hidden" title="复制当前上游的配置，新增一个账号（如小号）">新增账号</button>
-          <button id="queryTodayUsageBtn" type="button" class="btn btn-secondary hidden">查询今日消耗</button>
           <button id="testConnBtn" type="button" class="btn btn-secondary">测试连接</button>
-          <button id="testLoginBtn" type="button" class="btn btn-secondary">测试认证</button>
           <button id="saveSiteBtn" type="submit" class="btn btn-primary">保存配置</button>
         </div>
       </footer>

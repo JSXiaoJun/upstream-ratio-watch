@@ -166,29 +166,36 @@ class BalanceMonitoringTest(unittest.TestCase):
 
     def add_site(self, platform, threshold, token=""):
         now = app.utc_now_iso()
-        return app.db_execute(
+        site_id = app.db_execute(
             """
             INSERT INTO sites
             (name, base_url, platform, enabled, interval_minutes, login_enabled,
-             auth_mode, login_username, login_password, access_token, access_user_id,
              balance_alert_enabled, balance_alert_threshold, status, next_check_at,
              created_at, updated_at)
-            VALUES (?, ?, ?, 1, 3, 1, ?, ?, ?, ?, '1', 1, ?, 'unknown', ?, ?, ?)
+            VALUES (?, ?, ?, 1, 3, 1, 1, ?, 'unknown', ?, ?, ?)
             """,
-            (
-                platform,
-                f"{self.base_url}/{platform}".replace(f"/{platform}", ""),
-                platform,
-                "token" if token else "password",
-                "user@example.com",
-                "password",
-                token,
-                threshold,
-                now,
-                now,
-                now,
-            ),
+            (platform, self.base_url, platform, threshold, now, now, now),
         )
+        self.add_account(site_id, token=token)
+        return site_id
+
+    def add_account(self, site_id, name="", token="", username="user@example.com", user_id="1", password="password"):
+        now = app.utc_now_iso()
+        sort_order = app.db_query_one(
+            "SELECT COUNT(*) AS count FROM site_accounts WHERE site_id = ?", (site_id,)
+        )["count"]
+        return app.db_execute(
+            """
+            INSERT INTO site_accounts
+            (site_id, name, sort_order, auth_mode, login_username, login_password, access_token,
+             access_user_id, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (site_id, name, sort_order, "token" if token else "password", username, password, token, user_id, now, now),
+        )
+
+    def account(self, site_id, index=0):
+        return app.list_site_accounts(site_id)[index]
 
     def test_newapi_balance_alert_is_deduplicated_and_recovers(self):
         site_id = self.add_site("newapi", 10, token="system-token")
@@ -196,7 +203,7 @@ class BalanceMonitoringTest(unittest.TestCase):
         second = app.detect_site(site_id)
         self.assertEqual(8.0, first["balance"]["amount"])
         self.assertEqual(1, len(app.db_query_all("SELECT id FROM changes WHERE change_type = 'balance_low'")))
-        self.assertTrue(app.db_query_one("SELECT balance_alert_active FROM sites WHERE id = ?", (site_id,))["balance_alert_active"])
+        self.assertTrue(self.account(site_id)["balance_alert_active"])
 
         MockUpstreamHandler.newapi_quota = 6_000_000
         recovered = app.detect_site(site_id)
@@ -212,7 +219,7 @@ class BalanceMonitoringTest(unittest.TestCase):
         self.assertEqual(0.35, result["balance"]["amount"])
         self.assertEqual(3.5, result["balance"]["raw_amount"])
         self.assertEqual("CNY", result["balance"]["currency"])
-        site = app.db_query_one("SELECT current_balance, balance_alert_active FROM sites WHERE id = ?", (site_id,))
+        site = self.account(site_id)
         self.assertEqual(3.5, site["current_balance"])
         self.assertEqual(1, site["balance_alert_active"])
         summary = app.site_summary(app.db_query_one("SELECT * FROM sites WHERE id = ?", (site_id,)))
@@ -421,7 +428,7 @@ class BalanceMonitoringTest(unittest.TestCase):
     def test_rotated_sub2api_tokens_are_saved_even_when_group_fetch_fails(self):
         site_id = self.add_site("sub2api", 5, token="old-access-token")
         app.db_execute(
-            "UPDATE sites SET refresh_token = ?, token_expires_at = ? WHERE id = ?",
+            "UPDATE site_accounts SET refresh_token = ?, token_expires_at = ? WHERE site_id = ?",
             ("old-refresh-token", app.utc_now_iso(), site_id),
         )
         refreshed_auth = {
@@ -436,19 +443,17 @@ class BalanceMonitoringTest(unittest.TestCase):
         ):
             result = app.detect_site(site_id)
         self.assertFalse(result["success"])
-        site = app.db_query_one(
-            "SELECT access_token, refresh_token, token_expires_at FROM sites WHERE id = ?",
-            (site_id,),
-        )
+        site = self.account(site_id)
         self.assertEqual("new-access-token", site["access_token"])
         self.assertEqual("new-refresh-token", site["refresh_token"])
         self.assertEqual(refreshed_auth["token_expires_at"], site["token_expires_at"])
 
     def test_sub2api_auth_failure_notifies_once_and_rearms_after_recovery(self):
         site_id = self.add_site("sub2api", 5, token="expired-access-token")
+        app.db_execute("UPDATE sites SET name = ? WHERE id = ?", ("超哥", site_id))
         app.db_execute(
-            "UPDATE sites SET name = ?, refresh_token = ? WHERE id = ?",
-            ("超哥", "expired-refresh-token", site_id),
+            "UPDATE site_accounts SET refresh_token = ? WHERE site_id = ?",
+            ("expired-refresh-token", site_id),
         )
         auth_failure = {
             "groups": {"groups": {"code": 401, "message": "登录已过期"}},
@@ -478,9 +483,7 @@ class BalanceMonitoringTest(unittest.TestCase):
                     return_value=(True, success_payload, None),
                 ):
                     app.detect_site(site_id)
-                self.assertEqual(0, app.db_query_one(
-                    "SELECT auth_alert_active FROM sites WHERE id = ?", (site_id,),
-                )["auth_alert_active"])
+                self.assertEqual(0, self.account(site_id)["auth_alert_active"])
 
                 app.detect_site(site_id)
                 self.assertEqual(2, send_mock.call_count)
@@ -548,9 +551,10 @@ class BalanceMonitoringTest(unittest.TestCase):
 
     def test_bot_balance_api_requires_notification_token(self):
         site_id = self.add_site("sub2api", 5)
+        app.db_execute("UPDATE sites SET name = ?, usage_divisor = ? WHERE id = ?", ("余额测试站", 10, site_id))
         app.db_execute(
-            "UPDATE sites SET name = ?, current_balance = ?, balance_currency = ?, balance_last_check_at = ?, usage_divisor = ? WHERE id = ?",
-            ("余额测试站", 123.456, "USD", app.utc_now_iso(), 10, site_id),
+            "UPDATE site_accounts SET current_balance = ?, balance_currency = ?, balance_last_check_at = ? WHERE site_id = ?",
+            (123.456, "USD", app.utc_now_iso(), site_id),
         )
         app.update_notification_settings({
             "qq_enabled": True,
@@ -759,7 +763,10 @@ class BalanceMonitoringTest(unittest.TestCase):
 
         app.db_execute("DELETE FROM sites WHERE id = ?", (sub2api_id,))
         sub2api_token_id = self.add_site("sub2api", 5, token="saved-auth-token")
-        sub2api_token_site = app.db_query_one("SELECT * FROM sites WHERE id = ?", (sub2api_token_id,))
+        sub2api_token_site = app.site_with_account(
+            app.db_query_one("SELECT * FROM sites WHERE id = ?", (sub2api_token_id,)),
+            self.account(sub2api_token_id),
+        )
         with patch.object(app, "probe_sub2api_groups", return_value={
             "success": True,
             "message": "ok",
@@ -809,10 +816,13 @@ class BalanceMonitoringTest(unittest.TestCase):
     def test_saved_auth_test_persists_rotated_tokens_without_returning_them(self):
         site_id = self.add_site("sub2api", 5, token="old-access-token")
         app.db_execute(
-            "UPDATE sites SET refresh_token = ?, token_expires_at = ? WHERE id = ?",
+            "UPDATE site_accounts SET refresh_token = ?, token_expires_at = ? WHERE site_id = ?",
             ("old-refresh-token", "2020-01-01T00:00:00+08:00", site_id),
         )
-        site = app.db_query_one("SELECT * FROM sites WHERE id = ?", (site_id,))
+        site = app.site_with_account(
+            app.db_query_one("SELECT * FROM sites WHERE id = ?", (site_id,)),
+            self.account(site_id),
+        )
         refreshed_auth = {
             "access_token": "new-access-token",
             "refresh_token": "new-refresh-token",
@@ -829,10 +839,7 @@ class BalanceMonitoringTest(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertTrue(result["auth_updated"])
         self.assertNotIn("refreshed_auth", result)
-        updated = app.db_query_one(
-            "SELECT access_token, refresh_token, token_expires_at FROM sites WHERE id = ?",
-            (site_id,),
-        )
+        updated = self.account(site_id)
         self.assertEqual("new-access-token", updated["access_token"])
         self.assertEqual("new-refresh-token", updated["refresh_token"])
         self.assertEqual("2030-01-01T00:00:00+08:00", updated["token_expires_at"])
@@ -886,7 +893,7 @@ class BalanceMonitoringTest(unittest.TestCase):
 
     def test_today_usage_does_not_use_previous_day_cache(self):
         site_id = self.add_site("newapi", 5, token="system-token")
-        app.save_daily_usage_cache(site_id, "2000-01-01", 99.0, "USD", "2000-01-01T12:00:00+08:00")
+        app.save_daily_usage_cache(self.account(site_id)["id"], "2000-01-01", 99.0, "USD", "2000-01-01T12:00:00+08:00")
 
         with patch.object(app, "fetch_newapi_today_usage", return_value=(False, {}, "HTTP 403")):
             result = app.bot_today_usage_payload()
@@ -1196,76 +1203,214 @@ class BalanceMonitoringTest(unittest.TestCase):
         app.db_execute("DELETE FROM sites WHERE id = 7")
         self.assertEqual([], app.db_query_all("SELECT id FROM snapshots WHERE site_id = 7"))
 
-    def newapi_account(self, name, user_id=None, **extra):
+    def newapi_site(self, name, *user_ids, **extra):
         body = {"name": name, "base_url": self.base_url, "platform": "newapi"}
-        if user_id is not None:
-            body.update({"login_enabled": True, "access_token": f"token-{user_id}", "access_user_id": user_id})
+        if user_ids:
+            body.update({
+                "login_enabled": True,
+                "accounts": [
+                    {"name": f"账号{user_id}", "access_token": f"token-{user_id}", "access_user_id": user_id}
+                    for user_id in user_ids
+                ],
+            })
         body.update(extra)
         return body
 
-    def test_same_upstream_allows_different_accounts_but_rejects_same_account(self):
-        main_id = self.api_request("/api/sites", "POST", self.newapi_account("主号", "1"))["id"]
-        alt_id = self.api_request("/api/sites", "POST", self.newapi_account("小号", "2"))["id"]
-        public_id = self.api_request("/api/sites", "POST", self.newapi_account("公开"))["id"]
-        self.assertEqual(3, len({main_id, alt_id, public_id}))
+    def test_same_upstream_keeps_accounts_on_one_site(self):
+        site_id = self.api_request("/api/sites", "POST", self.newapi_site("主站", "1", "2"))["id"]
+        accounts = app.list_site_accounts(site_id)
+        self.assertEqual(["1", "2"], [account["access_user_id"] for account in accounts])
+        self.assertFalse(app.db_query_one("SELECT access_token FROM sites WHERE id = ?", (site_id,))["access_token"])
 
-        code, message = self.api_error("/api/sites", "POST", self.newapi_account("重复", "1"))
+        code, message = self.api_error("/api/sites", "POST", self.newapi_site("另一个", "3", base_url=f"{self.base_url}/"))
         self.assertEqual(409, code)
-        self.assertIn("用户 ID 1", message)
-        self.assertIn("主号", message)
+        self.assertIn("主站", message)
+        self.assertIn("认证配置", message)
+
+        code, message = self.api_error("/api/sites", "POST", self.newapi_site("重复", "5", "5", base_url="https://other.example"))
+        self.assertEqual(400, code)
         self.assertIn("重复添加", message)
 
-        code, message = self.api_error("/api/sites", "POST", self.newapi_account("公开2", base_url=f"{self.base_url}/"))
-        self.assertEqual(409, code)
-        self.assertIn("公开", message)
+        summary = next(item for item in self.api_request("/api/sites", "GET")["data"] if item["id"] == site_id)
+        self.assertEqual(2, summary["account_count"])
+        self.assertNotIn("token-1", json.dumps(summary))
+        self.assertTrue(summary["accounts"][0]["has_access_token"])
+        self.assertTrue(summary["accounts"][0]["is_primary"])
 
-        code, message = self.api_error(f"/api/sites/{alt_id}", "PUT", self.newapi_account("小号", "1"))
-        self.assertEqual(409, code)
-        self.assertEqual("2", app.db_query_one("SELECT access_user_id FROM sites WHERE id = ?", (alt_id,))["access_user_id"])
+        first, second = accounts
+        self.api_request(f"/api/sites/{site_id}", "PUT", {
+            "login_enabled": True,
+            "accounts": [
+                {"id": second["id"], "name": "小号", "access_token": "", "access_user_id": "2"},
+                {"name": "新号", "access_token": "token-9", "access_user_id": "9"},
+            ],
+        })
+        updated = app.list_site_accounts(site_id)
+        self.assertEqual([second["id"], updated[1]["id"]], [account["id"] for account in updated])
+        self.assertEqual("token-2", updated[0]["access_token"])
+        self.assertEqual("小号", updated[0]["name"])
+        self.assertNotIn(first["id"], [account["id"] for account in updated])
 
-        self.api_request(f"/api/sites/{alt_id}", "PUT", {"name": "小号改名", "enabled": False})
-        self.api_request(f"/api/sites/{alt_id}", "PUT", self.newapi_account("小号改名", "3"))
-        self.assertEqual("3", app.db_query_one("SELECT access_user_id FROM sites WHERE id = ?", (alt_id,))["access_user_id"])
+        self.api_request(f"/api/sites/{site_id}", "PUT", {"login_enabled": False})
+        self.assertEqual([], app.list_site_accounts(site_id))
+
+    def test_legacy_flat_credentials_still_create_and_update_primary_account(self):
+        site_id = self.api_request("/api/sites", "POST", {
+            "name": "旧接口", "base_url": self.base_url, "platform": "newapi",
+            "login_enabled": True, "access_token": "flat-token", "access_user_id": "7",
+        })["id"]
+        self.assertEqual("flat-token", self.account(site_id)["access_token"])
+        self.add_account(site_id, name="第二个", token="second-token", user_id="8")
+        self.api_request(f"/api/sites/{site_id}", "PUT", {"login_enabled": True, "access_token": "", "access_user_id": "7"})
+        accounts = app.list_site_accounts(site_id)
+        self.assertEqual(["flat-token", "second-token"], [account["access_token"] for account in accounts])
 
     def test_sub2api_duplicate_accounts_match_username_and_token(self):
-        def sub2api(name, **extra):
-            return {"name": name, "base_url": self.base_url, "platform": "sub2api", **extra}
+        def sub2api(name, *accounts):
+            return {"name": name, "base_url": self.base_url, "platform": "sub2api", "accounts": list(accounts)}
 
-        self.api_request("/api/sites", "POST", sub2api("主号", login_username="Main@Example.com", login_password="p"))
-        self.api_request("/api/sites", "POST", sub2api("小号", login_username="alt@example.com", login_password="p"))
-        code, message = self.api_error("/api/sites", "POST", sub2api("重复", login_username="main@example.com", login_password="p"))
-        self.assertEqual(409, code)
+        code, message = self.api_error("/api/sites", "POST", sub2api(
+            "站点",
+            {"name": "主号", "login_username": "Main@Example.com", "login_password": "p"},
+            {"name": "重复", "login_username": "main@example.com", "login_password": "p"},
+        ))
+        self.assertEqual(400, code)
         self.assertIn("主号", message)
 
-        self.api_request("/api/sites", "POST", sub2api("令牌号", auth_mode="token", access_token="tok-a", refresh_token="ref-a"))
-        self.api_request("/api/sites", "POST", sub2api("令牌号2", auth_mode="token", access_token="tok-b"))
-        code, message = self.api_error("/api/sites", "POST", sub2api("令牌重复", auth_mode="token", access_token="tok-c", refresh_token="ref-a"))
-        self.assertEqual(409, code)
+        code, message = self.api_error("/api/sites", "POST", sub2api(
+            "站点",
+            {"name": "令牌号", "auth_mode": "token", "access_token": "tok-a", "refresh_token": "ref-a"},
+            {"name": "令牌重复", "auth_mode": "token", "access_token": "tok-c", "refresh_token": "ref-a"},
+        ))
+        self.assertEqual(400, code)
         self.assertIn("令牌号", message)
-        self.assertEqual(4, len(app.db_query_all("SELECT id FROM sites")))
 
-    def test_public_ratio_toggle_mutes_shared_changes_only(self):
-        site_id = self.api_request("/api/sites", "POST", self.newapi_account("小号", "2", notify_public_ratio=False))["id"]
-        self.assertFalse(app.site_summary(app.db_query_one("SELECT * FROM sites WHERE id = ?", (site_id,)))["notify_public_ratio"])
-        app.detect_site(site_id)
-        stale = json.dumps({"default": {"ratio": 2, "ratio_type": "number", "desc": ""}})
-        app.db_execute("UPDATE snapshots SET groups_json = ? WHERE site_id = ?", (stale, site_id))
-        app.db_execute("UPDATE sites SET current_login_groups_json = ? WHERE id = ?", (stale, site_id))
+        code, message = self.api_error("/api/sites", "POST", sub2api("空站点"))
+        self.assertEqual(400, code)
+        self.assertIn("至少需要配置一个账号", message)
 
-        with patch.object(app, "notify_changes") as notify:
+        site_id = self.api_request("/api/sites", "POST", sub2api(
+            "站点",
+            {"name": "主号", "login_username": "main@example.com", "login_password": "p"},
+            {"name": "令牌号", "auth_mode": "token", "access_token": "tok-a"},
+        ))["id"]
+        self.assertEqual(["password", "token"], [account["auth_mode"] for account in app.list_site_accounts(site_id)])
+        self.assertEqual(1, len(app.db_query_all("SELECT id FROM sites")))
+
+    def test_multiple_accounts_share_threshold_and_report_low_balance_together(self):
+        site_id = self.add_site("newapi", 10, token="system-token")
+        app.db_execute("UPDATE sites SET name = ? WHERE id = ?", ("聚合站", site_id))
+        app.db_execute("UPDATE site_accounts SET name = ? WHERE site_id = ?", ("账号1", site_id))
+        self.add_account(site_id, name="账号2", token="second-token", user_id="2")
+
+        with patch.object(app, "send_qq_message", return_value=(True, None)) as send_qq, \
+                patch.object(app, "send_email_message"), \
+                patch.object(app, "send_wecom_message"), \
+                patch.object(app, "send_feishu_message"):
+            result = app.detect_site(site_id)
             app.detect_site(site_id)
-        pushed = notify.call_args.args[1]
-        self.assertEqual(1, len(pushed))
-        self.assertTrue(pushed[0]["message"].startswith("认证增强"))
-        self.assertEqual(2, len(app.db_query_all("SELECT id FROM changes WHERE site_id = ? AND change_type = 'ratio_changed'", (site_id,))))
+        self.assertEqual(1, send_qq.call_count)
+        subject, body = send_qq.call_args.args
+        self.assertIn("账号1、账号2余额不足", subject)
+        self.assertIn("· 账号1：¥8.00", body)
+        self.assertIn("· 账号2：¥8.00", body)
+        self.assertEqual(2, len(result["accounts"]))
+        low_changes = app.db_query_all("SELECT account_id, message FROM changes WHERE change_type = 'balance_low' ORDER BY id")
+        self.assertEqual([account["id"] for account in app.list_site_accounts(site_id)], [row["account_id"] for row in low_changes])
+        self.assertTrue(low_changes[1]["message"].startswith("账号「账号2」"))
+        self.assertEqual(4, len(app.db_query_all("SELECT id FROM balance_snapshots WHERE site_id = ?", (site_id,))))
+        self.assertEqual("warning", app.db_query_one("SELECT status FROM sites WHERE id = ?", (site_id,))["status"])
 
-        self.api_request(f"/api/sites/{site_id}", "PUT", {"notify_public_ratio": True})
-        app.db_execute("UPDATE snapshots SET groups_json = ? WHERE site_id = ?", (stale, site_id))
-        app.db_execute("UPDATE sites SET current_login_groups_json = ? WHERE id = ?", (stale, site_id))
-        with patch.object(app, "notify_changes") as notify:
-            app.detect_site(site_id)
-        self.assertEqual(2, len(notify.call_args.args[1]))
+        balances = app.bot_balance_payload()
+        self.assertEqual(["聚合站·账号1", "聚合站·账号2"], [item["name"] for item in balances])
+        self.assertEqual([8.0, 8.0], [item["current_balance"] for item in balances])
+        usage = app.bot_today_usage_payload()
+        self.assertEqual(["聚合站·账号1", "聚合站·账号2"], [item["name"] for item in usage])
+        self.assertEqual([2.5, 2.5], [item["amount"] for item in usage])
+        summary = app.site_summary(app.db_query_one("SELECT * FROM sites WHERE id = ?", (site_id,)))
+        self.assertEqual(16.0, summary["current_balance"])
+        self.assertTrue(summary["balance_alert_active"])
 
+    def test_secondary_account_login_failure_is_named(self):
+        site_id = self.add_site("newapi", 1, token="system-token")
+        self.add_account(site_id, name="坏号", token="bad-token", user_id="2")
+        original = app.fetch_newapi_balance
+
+        def fake_balance(base_url, token, user_id=""):
+            if token == "bad-token":
+                return False, {}, "令牌无效"
+            return original(base_url, token, user_id)
+
+        with patch.object(app, "fetch_newapi_balance", side_effect=fake_balance):
+            result = app.detect_site(site_id)
+        self.assertTrue(result["success"])
+        site = app.db_query_one("SELECT status, login_last_error FROM sites WHERE id = ?", (site_id,))
+        self.assertEqual("warning", site["status"])
+        self.assertEqual("坏号：令牌无效", site["login_last_error"])
+        self.assertIsNone(self.account(site_id)["login_last_error"])
+        self.assertEqual("令牌无效", self.account(site_id, 1)["login_last_error"])
+
+    def test_same_upstream_sites_are_merged_into_accounts(self):
+        now = app.utc_now_iso()
+        with app.connect_db() as conn:
+            conn.execute("DROP TABLE account_daily_usage_cache")
+            conn.execute("DROP TABLE site_accounts")
+            for site_id, name, user_id, public in ((3, "主号", "1", 0), (4, "小号", "2", 1), (5, "公开", "", 1)):
+                conn.execute(
+                    """
+                    INSERT INTO sites (id, name, base_url, platform, login_enabled, access_token, access_user_id,
+                        current_balance, notify_public_ratio, balance_alert_enabled, balance_alert_threshold, created_at, updated_at)
+                    VALUES (?, ?, ?, 'newapi', ?, ?, ?, ?, ?, 1, 5, ?, ?)
+                    """,
+                    (site_id, name, self.base_url if site_id != 5 else f"{self.base_url}/", 1 if user_id else 0,
+                     f"token-{user_id}" if user_id else "", user_id, 40.0 if user_id else None, public, now, now),
+                )
+            conn.execute("INSERT INTO changes (site_id, change_type, message, created_at) VALUES (3, 'balance_low', 'low', ?)", (now,))
+            conn.execute("INSERT INTO balance_snapshots (site_id, status, checked_at) VALUES (3, 'success', ?)", (now,))
+            conn.commit()
+
+        app.init_db()
+        self.assertEqual([4], [row["id"] for row in app.db_query_all("SELECT id FROM sites")])
+        accounts = app.list_site_accounts(4)
+        self.assertEqual(["小号", "主号"], [account["name"] for account in accounts])
+        self.assertEqual(["token-2", "token-1"], [account["access_token"] for account in accounts])
+        self.assertEqual([40.0, 40.0], [account["current_balance"] for account in accounts])
+        self.assertEqual(1, app.db_query_one("SELECT login_enabled FROM sites WHERE id = 4")["login_enabled"])
+        self.assertEqual("", app.db_query_one("SELECT access_token FROM sites WHERE id = 4")["access_token"])
+        change = app.db_query_one("SELECT site_id, account_id FROM changes")
+        self.assertEqual((4, accounts[1]["id"]), (change["site_id"], change["account_id"]))
+        snapshot = app.db_query_one("SELECT site_id, account_id FROM balance_snapshots")
+        self.assertEqual((4, accounts[1]["id"]), (snapshot["site_id"], snapshot["account_id"]))
+        self.assertEqual(1, len(list(Path(self.temp_dir.name).glob("test.before-site-accounts-*.db"))))
+
+        app.init_db()
+        self.assertEqual(2, len(app.list_site_accounts(4)))
+
+    def test_auth_test_and_usage_target_selected_account(self):
+        site_id = self.add_site("newapi", 1, token="system-token")
+        second_id = self.add_account(site_id, name="小号", token="second-token", user_id="2")
+        with patch.object(
+            app,
+            "fetch_newapi_groups_with_access_token",
+            return_value=(True, {"success": True, "data": {}}, None),
+        ) as fetch_mock:
+            result = self.api_request(f"/api/sites/{site_id}/auth/test", "POST", {"account_id": second_id, "access_token": ""})
+        self.assertTrue(result["used_saved_credentials"])
+        fetch_mock.assert_called_once_with(self.base_url, "second-token", "2")
+
+        with patch.object(
+            app,
+            "fetch_newapi_groups_with_access_token",
+            return_value=(True, {"success": True, "data": {}}, None),
+        ):
+            new_result = self.api_request(f"/api/sites/{site_id}/auth/test", "POST", {"account_id": None, "access_token": "", "access_user_id": "3"})
+        self.assertFalse(new_result["used_saved_credentials"])
+
+        usage = self.api_request(f"/api/sites/{site_id}/usage/today", "POST", {"account_id": second_id})
+        self.assertEqual(second_id, usage["account_id"])
+        self.assertEqual("小号", usage["account_name"])
+        code, _ = self.api_error(f"/api/sites/{site_id}/usage/today", "POST", {"account_id": 999})
+        self.assertEqual(404, code)
 
 
 class NewApiAuthErrorMessageTest(unittest.TestCase):

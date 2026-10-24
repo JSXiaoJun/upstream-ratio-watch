@@ -12,6 +12,8 @@ const state = {
   refreshInFlight: false,
   dialogAvailableGroups: [],
   dialogNotifyAllGroups: true,
+  dialogAccounts: [],
+  dialogStoredPlatform: null,
   reportGroups: [],
   reportLayout: null,
   reportLayoutDirty: false,
@@ -52,36 +54,24 @@ const els = {
   siteUsageDivisor: document.getElementById('siteUsageDivisor'),
   sub2apiUsageEndpointField: document.getElementById('sub2apiUsageEndpointField'),
   siteSub2apiUsageEndpoint: document.getElementById('siteSub2apiUsageEndpoint'),
-  siteAuthMode: document.getElementById('siteAuthMode'),
   siteLoginEnabled: document.getElementById('siteLoginEnabled'),
-  siteLoginUsername: document.getElementById('siteLoginUsername'),
-  siteLoginPassword: document.getElementById('siteLoginPassword'),
-  siteAccessToken: document.getElementById('siteAccessToken'),
-  siteSub2apiAccessToken: document.getElementById('siteSub2apiAccessToken'),
-  siteRefreshToken: document.getElementById('siteRefreshToken'),
-  siteTokenExpiresAt: document.getElementById('siteTokenExpiresAt'),
-  siteAccessUserId: document.getElementById('siteAccessUserId'),
+  siteAccountsSection: document.getElementById('siteAccountsSection'),
+  siteAccountsList: document.getElementById('siteAccountsList'),
+  addAccountBtn: document.getElementById('addAccountBtn'),
+  sub2apiAuthHelp: document.getElementById('sub2apiAuthHelp'),
   siteBalanceAlertEnabled: document.getElementById('siteBalanceAlertEnabled'),
   siteBalanceAlertThreshold: document.getElementById('siteBalanceAlertThreshold'),
   siteNotifyGroupsSection: document.getElementById('siteNotifyGroupsSection'),
   siteNotifyGroupsList: document.getElementById('siteNotifyGroupsList'),
   selectAllNotifyGroupsBtn: document.getElementById('selectAllNotifyGroupsBtn'),
   clearNotifyGroupsBtn: document.getElementById('clearNotifyGroupsBtn'),
-  loginFields: document.getElementById('loginFields'),
   newapiAuthSection: document.getElementById('newapiAuthSection'),
-  sub2apiAuthSection: document.getElementById('sub2apiAuthSection'),
-  sub2apiPasswordFields: document.getElementById('sub2apiPasswordFields'),
-  sub2apiTokenFields: document.getElementById('sub2apiTokenFields'),
   siteEnabled: document.getElementById('siteEnabled'),
   dialogMsg: document.getElementById('dialogMsg'),
   saveSiteBtn: document.getElementById('saveSiteBtn'),
   siteDialogTabs: Array.from(document.querySelectorAll('[data-site-tab]')),
   siteDialogPanels: Array.from(document.querySelectorAll('[data-site-tab-panel]')),
   testConnBtn: document.getElementById('testConnBtn'),
-  testLoginBtn: document.getElementById('testLoginBtn'),
-  queryTodayUsageBtn: document.getElementById('queryTodayUsageBtn'),
-  addSiblingAccountBtn: document.getElementById('addSiblingAccountBtn'),
-  siteNotifyPublicRatio: document.getElementById('siteNotifyPublicRatio'),
   closeDialogBtn: document.getElementById('closeDialogBtn'),
   notifyForm: document.getElementById('notifyForm'),
   wecomEnabled: document.getElementById('wecomEnabled'),
@@ -239,7 +229,6 @@ function setSiteDialogTab(tabName) {
     panel.classList.toggle('active', panel.dataset.siteTabPanel === tabName);
   });
   els.testConnBtn.classList.toggle('hidden', tabName !== 'basic');
-  els.testLoginBtn.classList.toggle('hidden', tabName !== 'auth');
 }
 
 function availableGroupsForSite(site) {
@@ -269,39 +258,178 @@ function renderNotifyGroupPicker(groups, selectedGroups = [], selectAllByDefault
     : '<div class="empty-inline">暂无已采集分组</div>';
 }
 
-function setLoginFieldsVisible(visible) {
-  els.loginFields.classList.toggle('hidden', !visible);
-}
-
-function sub2apiAuthMode() {
-  return els.siteAuthMode.value || 'password';
-}
-
-function updateSub2apiAuthFields() {
-  const tokenMode = sub2apiAuthMode() === 'token';
-  els.sub2apiPasswordFields.classList.toggle('hidden', tokenMode);
-  els.sub2apiTokenFields.classList.toggle('hidden', !tokenMode);
-}
-
 function platformLabel(siteOrValue) {
   const value = typeof siteOrValue === 'string' ? siteOrValue : (siteOrValue?.platform || 'newapi');
   return value === 'sub2api' ? 'sub2api' : 'NewAPI';
+}
+
+function accountCards() {
+  return Array.from(els.siteAccountsList.querySelectorAll('.account-card'));
+}
+
+function accountField(card, name) {
+  return card.querySelector(`[data-field="${name}"]`);
+}
+
+function accountCardSummary(card) {
+  const id = Number(card.dataset.accountId);
+  return id ? state.dialogAccounts.find((account) => account.id === id) || null : null;
+}
+
+function accountsVisible() {
+  return els.sitePlatform.value === 'sub2api' || els.siteLoginEnabled.checked;
+}
+
+function accountStatusHtml(account) {
+  if (!account) return '<span class="muted">新账号，保存后开始检测</span>';
+  const parts = [];
+  const balance = balanceLabel(account);
+  parts.push(`余额 <b class="${account.balance_alert_active ? 'balance-low' : ''}">${escapeHtml(balance)}</b>`);
+  parts.push(account.login_last_error
+    ? `<span class="account-error">登录异常：${escapeHtml(account.login_last_error)}</span>`
+    : account.login_last_check_at ? '登录正常' : '尚未检测');
+  if (account.balance_last_error) parts.push(`<span class="account-error">余额采集：${escapeHtml(account.balance_last_error)}</span>`);
+  return parts.join(' · ');
+}
+
+function accountCardHtml(account) {
+  return `
+    <div class="account-card" data-account-id="${account?.id || ''}" data-stored-mode="${escapeHtml(account?.auth_mode || 'password')}">
+      <div class="account-card-head">
+        <input class="input account-name-input" data-field="name" maxlength="40" placeholder="账号名称，例如：主号" value="${escapeHtml(account?.name || '')}" />
+        <span class="tag strong account-primary-tag">主账号</span>
+        <div class="action-row">
+          <button type="button" class="btn btn-secondary btn-small" data-account-act="primary">设为主账号</button>
+          <button type="button" class="btn btn-secondary btn-small" data-account-act="test">测试</button>
+          <button type="button" class="btn btn-secondary btn-small" data-account-act="usage">今日消耗</button>
+          <button type="button" class="btn btn-secondary btn-small" data-account-act="remove">删除</button>
+        </div>
+      </div>
+      <div class="dialog-grid account-newapi-fields">
+        <label class="field">
+          <span>系统访问令牌</span>
+          <input class="input" data-field="access_token" type="password" autocomplete="off" />
+        </label>
+        <label class="field">
+          <span>NewAPI 用户 ID</span>
+          <input class="input" data-field="access_user_id" inputmode="numeric" placeholder="例如：4" value="${escapeHtml(account?.access_user_id || '')}" />
+        </label>
+      </div>
+      <div class="dialog-grid account-sub2api-fields">
+        <label class="field span-2">
+          <span>认证方式</span>
+          <select class="input" data-field="auth_mode">
+            <option value="password" ${account?.auth_mode === 'token' ? '' : 'selected'}>账号密码登录</option>
+            <option value="token" ${account?.auth_mode === 'token' ? 'selected' : ''}>导入登录态</option>
+          </select>
+        </label>
+        <label class="field account-password-field">
+          <span>用户邮箱</span>
+          <input class="input" data-field="login_username" autocomplete="off" placeholder="user@example.com" value="${escapeHtml(account?.login_username || '')}" />
+        </label>
+        <label class="field account-password-field">
+          <span>用户密码</span>
+          <input class="input" data-field="login_password" type="password" autocomplete="new-password" />
+        </label>
+        <label class="field span-2 account-token-field">
+          <span>auth_token</span>
+          <input class="input" data-field="sub2api_access_token" type="password" autocomplete="off" />
+        </label>
+        <label class="field account-token-field">
+          <span>refresh_token</span>
+          <input class="input" data-field="refresh_token" type="password" autocomplete="off" />
+        </label>
+        <label class="field account-token-field">
+          <span>token_expires_at</span>
+          <input class="input" data-field="token_expires_at" autocomplete="off" placeholder="可选" value="${escapeHtml(account?.token_expires_at || '')}" />
+        </label>
+      </div>
+      <div class="account-status">${accountStatusHtml(account)}</div>
+      <div class="account-msg" data-account-msg></div>
+    </div>
+  `;
+}
+
+function addAccountCard(account = null) {
+  els.siteAccountsList.insertAdjacentHTML('beforeend', accountCardHtml(account));
+  updateAccountCards();
+}
+
+function renderAccountCards(accounts) {
+  els.siteAccountsList.innerHTML = '';
+  (accounts || []).forEach((account) => els.siteAccountsList.insertAdjacentHTML('beforeend', accountCardHtml(account)));
+}
+
+function cardUsesSavedAuth(card) {
+  return !!card.dataset.accountId && els.sitePlatform.value === state.dialogStoredPlatform;
+}
+
+function updateAccountCards() {
+  const platform = els.sitePlatform.value || 'newapi';
+  const isSub2api = platform === 'sub2api';
+  const siteSaved = !!els.siteId.value;
+  accountCards().forEach((card, index) => {
+    const account = accountCardSummary(card);
+    const saved = cardUsesSavedAuth(card);
+    const mode = accountField(card, 'auth_mode').value || 'password';
+    const sameMode = saved && card.dataset.storedMode === mode;
+    card.classList.toggle('primary', index === 0);
+    card.querySelector('.account-primary-tag').classList.toggle('hidden', index !== 0);
+    card.querySelector('[data-account-act="primary"]').classList.toggle('hidden', index === 0);
+    card.querySelector('[data-account-act="usage"]').classList.toggle('hidden', !siteSaved || !card.dataset.accountId);
+    card.querySelector('.account-newapi-fields').classList.toggle('hidden', isSub2api);
+    card.querySelector('.account-sub2api-fields').classList.toggle('hidden', !isSub2api);
+    card.querySelectorAll('.account-password-field').forEach((field) => field.classList.toggle('hidden', mode === 'token'));
+    card.querySelectorAll('.account-token-field').forEach((field) => field.classList.toggle('hidden', mode !== 'token'));
+    accountField(card, 'access_token').placeholder = saved && account?.has_access_token ? '留空保留已保存令牌' : '必填';
+    accountField(card, 'login_password').placeholder = sameMode && account?.has_login_password ? '留空保留已保存密码' : '必填';
+    accountField(card, 'sub2api_access_token').placeholder = sameMode && account?.has_access_token ? '留空保留已保存令牌' : '必填';
+    accountField(card, 'refresh_token').placeholder = sameMode && account?.has_refresh_token ? '留空保留；可选' : '可选';
+  });
 }
 
 function updatePlatformFields() {
   const platform = els.sitePlatform.value || 'newapi';
   const isSub2api = platform === 'sub2api';
   els.newapiAuthSection.classList.toggle('hidden', isSub2api);
-  els.sub2apiAuthSection.classList.toggle('hidden', !isSub2api);
+  els.sub2apiAuthHelp.classList.toggle('hidden', !isSub2api);
   els.sub2apiUsageEndpointField.classList.toggle('hidden', !isSub2api);
-  updateSub2apiAuthFields();
-  els.testLoginBtn.textContent = isSub2api ? (sub2apiAuthMode() === 'token' ? '测试登录态' : '测试登录') : '测试认证';
-  if (isSub2api) {
-    els.siteLoginEnabled.checked = true;
-    setLoginFieldsVisible(false);
-  } else {
-    setLoginFieldsVisible(els.siteLoginEnabled.checked);
+  const visible = accountsVisible();
+  els.siteAccountsSection.classList.toggle('hidden', !visible);
+  if (visible && !accountCards().length) addAccountCard();
+  updateAccountCards();
+}
+
+function accountPayload(card) {
+  const platform = els.sitePlatform.value;
+  const id = Number(card.dataset.accountId) || null;
+  const name = accountField(card, 'name').value.trim();
+  if (platform !== 'sub2api') {
+    return {
+      id,
+      name,
+      access_token: accountField(card, 'access_token').value.trim(),
+      access_user_id: accountField(card, 'access_user_id').value.trim(),
+    };
   }
+  const authMode = accountField(card, 'auth_mode').value || 'password';
+  if (authMode === 'password') {
+    return {
+      id,
+      name,
+      auth_mode: authMode,
+      login_username: accountField(card, 'login_username').value.trim(),
+      login_password: accountField(card, 'login_password').value,
+    };
+  }
+  return {
+    id,
+    name,
+    auth_mode: authMode,
+    access_token: accountField(card, 'sub2api_access_token').value.trim(),
+    refresh_token: accountField(card, 'refresh_token').value.trim(),
+    token_expires_at: accountField(card, 'token_expires_at').value.trim(),
+  };
 }
 
 function setActiveView(view) {
@@ -582,6 +710,17 @@ function pruneInactiveViews() {
   }
 }
 
+function balanceCell(site) {
+  const accounts = site.accounts || [];
+  if (accounts.length <= 1) {
+    return `<span class="${site.balance_alert_active ? 'balance-low' : ''}">${escapeHtml(balanceLabel(site))}</span>`;
+  }
+  return `<div class="account-balances">${accounts.map((account) => `
+    <span class="${account.balance_alert_active ? 'balance-low' : ''}${account.login_last_error ? ' account-error' : ''}"
+      title="${escapeHtml(account.login_last_error || account.balance_last_error || '')}">${escapeHtml(account.label)}：${escapeHtml(balanceLabel(account))}</span>
+  `).join('')}</div>`;
+}
+
 function siteRows(sites) {
   return sites.map((site) => {
     const selected = site.id === state.selectedSiteId ? ' selected' : '';
@@ -600,9 +739,10 @@ function siteRows(sites) {
         <td>
           ${hiddenCount ? `<span class="tag strong">${hiddenCount} 个隐藏</span>` : '<span class="muted">无</span>'}
           ${site.platform === 'sub2api' ? '<span class="tag login">用户登录</span>' : site.login_enabled ? '<span class="tag login">认证增强</span>' : ''}
+          ${Number(site.account_count || 0) > 1 ? `<span class="tag">${site.account_count} 个账号</span>` : ''}
         </td>
         <td>${site.current_groups_count || 0}</td>
-        <td><span class="${site.balance_alert_active ? 'balance-low' : ''}">${escapeHtml(balanceLabel(site))}</span></td>
+        <td>${balanceCell(site)}</td>
         <td>${fmtTime(site.last_check_at)}</td>
         <td>
           <div class="action-row">
@@ -737,6 +877,26 @@ function renderDetail(site) {
       `).join('')
     : '<div class="empty-inline">暂无已采集分组</div>';
   const hiddenGroups = Object.entries(loginGroupsObj).filter(([name]) => !(name in publicGroupsObj));
+  const accounts = site.accounts || [];
+  const accountRows = accounts.map((account) => {
+    const authText = site.platform === 'sub2api'
+      ? (account.auth_mode === 'token' ? `导入登录态（refresh ${account.has_refresh_token ? '已配置' : '未配置'}）` : `账号登录 ${account.login_username || '-'}`)
+      : `用户 ID ${account.access_user_id || '-'}`;
+    const errors = [
+      account.login_last_error ? `登录异常：${account.login_last_error}` : '',
+      account.balance_last_error ? `余额采集：${account.balance_last_error}` : '',
+    ].filter(Boolean);
+    return `
+      <div class="info-row account-info-row">
+        <div>
+          <strong>${escapeHtml(account.label)}${account.is_primary ? ' <span class="tag strong">主账号</span>' : ''}</strong>
+          <span>${escapeHtml(authText)} · 余额检测 ${fmtTime(account.balance_last_check_at)}</span>
+          ${errors.length ? `<span class="account-error">${escapeHtml(errors.join('；'))}</span>` : ''}
+        </div>
+        <b class="${account.balance_alert_active ? 'balance-low' : ''}">${escapeHtml(balanceLabel(account))}</b>
+      </div>
+    `;
+  }).join('');
   const groupRows = groups.length
     ? groups.map(([name, item]) => `
         <div class="group-row">
@@ -777,7 +937,7 @@ function renderDetail(site) {
       <div class="meta-card"><div class="k">金额换算</div><div class="v">${usageDivisorLabel(site.usage_divisor)}</div></div>
       <div class="meta-card"><div class="k">公开分组</div><div class="v">${site.current_groups_count || 0}</div></div>
       <div class="meta-card"><div class="k">认证分组</div><div class="v">${site.current_login_groups_count || 0}</div></div>
-      <div class="meta-card"><div class="k">账户余额</div><div class="v ${site.balance_alert_active ? 'balance-low' : ''}">${escapeHtml(balanceLabel(site))}</div></div>
+      <div class="meta-card"><div class="k">${accounts.length > 1 ? '余额合计' : '账户余额'}</div><div class="v ${site.balance_alert_active ? 'balance-low' : ''}">${escapeHtml(balanceLabel(site))}</div></div>
       <div class="meta-card"><div class="k">余额预警</div><div class="v">${site.balance_alert_enabled ? `低于 ¥${Number(site.balance_alert_threshold || 0).toFixed(2)}` : '未启用'}</div></div>
       <div class="meta-card"><div class="k">余额检测</div><div class="v">${fmtTime(site.balance_last_check_at)}</div></div>
       <div class="meta-card"><div class="k">上次检测</div><div class="v">${fmtTime(site.last_check_at)}</div></div>
@@ -785,9 +945,14 @@ function renderDetail(site) {
       <div class="meta-card"><div class="k">连续失败</div><div class="v">${site.consecutive_failures || 0}</div></div>
       <div class="meta-card"><div class="k">启用状态</div><div class="v">${site.enabled ? '启用中' : '已停用'}</div></div>
       <div class="meta-card wide"><div class="k">变化通知范围</div><div class="v">${site.notify_all_groups ? '全部分组' : escapeHtml((site.notify_groups || []).join('、') || '-')}</div></div>
-      <div class="meta-card wide"><div class="k">监控模式</div><div class="v">${site.platform === 'sub2api' ? `sub2api ${site.auth_mode === 'token' ? `导入登录态（refresh ${site.has_refresh_token ? '已配置' : '未配置'}）` : `账号登录（${escapeHtml(site.login_username || '-')}）`}` : site.login_enabled ? `认证增强监控（系统访问令牌 / 用户ID ${escapeHtml(site.access_user_id || '-')}）` : '公开分组监控'}</div></div>
+      <div class="meta-card wide"><div class="k">监控模式</div><div class="v">${site.platform === 'sub2api' ? `sub2api 用户登录（${accounts.length} 个账号）` : site.login_enabled ? `认证增强监控（${accounts.length} 个账号）` : '公开分组监控'}</div></div>
     </div>
-    ${site.balance_last_error ? `<div class="error-box">余额采集：${escapeHtml(site.balance_last_error)}</div>` : ''}
+    ${accounts.length ? `
+      <section class="detail-section">
+        <div class="section-title">账号</div>
+        <div class="info-list">${accountRows}</div>
+      </section>
+    ` : ''}
     <section class="detail-section notify-scope-editor">
       <div class="group-picker-head notify-scope-head">
         <div>
@@ -807,12 +972,11 @@ function renderDetail(site) {
     </section>
     <section class="mode-note ${site.login_enabled ? 'enabled' : ''}">
       ${site.platform === 'sub2api'
-        ? (site.auth_mode === 'token' ? '当前站点使用导入登录态检测该账号实际可见的分组倍率；适合开启 Turnstile 的上游。' : '当前站点使用 sub2api 普通用户账号登录，检测该账号实际可见的分组倍率和用户专属倍率。')
+        ? '当前站点使用 sub2api 普通用户账号登录，主账号检测实际可见的分组倍率和用户专属倍率；其他账号只检测余额和登录状态。'
         : site.login_enabled
-        ? '当前站点已开启认证增强监控，检测时会优先使用系统访问令牌采集该账号可见的隐藏用户分组或专属分组。'
+        ? '当前站点已开启认证增强监控，主账号的系统访问令牌用于采集隐藏或专属分组；其他账号只检测余额和登录状态。'
         : '当前站点只监控公开 /api/user/groups。若该站存在特殊分组，可在编辑站点中开启认证增强监控。'}
     </section>
-    ${site.login_last_error ? `<div class="error-box">${escapeHtml(site.login_last_error)}</div>` : ''}
     ${site.login_enabled && hiddenGroups.length ? `
       <section class="detail-section">
         <div class="section-title">认证后新增分组</div>
@@ -852,24 +1016,15 @@ function openDialog(site = null) {
     els.siteInterval.value = site.interval_minutes;
     els.siteUsageDivisor.value = site.usage_divisor ?? 1;
     els.siteSub2apiUsageEndpoint.value = site.sub2api_usage_endpoint || 'dashboard';
-    els.siteAuthMode.value = site.auth_mode || 'password';
     els.siteLoginEnabled.checked = !!site.login_enabled;
-    els.siteLoginUsername.value = site.login_username || '';
-    els.siteLoginPassword.value = '';
-    els.siteAccessToken.value = '';
-    els.siteSub2apiAccessToken.value = '';
-    els.siteRefreshToken.value = '';
-    els.siteTokenExpiresAt.value = site.token_expires_at || '';
-    els.siteAccessUserId.value = site.access_user_id || '';
     els.siteBalanceAlertEnabled.checked = !!site.balance_alert_enabled;
     els.siteBalanceAlertThreshold.value = site.balance_alert_threshold ?? 10;
     state.dialogNotifyAllGroups = site.notify_all_groups !== false;
     renderNotifyGroupPicker(availableGroupsForSite(site), site.notify_groups || [], state.dialogNotifyAllGroups);
     els.siteEnabled.checked = !!site.enabled;
-    els.siteNotifyPublicRatio.checked = site.notify_public_ratio !== false;
     renderReportGroupSelect(site.report_group_id);
-    els.queryTodayUsageBtn.classList.remove('hidden');
-    els.addSiblingAccountBtn.classList.remove('hidden');
+    state.dialogAccounts = site.accounts || [];
+    state.dialogStoredPlatform = site.platform || 'newapi';
   } else {
     els.dialogTitle.textContent = '添加站点';
     els.siteId.value = '';
@@ -879,49 +1034,19 @@ function openDialog(site = null) {
     els.siteInterval.value = 3;
     els.siteUsageDivisor.value = 1;
     els.siteSub2apiUsageEndpoint.value = 'dashboard';
-    els.siteAuthMode.value = 'password';
     els.siteLoginEnabled.checked = false;
-    els.siteLoginUsername.value = '';
-    els.siteLoginPassword.value = '';
-    els.siteAccessToken.value = '';
-    els.siteSub2apiAccessToken.value = '';
-    els.siteRefreshToken.value = '';
-    els.siteTokenExpiresAt.value = '';
-    els.siteAccessUserId.value = '';
     els.siteBalanceAlertEnabled.checked = false;
     els.siteBalanceAlertThreshold.value = 10;
     state.dialogNotifyAllGroups = true;
     renderNotifyGroupPicker([], [], true);
     els.siteEnabled.checked = true;
-    els.siteNotifyPublicRatio.checked = true;
     renderReportGroupSelect(null);
-    els.queryTodayUsageBtn.classList.add('hidden');
-    els.addSiblingAccountBtn.classList.add('hidden');
+    state.dialogAccounts = [];
+    state.dialogStoredPlatform = null;
   }
+  renderAccountCards(state.dialogAccounts);
   updatePlatformFields();
   if (!els.dialog.open) els.dialog.showModal();
-}
-
-function openSiblingAccountDialog(site) {
-  openDialog(null);
-  els.dialogTitle.textContent = `为「${site.name}」的上游新增账号`;
-  els.siteName.value = `${site.name}-小号`;
-  els.sitePlatform.value = site.platform || 'newapi';
-  els.siteBaseUrl.value = site.base_url;
-  els.siteInterval.value = site.interval_minutes;
-  els.siteUsageDivisor.value = site.usage_divisor ?? 1;
-  els.siteSub2apiUsageEndpoint.value = site.sub2api_usage_endpoint || 'dashboard';
-  els.siteAuthMode.value = site.auth_mode || 'password';
-  els.siteLoginEnabled.checked = true;
-  els.siteBalanceAlertEnabled.checked = !!site.balance_alert_enabled;
-  els.siteBalanceAlertThreshold.value = site.balance_alert_threshold ?? 10;
-  els.siteNotifyPublicRatio.checked = false;
-  state.dialogNotifyAllGroups = site.notify_all_groups !== false;
-  renderNotifyGroupPicker(availableGroupsForSite(site), site.notify_groups || [], state.dialogNotifyAllGroups);
-  renderReportGroupSelect(site.report_group_id);
-  updatePlatformFields();
-  setSiteDialogTab('auth');
-  els.dialogMsg.textContent = '已复制上游配置，请填写这个账号的认证信息；分组倍率推送默认关闭，避免与原账号重复。';
 }
 
 async function loadSelectedSiteChanges() {
@@ -1018,9 +1143,33 @@ async function deleteSite(id) {
 
 els.addSiteBtn.addEventListener('click', () => openDialog());
 els.closeDialogBtn.addEventListener('click', () => els.dialog.close());
-els.addSiblingAccountBtn.addEventListener('click', () => {
-  const site = state.sites.find((s) => String(s.id) === els.siteId.value);
-  if (site) openSiblingAccountDialog(site);
+els.addAccountBtn.addEventListener('click', () => {
+  addAccountCard();
+  const cards = accountCards();
+  accountField(cards[cards.length - 1], 'name').focus();
+});
+els.siteAccountsList.addEventListener('change', (event) => {
+  if (event.target.matches('[data-field="auth_mode"]')) updateAccountCards();
+});
+els.siteAccountsList.addEventListener('click', (event) => {
+  const button = event.target.closest('[data-account-act]');
+  if (!button) return;
+  const card = button.closest('.account-card');
+  const act = button.dataset.accountAct;
+  if (act === 'primary') {
+    els.siteAccountsList.prepend(card);
+    updateAccountCards();
+    setAccountMessage(card, '已设为主账号，保存后生效');
+  } else if (act === 'remove') {
+    const label = accountField(card, 'name').value.trim() || '这个账号';
+    if (card.dataset.accountId && !confirm(`确认删除「${label}」？保存后生效，该账号的余额和登录状态不再检测。`)) return;
+    card.remove();
+    updatePlatformFields();
+  } else if (act === 'test') {
+    testAccount(card, button).catch((err) => setAccountMessage(card, err.message, true));
+  } else if (act === 'usage') {
+    queryAccountUsage(card, button).catch((err) => setAccountMessage(card, err.message, true));
+  }
 });
 els.logoutBtn.addEventListener('click', async () => {
   try {
@@ -1032,9 +1181,8 @@ els.logoutBtn.addEventListener('click', async () => {
 els.siteDialogTabs.forEach((button) => {
   button.addEventListener('click', () => setSiteDialogTab(button.dataset.siteTab));
 });
-els.siteLoginEnabled.addEventListener('change', () => setLoginFieldsVisible(els.siteLoginEnabled.checked));
+els.siteLoginEnabled.addEventListener('change', updatePlatformFields);
 els.sitePlatform.addEventListener('change', updatePlatformFields);
-els.siteAuthMode.addEventListener('change', updatePlatformFields);
 els.siteNotifyGroupsList.addEventListener('change', () => {
   state.dialogNotifyAllGroups = state.dialogAvailableGroups.length > 0
     && selectedNotifyGroups().length === state.dialogAvailableGroups.length;
@@ -1298,7 +1446,7 @@ els.overviewSitesBody.addEventListener('click', handleSiteTableClick);
 els.form.addEventListener('submit', async (e) => {
   e.preventDefault();
   const platform = els.sitePlatform.value;
-  const authMode = platform === 'sub2api' ? sub2apiAuthMode() : 'password';
+  const loginEnabled = platform === 'sub2api' ? true : els.siteLoginEnabled.checked;
   const payload = {
     name: els.siteName.value.trim(),
     platform,
@@ -1306,16 +1454,8 @@ els.form.addEventListener('submit', async (e) => {
     interval_minutes: Math.max(1, Number(els.siteInterval.value || 3)),
     usage_divisor: Number(els.siteUsageDivisor.value),
     sub2api_usage_endpoint: platform === 'sub2api' ? els.siteSub2apiUsageEndpoint.value : 'dashboard',
-    login_enabled: platform === 'sub2api' ? true : els.siteLoginEnabled.checked,
-    auth_mode: authMode,
-    login_username: authMode === 'password' ? els.siteLoginUsername.value.trim() : '',
-    login_password: authMode === 'password' ? els.siteLoginPassword.value : '',
-    access_token: platform === 'sub2api' ? els.siteSub2apiAccessToken.value.trim() : els.siteAccessToken.value.trim(),
-    refresh_token: authMode === 'token' ? els.siteRefreshToken.value.trim() : '',
-    token_expires_at: authMode === 'token' ? els.siteTokenExpiresAt.value.trim() : '',
-    access_user_id: els.siteAccessUserId.value.trim(),
+    login_enabled: loginEnabled,
     enabled: els.siteEnabled.checked,
-    notify_public_ratio: els.siteNotifyPublicRatio.checked,
     report_group_id: els.siteReportGroup.value ? Number(els.siteReportGroup.value) : null,
     balance_alert_enabled: els.siteBalanceAlertEnabled.checked,
     balance_alert_threshold: Math.max(0, Number(els.siteBalanceAlertThreshold.value || 0)),
@@ -1323,7 +1463,10 @@ els.form.addEventListener('submit', async (e) => {
       || selectedNotifyGroups().length === state.dialogAvailableGroups.length,
     notify_groups: selectedNotifyGroups(),
   };
+  if (loginEnabled) payload.accounts = accountCards().map(accountPayload);
   const id = els.siteId.value;
+  if (id && !loginEnabled && state.dialogAccounts.length
+    && !confirm(`关闭认证增强后会删除已保存的 ${state.dialogAccounts.length} 个账号，余额和登录状态不再检测。确认保存？`)) return;
   if (!payload.name || !payload.base_url) {
     setSiteDialogTab('basic');
     els.dialogMsg.textContent = '请填写站点名称和 Base URL';
@@ -1363,36 +1506,15 @@ els.form.addEventListener('submit', async (e) => {
     els.saveSiteBtn.textContent = '保存配置';
     els.dialogMsg.textContent = err.message;
     els.dialogMsg.classList.add('error');
-    if (/登录|令牌|用户 ID|auth_token|重复添加/.test(err.message)) setSiteDialogTab('auth');
+    if (/账号|登录|令牌|用户 ID|auth_token|邮箱|密码|重复添加|认证配置/.test(err.message)) setSiteDialogTab('auth');
     showToast(`保存失败：${err.message}`, 'error');
   }
 });
 
-function siteAuthTestPayload() {
-  const platform = els.sitePlatform.value;
-  const authMode = platform === 'sub2api' ? sub2apiAuthMode() : 'password';
-  return {
-    platform,
-    base_url: els.siteBaseUrl.value.trim().replace(/\/+$/, ''),
-    auth_mode: authMode,
-    login_username: els.siteLoginUsername.value.trim(),
-    login_password: els.siteLoginPassword.value,
-    access_token: platform === 'sub2api'
-      ? els.siteSub2apiAccessToken.value.trim()
-      : els.siteAccessToken.value.trim(),
-    refresh_token: els.siteRefreshToken.value.trim(),
-    token_expires_at: els.siteTokenExpiresAt.value.trim(),
-    access_user_id: els.siteAccessUserId.value.trim(),
-  };
-}
-
-async function testSavedSiteAuthentication() {
-  const siteId = Number(els.siteId.value);
-  if (!siteId) throw new Error('请先保存站点配置');
-  return api(`/api/sites/${siteId}/auth/test`, {
-    method: 'POST',
-    body: JSON.stringify(siteAuthTestPayload()),
-  });
+function setAccountMessage(card, message, isError = false) {
+  const box = card.querySelector('[data-account-msg]');
+  box.textContent = message || '';
+  box.classList.toggle('error', !!isError);
 }
 
 function updateGroupsFromAuthTest(result) {
@@ -1401,199 +1523,73 @@ function updateGroupsFromAuthTest(result) {
   }
 }
 
-els.testConnBtn.addEventListener('click', async () => {
-  const baseUrl = els.siteBaseUrl.value.trim().replace(/\/+$/, '');
+async function runAccountTest(card) {
   const platform = els.sitePlatform.value;
-  if (!baseUrl) {
-    els.dialogMsg.textContent = '请先填写 Base URL';
-    return;
+  const baseUrl = els.siteBaseUrl.value.trim().replace(/\/+$/, '');
+  if (!baseUrl) throw new Error('请先在基础配置中填写 Base URL');
+  const account = accountPayload(card);
+  const siteId = Number(els.siteId.value);
+  if (siteId) {
+    return api(`/api/sites/${siteId}/auth/test`, {
+      method: 'POST',
+      body: JSON.stringify({ ...account, account_id: account.id, platform, base_url: baseUrl }),
+    });
   }
-  const authMode = platform === 'sub2api' ? sub2apiAuthMode() : 'password';
-  if (platform === 'sub2api' && els.siteId.value) {
-    els.dialogMsg.textContent = '正在使用已保存认证检测连接...';
-    els.dialogMsg.classList.remove('error');
-    try {
-      const res = await testSavedSiteAuthentication();
-      const source = res.used_saved_credentials ? '已保存认证' : '当前输入认证';
-      els.dialogMsg.textContent = res.success
-        ? `连接成功（${source}）：${res.groups_count} 个分组`
-        : `连接失败：${res.message}`;
-      els.dialogMsg.classList.toggle('error', !res.success);
-      updateGroupsFromAuthTest(res);
-    } catch (err) {
-      els.dialogMsg.textContent = `连接失败：${err.message}`;
-      els.dialogMsg.classList.add('error');
+  if (platform === 'sub2api') {
+    if (account.auth_mode === 'password' && (!account.login_username || !account.login_password)) {
+      throw new Error('请填写用户邮箱和密码');
     }
-    return;
-  }
-  if (platform === 'sub2api' && authMode === 'password' && (!els.siteLoginUsername.value.trim() || !els.siteLoginPassword.value)) {
-    els.dialogMsg.textContent = '请填写 sub2api 用户邮箱和密码';
-    return;
-  }
-  if (platform === 'sub2api' && authMode === 'token' && !els.siteSub2apiAccessToken.value.trim()) {
-    els.dialogMsg.textContent = '请填写 sub2api auth_token';
-    return;
-  }
-  els.dialogMsg.textContent = '检测中...';
-  try {
+    if (account.auth_mode === 'token' && !account.access_token) throw new Error('请填写 auth_token');
     const res = await api('/api/check-connection', {
       method: 'POST',
-      body: JSON.stringify({
-        platform,
-        base_url: baseUrl,
-        auth_mode: authMode,
-        login_username: els.siteLoginUsername.value.trim(),
-        login_password: els.siteLoginPassword.value,
-        access_token: els.siteSub2apiAccessToken.value.trim(),
-        refresh_token: els.siteRefreshToken.value.trim(),
-        token_expires_at: els.siteTokenExpiresAt.value.trim(),
-      }),
+      body: JSON.stringify({ ...account, platform, base_url: baseUrl }),
     });
     if (res.refreshed_auth) {
-      els.siteSub2apiAccessToken.value = res.refreshed_auth.access_token || els.siteSub2apiAccessToken.value;
-      els.siteRefreshToken.value = res.refreshed_auth.refresh_token || els.siteRefreshToken.value;
-      els.siteTokenExpiresAt.value = res.refreshed_auth.token_expires_at || els.siteTokenExpiresAt.value;
+      accountField(card, 'sub2api_access_token').value = res.refreshed_auth.access_token || account.access_token || '';
+      accountField(card, 'refresh_token').value = res.refreshed_auth.refresh_token || account.refresh_token || '';
+      accountField(card, 'token_expires_at').value = res.refreshed_auth.token_expires_at || account.token_expires_at || '';
     }
-    els.dialogMsg.textContent = res.success
-      ? `连接成功：${res.groups_count} 个分组`
-      : `失败：${res.message}`;
-    if (res.success && res.groups) {
-      renderNotifyGroupPicker(Object.keys(res.groups), selectedNotifyGroups(), state.dialogNotifyAllGroups);
-    }
-  } catch (err) {
-    els.dialogMsg.textContent = `失败：${err.message}`;
+    return res;
   }
-});
+  if (!account.access_token || !account.access_user_id) throw new Error('请填写系统访问令牌和 NewAPI 用户 ID');
+  return api('/api/check-login', {
+    method: 'POST',
+    body: JSON.stringify({ base_url: baseUrl, access_token: account.access_token, access_user_id: account.access_user_id }),
+  });
+}
 
-els.testLoginBtn.addEventListener('click', async () => {
-  const baseUrl = els.siteBaseUrl.value.trim().replace(/\/+$/, '');
-  const platform = els.sitePlatform.value;
-  if (platform === 'sub2api') {
-    const authMode = sub2apiAuthMode();
-    const username = els.siteLoginUsername.value.trim();
-    const password = els.siteLoginPassword.value;
-    const accessToken = els.siteSub2apiAccessToken.value.trim();
-    const refreshToken = els.siteRefreshToken.value.trim();
-    if (els.siteId.value) {
-      if (!baseUrl) {
-        els.dialogMsg.textContent = '请填写 Base URL';
-        return;
-      }
-      els.dialogMsg.textContent = authMode === 'token' ? '正在测试已保存登录态...' : '正在测试已保存登录密码...';
-      els.dialogMsg.classList.remove('error');
-      try {
-        const res = await testSavedSiteAuthentication();
-        const source = res.used_saved_credentials ? '已保存认证' : '当前输入认证';
-        els.dialogMsg.textContent = res.success
-          ? `${authMode === 'token' ? '登录态可用' : '登录成功'}（${source}）：当前用户可见 ${res.groups_count} 个分组`
-          : `${authMode === 'token' ? '登录态失败' : '登录失败'}：${res.message}`;
-        els.dialogMsg.classList.toggle('error', !res.success);
-        updateGroupsFromAuthTest(res);
-      } catch (err) {
-        els.dialogMsg.textContent = `${authMode === 'token' ? '登录态失败' : '登录失败'}：${err.message}`;
-        els.dialogMsg.classList.add('error');
-      }
-      return;
-    }
-    if (authMode === 'password' && (!baseUrl || !username || !password)) {
-      els.dialogMsg.textContent = '请填写 Base URL、用户邮箱和密码';
-      return;
-    }
-    if (authMode === 'token' && (!baseUrl || !accessToken)) {
-      els.dialogMsg.textContent = '请填写 Base URL 和 auth_token';
-      return;
-    }
-    els.dialogMsg.textContent = authMode === 'token' ? 'sub2api 登录态测试中...' : 'sub2api 登录测试中...';
-    try {
-      const res = await api('/api/check-connection', {
-        method: 'POST',
-        body: JSON.stringify({
-          platform,
-          base_url: baseUrl,
-          auth_mode: authMode,
-          login_username: username,
-          login_password: password,
-          access_token: accessToken,
-          refresh_token: refreshToken,
-          token_expires_at: els.siteTokenExpiresAt.value.trim(),
-        }),
-      });
-      if (res.refreshed_auth) {
-        els.siteSub2apiAccessToken.value = res.refreshed_auth.access_token || els.siteSub2apiAccessToken.value;
-        els.siteRefreshToken.value = res.refreshed_auth.refresh_token || els.siteRefreshToken.value;
-        els.siteTokenExpiresAt.value = res.refreshed_auth.token_expires_at || els.siteTokenExpiresAt.value;
-      }
-      els.dialogMsg.textContent = res.success
-        ? `${authMode === 'token' ? '登录态可用' : '登录成功'}：当前用户可见 ${res.groups_count} 个分组`
-        : `${authMode === 'token' ? '登录态失败' : '登录失败'}：${res.message}`;
-      if (res.success && res.groups) {
-        renderNotifyGroupPicker(Object.keys(res.groups), selectedNotifyGroups(), state.dialogNotifyAllGroups);
-      }
-    } catch (err) {
-      els.dialogMsg.textContent = `${authMode === 'token' ? '登录态失败' : '登录失败'}：${err.message}`;
-    }
-    return;
-  }
-  const accessToken = els.siteAccessToken.value.trim();
-  const accessUserId = els.siteAccessUserId.value.trim();
-  if (els.siteId.value) {
-    if (!baseUrl || !accessUserId) {
-      els.dialogMsg.textContent = '请填写 Base URL 和 NewAPI 用户 ID';
-      return;
-    }
-    els.dialogMsg.textContent = '正在测试已保存访问令牌...';
-    els.dialogMsg.classList.remove('error');
-    try {
-      const res = await testSavedSiteAuthentication();
-      const source = res.used_saved_credentials ? '已保存令牌' : '当前输入令牌';
-      els.dialogMsg.textContent = res.success
-        ? `验证成功（${source}）：认证后可见 ${res.groups_count} 个分组`
-        : `验证失败：${res.message}`;
-      els.dialogMsg.classList.toggle('error', !res.success);
-      updateGroupsFromAuthTest(res);
-    } catch (err) {
-      els.dialogMsg.textContent = `验证失败：${err.message}`;
-      els.dialogMsg.classList.add('error');
-    }
-    return;
-  }
-  if (!baseUrl || !accessToken || !accessUserId) {
-    els.dialogMsg.textContent = '请填写 Base URL、系统访问令牌和 NewAPI 用户 ID';
-    return;
-  }
-  els.dialogMsg.textContent = '访问令牌测试中...';
+async function testAccount(card, button) {
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = '测试中...';
+  setAccountMessage(card, '正在测试认证...');
   try {
-    const res = await api('/api/check-login', {
-      method: 'POST',
-      body: JSON.stringify({
-        base_url: baseUrl,
-        access_token: accessToken,
-        access_user_id: accessUserId,
-      }),
-    });
-    els.dialogMsg.textContent = res.success
-      ? `验证成功：认证后可见 ${res.groups_count} 个分组`
-      : `验证失败：${res.message}`;
-    if (res.success && res.groups) {
-      renderNotifyGroupPicker(Object.keys(res.groups), selectedNotifyGroups(), state.dialogNotifyAllGroups);
-    }
-  } catch (err) {
-    els.dialogMsg.textContent = `验证失败：${err.message}`;
+    const res = await runAccountTest(card);
+    const source = res.used_saved_credentials ? '（已保存认证）' : '';
+    setAccountMessage(
+      card,
+      res.success ? `认证成功${source}：可见 ${res.groups_count} 个分组` : `认证失败：${res.message}`,
+      !res.success,
+    );
+    if (accountCards()[0] === card) updateGroupsFromAuthTest(res);
+  } finally {
+    button.disabled = false;
+    button.textContent = originalText;
   }
-});
+}
 
-els.queryTodayUsageBtn.addEventListener('click', async () => {
+async function queryAccountUsage(card, button) {
   const siteId = Number(els.siteId.value);
-  if (!siteId) return;
-  const originalText = els.queryTodayUsageBtn.textContent;
-  els.queryTodayUsageBtn.disabled = true;
-  els.queryTodayUsageBtn.textContent = '查询中...';
-  els.dialogMsg.textContent = '正在实时查询今日消耗...';
-  els.dialogMsg.classList.remove('error');
+  const accountId = Number(card.dataset.accountId);
+  if (!siteId || !accountId) throw new Error('请先保存账号');
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = '查询中...';
+  setAccountMessage(card, '正在实时查询今日消耗...');
   try {
     const result = await api(`/api/sites/${siteId}/usage/today`, {
       method: 'POST',
-      body: '{}',
+      body: JSON.stringify({ account_id: accountId }),
     });
     if (result.sub2api_usage_endpoint) {
       els.siteSub2apiUsageEndpoint.value = result.sub2api_usage_endpoint;
@@ -1602,20 +1598,50 @@ els.queryTodayUsageBtn.addEventListener('click', async () => {
     }
     const switchedText = result.endpoint_switched ? '；默认接口不可用，已自动切换并固定使用兼容接口' : '';
     if (result.live_success) {
-      els.dialogMsg.textContent = `今日消耗：¥${Number(result.amount || 0).toFixed(2)}（上游原始 ${Number(result.raw_amount || 0).toFixed(4)} ${result.raw_currency || 'USD'}）${switchedText}`;
+      setAccountMessage(card, `今日消耗：¥${Number(result.amount || 0).toFixed(2)}（上游原始 ${Number(result.raw_amount || 0).toFixed(4)} ${result.raw_currency || 'USD'}）${switchedText}`);
     } else if (result.cached) {
-      els.dialogMsg.textContent = `实时查询失败：${result.error || '未知错误'}；当天缓存：¥${Number(result.amount || 0).toFixed(2)}`;
-      els.dialogMsg.classList.add('error');
+      setAccountMessage(card, `实时查询失败：${result.error || '未知错误'}；当天缓存：¥${Number(result.amount || 0).toFixed(2)}`, true);
     } else {
-      els.dialogMsg.textContent = `今日消耗查询失败：${result.error || '未知错误'}`;
-      els.dialogMsg.classList.add('error');
+      setAccountMessage(card, `今日消耗查询失败：${result.error || '未知错误'}`, true);
     }
-  } catch (err) {
-    els.dialogMsg.textContent = `今日消耗查询失败：${err.message}`;
-    els.dialogMsg.classList.add('error');
   } finally {
-    els.queryTodayUsageBtn.disabled = false;
-    els.queryTodayUsageBtn.textContent = originalText;
+    button.disabled = false;
+    button.textContent = originalText;
+  }
+}
+
+els.testConnBtn.addEventListener('click', async () => {
+  const baseUrl = els.siteBaseUrl.value.trim().replace(/\/+$/, '');
+  const platform = els.sitePlatform.value;
+  els.dialogMsg.classList.remove('error');
+  if (!baseUrl) {
+    els.dialogMsg.textContent = '请先填写 Base URL';
+    return;
+  }
+  els.dialogMsg.textContent = '检测中...';
+  try {
+    let res;
+    if (platform === 'sub2api') {
+      const card = accountCards()[0];
+      if (!card) {
+        els.dialogMsg.textContent = 'sub2api 需要先在认证配置中添加账号';
+        return;
+      }
+      res = await runAccountTest(card);
+    } else {
+      res = await api('/api/check-connection', {
+        method: 'POST',
+        body: JSON.stringify({ platform, base_url: baseUrl }),
+      });
+    }
+    els.dialogMsg.textContent = res.success
+      ? `连接成功${platform === 'sub2api' ? '（主账号）' : ''}：${res.groups_count} 个分组`
+      : `连接失败：${res.message}`;
+    els.dialogMsg.classList.toggle('error', !res.success);
+    updateGroupsFromAuthTest(res);
+  } catch (err) {
+    els.dialogMsg.textContent = `连接失败：${err.message}`;
+    els.dialogMsg.classList.add('error');
   }
 });
 

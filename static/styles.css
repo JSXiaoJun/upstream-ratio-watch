@@ -733,7 +733,31 @@ body {
 }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 10px; margin: 0; }
 .dialog-actions .btn { min-width: 94px; }
-#queryTodayUsageBtn { min-width: 118px; }
+.account-section { display: grid; gap: 12px; justify-items: start; }
+.account-list { display: grid; gap: 12px; width: 100%; }
+.account-card {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+}
+.account-card.primary { border-color: #cdeedd; background: #f8fdfa; }
+.account-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.account-card-head .account-name-input { flex: 1; min-width: 160px; }
+.account-card-head .action-row { flex-wrap: wrap; }
+.account-status { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.account-msg { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.account-msg:empty { display: none; }
+.account-msg.error, .account-error { color: var(--red); }
+.account-balances { display: grid; gap: 2px; font-size: 12px; white-space: nowrap; }
+.account-info-row .account-error { color: var(--red); }
 .dialog-msg { flex: 1; min-width: 0; min-height: 20px; color: var(--muted); overflow-wrap: anywhere; }
 .dialog-msg.error { color: var(--red); }
 

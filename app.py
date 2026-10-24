@@ -32,7 +32,7 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 STATIC_DIR = APP_DIR / "static"
 DB_PATH = DATA_DIR / "app.db"
-APP_VERSION = "1.13.0"
+APP_VERSION = "1.14.0"
 AUTH_CONFIG_PATH = Path(os.getenv("AUTH_CONFIG_PATH") or (DATA_DIR / "auth.json"))
 AUTH_COOKIE_NAME = "upstream_watch_session"
 DEFAULT_SESSION_DAYS = 30
@@ -328,8 +328,132 @@ def drop_sites_base_url_unique(conn: sqlite3.Connection) -> None:
         conn.execute("PRAGMA foreign_keys=ON")
 
 
+SITE_CREDENTIAL_COLUMNS = ("login_username", "login_password", "access_token", "access_user_id", "refresh_token", "token_expires_at")
+ACCOUNT_STATE_COLUMNS = (
+    "auth_alert_active", "login_last_error", "login_last_check_at", "current_balance", "balance_currency",
+    "balance_last_error", "balance_last_check_at", "balance_alert_active",
+)
+
+
+def legacy_site_has_account(site: Dict[str, Any]) -> bool:
+    if (site.get("platform") or "newapi") == "sub2api":
+        return True
+    return bool(site.get("login_enabled")) and bool(str(site.get("access_token") or "").strip() or str(site.get("access_user_id") or "").strip())
+
+
+def migrate_site_accounts(conn: sqlite3.Connection) -> None:
+    # Before accounts existed, every login lived on its own site row, so several rows could
+    # point at one upstream. Each upstream becomes one site whose logins are its accounts.
+    sites = [dict(row) for row in conn.execute("SELECT * FROM sites ORDER BY id").fetchall()]
+    if not sites:
+        return
+    buckets: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for site in sites:
+        key = (normalize_base_url(str(site.get("base_url") or "")).lower(), str(site.get("platform") or "newapi"))
+        buckets.setdefault(key, []).append(site)
+    needs_merge = any(len(group) > 1 for group in buckets.values())
+    if not needs_merge and not any(legacy_site_has_account(site) for site in sites):
+        return
+
+    conn.commit()
+    backup_path = DB_PATH.with_name(f"{DB_PATH.stem}.before-site-accounts-{datetime.now().strftime('%Y%m%d%H%M%S')}{DB_PATH.suffix}")
+    backup_conn = sqlite3.connect(backup_path)
+    try:
+        conn.backup(backup_conn)
+    finally:
+        backup_conn.close()
+
+    now = utc_now_iso()
+    try:
+        for group in buckets.values():
+            kept = min(group, key=lambda item: (0 if item.get("notify_public_ratio") in (None, 1) else 1, int(item["id"])))
+            ordered = [kept] + [site for site in group if site["id"] != kept["id"]]
+            merged = len(ordered) > 1
+            sort_order = 0
+            for site in ordered:
+                if not legacy_site_has_account(site):
+                    continue
+                values = {column: site.get(column) for column in SITE_CREDENTIAL_COLUMNS + ACCOUNT_STATE_COLUMNS}
+                account_id = conn.execute(
+                    f"""
+                    INSERT INTO site_accounts
+                    (site_id, name, sort_order, auth_mode, {", ".join(SITE_CREDENTIAL_COLUMNS + ACCOUNT_STATE_COLUMNS)}, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, {", ".join("?" for _ in SITE_CREDENTIAL_COLUMNS + ACCOUNT_STATE_COLUMNS)}, ?, ?)
+                    """,
+                    (
+                        kept["id"],
+                        str(site.get("name") or "") if merged else "",
+                        sort_order,
+                        (site.get("auth_mode") or "password") if (site.get("platform") or "newapi") == "sub2api" else "password",
+                        *[str(values[column] or "") for column in SITE_CREDENTIAL_COLUMNS],
+                        int(values["auth_alert_active"] or 0),
+                        values["login_last_error"],
+                        values["login_last_check_at"],
+                        values["current_balance"],
+                        values["balance_currency"] or "USD",
+                        values["balance_last_error"],
+                        values["balance_last_check_at"],
+                        int(values["balance_alert_active"] or 0),
+                        now,
+                        now,
+                    ),
+                ).lastrowid
+                sort_order += 1
+                conn.execute("UPDATE balance_snapshots SET account_id = ?, site_id = ? WHERE site_id = ?", (account_id, kept["id"], site["id"]))
+                conn.execute(
+                    "UPDATE changes SET account_id = ? WHERE site_id = ? AND change_type IN ('balance_low', 'balance_recovered')",
+                    (account_id, site["id"]),
+                )
+                usage = conn.execute("SELECT * FROM daily_usage_cache WHERE site_id = ?", (site["id"],)).fetchone()
+                if usage:
+                    conn.execute(
+                        "INSERT INTO account_daily_usage_cache (account_id, usage_date, amount, currency, fetched_at) VALUES (?, ?, ?, ?, ?)",
+                        (account_id, usage["usage_date"], usage["amount"], usage["currency"], usage["fetched_at"]),
+                    )
+            if merged:
+                others = ordered[1:]
+                alert_source = next((site for site in ordered if site.get("balance_alert_enabled")), None)
+                login_groups = kept.get("current_login_groups_json") or next(
+                    (site.get("current_login_groups_json") for site in others if site.get("current_login_groups_json")), None
+                )
+                conn.execute(
+                    """
+                    UPDATE sites
+                    SET enabled = ?, login_enabled = ?, balance_alert_enabled = ?, balance_alert_threshold = ?,
+                        current_login_groups_json = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        1 if any(site.get("enabled") for site in ordered) else 0,
+                        1 if any(site.get("login_enabled") for site in ordered) else 0,
+                        1 if alert_source else 0,
+                        float((alert_source or kept).get("balance_alert_threshold") or 0),
+                        login_groups,
+                        now,
+                        kept["id"],
+                    ),
+                )
+                for site in others:
+                    conn.execute("UPDATE changes SET site_id = ? WHERE site_id = ?", (kept["id"], site["id"]))
+                    conn.execute("UPDATE balance_snapshots SET site_id = ? WHERE site_id = ?", (kept["id"], site["id"]))
+                    conn.execute("DELETE FROM sites WHERE id = ?", (site["id"],))
+        conn.execute(
+            f"""
+            UPDATE sites SET {", ".join(f"{column} = ''" for column in SITE_CREDENTIAL_COLUMNS)},
+                auth_alert_active = 0, current_balance = NULL, balance_alert_active = 0
+            """
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
 def init_db() -> None:
     with DB_LOCK, connect_db() as conn:
+        site_accounts_existed = bool(conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'site_accounts'"
+        ).fetchone())
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS sites (
@@ -476,14 +600,53 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS site_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                site_id INTEGER NOT NULL,
+                name TEXT NOT NULL DEFAULT '',
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                auth_mode TEXT NOT NULL DEFAULT 'password',
+                login_username TEXT NOT NULL DEFAULT '',
+                login_password TEXT NOT NULL DEFAULT '',
+                access_token TEXT NOT NULL DEFAULT '',
+                access_user_id TEXT NOT NULL DEFAULT '',
+                refresh_token TEXT NOT NULL DEFAULT '',
+                token_expires_at TEXT NOT NULL DEFAULT '',
+                auth_alert_active INTEGER NOT NULL DEFAULT 0,
+                login_last_error TEXT,
+                login_last_check_at TEXT,
+                current_balance REAL,
+                balance_currency TEXT NOT NULL DEFAULT 'USD',
+                balance_last_error TEXT,
+                balance_last_check_at TEXT,
+                balance_alert_active INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(site_id) REFERENCES sites(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS account_daily_usage_cache (
+                account_id INTEGER PRIMARY KEY,
+                usage_date TEXT NOT NULL,
+                amount REAL NOT NULL,
+                currency TEXT NOT NULL DEFAULT 'USD',
+                fetched_at TEXT NOT NULL,
+                FOREIGN KEY(account_id) REFERENCES site_accounts(id) ON DELETE CASCADE
+            );
+
             CREATE INDEX IF NOT EXISTS idx_sites_enabled_next_check ON sites(enabled, next_check_at);
             CREATE INDEX IF NOT EXISTS idx_snapshots_site_checked ON snapshots(site_id, checked_at DESC);
             CREATE INDEX IF NOT EXISTS idx_changes_site_created ON changes(site_id, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_balance_snapshots_site_checked ON balance_snapshots(site_id, checked_at DESC);
             CREATE INDEX IF NOT EXISTS idx_daily_usage_cache_date ON daily_usage_cache(usage_date);
             CREATE INDEX IF NOT EXISTS idx_notification_logs_created ON notification_logs(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_site_accounts_site ON site_accounts(site_id, sort_order, id);
             """
         )
+        for table_name in ("changes", "balance_snapshots"):
+            table_columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
+            if "account_id" not in table_columns:
+                conn.execute(f"ALTER TABLE {table_name} ADD COLUMN account_id INTEGER")
         columns = {
             row["name"]
             for row in conn.execute("PRAGMA table_info(sites)").fetchall()
@@ -535,6 +698,8 @@ def init_db() -> None:
                 conn.execute(f"ALTER TABLE sites ADD COLUMN {column_name} {column_type}")
         if sites_base_url_is_unique(conn):
             drop_sites_base_url_unique(conn)
+        if not site_accounts_existed:
+            migrate_site_accounts(conn)
         setting_columns = {
             row["name"]
             for row in conn.execute("PRAGMA table_info(notification_settings)").fetchall()
@@ -1215,18 +1380,7 @@ def fetch_sub2api_today_usage(
 
     def save_refreshed_auth(refreshed: Dict[str, Any], fallback_refresh_token: str) -> str:
         auth = refreshed_auth_payload(refreshed, fallback_refresh_token)
-        if site.get("id") is not None:
-            db_execute(
-                """
-                UPDATE sites
-                SET access_token = ?, refresh_token = ?, token_expires_at = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    auth["access_token"], auth["refresh_token"], auth["token_expires_at"],
-                    utc_now_iso(), site["id"],
-                ),
-            )
+        save_account_auth(site.get("account_id"), auth)
         return auth["access_token"]
 
     if mode != "token":
@@ -1296,9 +1450,24 @@ def fetch_sub2api_groups_by_token(base_url: str, access_token: str) -> Tuple[boo
         if rates_success and isinstance(parsed_rates, dict):
             rates_data = parsed_rates
 
+    _, profile, _ = fetch_sub2api_profile_by_token(base_url, token)
+    return True, {
+        "success": True,
+        "data": groups_data,
+        "user_rates": rates_data,
+        "rates_error": None if rates_ok else rates_error,
+        "balance": profile.get("balance"),
+        "balance_error": profile.get("balance_error"),
+    }, None
+
+
+def fetch_sub2api_profile_by_token(base_url: str, access_token: str) -> Tuple[bool, Dict[str, Any], Optional[str]]:
+    token = (access_token or "").strip()
+    if not token:
+        return False, {"balance": None, "balance_error": "auth_token 为空"}, "auth_token 为空"
     profile_ok, profile_payload, profile_error = request_json(
         f"{normalize_base_url(base_url)}/api/v1/user/profile",
-        headers=headers,
+        headers=sub2api_token_headers(token),
     )
     balance: Optional[Dict[str, Any]] = None
     balance_error: Optional[str] = None
@@ -1316,15 +1485,12 @@ def fetch_sub2api_groups_by_token(base_url: str, access_token: str) -> Tuple[boo
             balance_error = profile_message or "用户资料响应失败"
     else:
         balance_error = profile_error or "用户资料请求失败"
-
-    return True, {
-        "success": True,
-        "data": groups_data,
-        "user_rates": rates_data,
-        "rates_error": None if rates_ok else rates_error,
-        "balance": balance,
-        "balance_error": balance_error,
-    }, None
+    result = {"balance": balance, "balance_error": balance_error}
+    if balance:
+        return True, result, None
+    if isinstance(profile_payload, dict):
+        result.update({key: profile_payload[key] for key in ("status", "raw", "code", "message") if key in profile_payload})
+    return False, result, balance_error
 
 
 def fetch_sub2api_user_groups(
@@ -1335,7 +1501,9 @@ def fetch_sub2api_user_groups(
     access_token: str = "",
     refresh_token: str = "",
     token_expires_at: Any = None,
+    fetch_by_token: Any = None,
 ) -> Tuple[bool, Dict[str, Any], Optional[str]]:
+    fetch = fetch_by_token or fetch_sub2api_groups_by_token
     mode = (auth_mode or "password").strip().lower()
     if mode == "token":
         refresh_attempted = False
@@ -1348,7 +1516,7 @@ def fetch_sub2api_user_groups(
             if refresh_ok:
                 new_access_token = str(refreshed.get("access_token") or "").strip()
                 if new_access_token:
-                    ok, payload, error_message = fetch_sub2api_groups_by_token(base_url, new_access_token)
+                    ok, payload, error_message = fetch(base_url, new_access_token)
                     if isinstance(payload, dict):
                         payload["refreshed_auth"] = refreshed_auth_payload(refreshed, refresh_token)
                     return ok, payload, error_message
@@ -1356,7 +1524,7 @@ def fetch_sub2api_user_groups(
             else:
                 refresh_failure = refresh_error or "登录态主动刷新失败"
 
-        ok, payload, error_message = fetch_sub2api_groups_by_token(base_url, access_token)
+        ok, payload, error_message = fetch(base_url, access_token)
         if ok or not refresh_token or not is_sub2api_auth_error(payload, error_message):
             return ok, payload, error_message
         if refresh_attempted:
@@ -1367,7 +1535,7 @@ def fetch_sub2api_user_groups(
         new_access_token = str(refreshed.get("access_token") or "").strip()
         if not new_access_token:
             return False, {"refresh": refreshed}, "刷新成功但没有返回 access_token"
-        ok, payload, error_message = fetch_sub2api_groups_by_token(base_url, new_access_token)
+        ok, payload, error_message = fetch(base_url, new_access_token)
         if isinstance(payload, dict):
             payload["refreshed_auth"] = refreshed_auth_payload(refreshed, refresh_token)
         return ok, payload, error_message
@@ -1375,7 +1543,7 @@ def fetch_sub2api_user_groups(
     login_ok, token, login_payload, login_error = sub2api_login(base_url, username, password)
     if not login_ok:
         return False, {"login": login_payload}, login_error or "登录失败"
-    return fetch_sub2api_groups_by_token(base_url, token)
+    return fetch(base_url, token)
 
 
 def fetch_newapi_groups_with_access_token(base_url: str, access_token: str, user_id: str = "") -> Tuple[bool, Dict[str, Any], Optional[str]]:
@@ -1488,7 +1656,7 @@ def test_site_authentication(site: Dict[str, Any], overrides: Any = None) -> Dic
     if platform not in {"newapi", "sub2api"}:
         return {"success": False, "message": "platform invalid", "groups_count": 0, "groups": {}}
 
-    same_platform = platform == stored_platform
+    same_platform = platform == stored_platform and site.get("account_id") is not None
     base_url = normalize_base_url(str(values.get("base_url") or site.get("base_url") or ""))
     if not base_url:
         return {"success": False, "message": "Base URL 不能为空", "groups_count": 0, "groups": {}}
@@ -1513,7 +1681,7 @@ def test_site_authentication(site: Dict[str, Any], overrides: Any = None) -> Dic
             supplied_refresh_token or (str(site.get("refresh_token") or "").strip() if same_auth else "")
         ) if auth_mode == "token" else ""
         token_expires_at = (
-            values.get("token_expires_at") or (site.get("token_expires_at") if same_auth else None)
+            values.get("token_expires_at") or (site.get("token_expires_at") if same_auth else None) or None
         ) if auth_mode == "token" else None
         used_saved_credentials = same_auth and (
             not supplied_password if auth_mode == "password" else not supplied_access_token
@@ -1529,22 +1697,8 @@ def test_site_authentication(site: Dict[str, Any], overrides: Any = None) -> Dic
             token_expires_at=token_expires_at,
         )
         refreshed_auth = result.pop("refreshed_auth", None)
-        if isinstance(refreshed_auth, dict):
-            auth = refreshed_auth_payload(refreshed_auth, refresh_token)
-            db_execute(
-                """
-                UPDATE sites
-                SET access_token = COALESCE(NULLIF(?, ''), access_token),
-                    refresh_token = COALESCE(NULLIF(?, ''), refresh_token),
-                    token_expires_at = COALESCE(NULLIF(?, ''), token_expires_at),
-                    updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    auth["access_token"], auth["refresh_token"], auth["token_expires_at"],
-                    utc_now_iso(), site["id"],
-                ),
-            )
+        if isinstance(refreshed_auth, dict) and site.get("account_id") is not None:
+            save_account_auth(site["account_id"], refreshed_auth_payload(refreshed_auth, refresh_token))
             result["auth_updated"] = True
         result.pop("raw", None)
         result["used_saved_credentials"] = used_saved_credentials
@@ -2146,28 +2300,37 @@ def update_bot_settings(body: Any) -> None:
 
 
 def bot_balance_payload() -> List[Dict[str, Any]]:
-    sites = db_query_all(
-        f"""
-        SELECT sites.name, sites.current_balance, sites.balance_currency, sites.balance_last_error,
-               sites.balance_last_check_at, sites.enabled, sites.status, sites.usage_divisor,
-               {REPORT_GROUP_COLUMNS}
-        FROM sites
-        {REPORT_GROUP_JOIN}
-        {REPORT_ORDER_BY}
-        """
-    )
-    for site in sites:
-        raw_balance = site.get("current_balance")
-        site["raw_current_balance"] = raw_balance
-        site["raw_balance_currency"] = site.get("balance_currency") or "USD"
-        site["current_balance"] = converted_balance(site, raw_balance)
-        site["balance_currency"] = "CNY"
-        site["usage_divisor"] = site_usage_divisor(site)
-    return sites
+    accounts = accounts_by_site_id()
+    entries: List[Dict[str, Any]] = []
+    for site in ordered_sites():
+        site_accounts = accounts.get(int(site["id"]), [])
+        for index, account in enumerate(site_accounts or [None]):
+            account = account or {}
+            raw_balance = account.get("current_balance")
+            entries.append({
+                "id": site["id"],
+                "account_id": account.get("id"),
+                "name": account_display_name(site, account, index, len(site_accounts)),
+                "site_name": site["name"],
+                "account_name": account_label(account, index) if account else None,
+                "current_balance": converted_balance(site, raw_balance),
+                "balance_currency": "CNY",
+                "raw_current_balance": raw_balance,
+                "raw_balance_currency": account.get("balance_currency") or "USD",
+                "balance_last_error": account.get("balance_last_error"),
+                "balance_last_check_at": account.get("balance_last_check_at"),
+                "balance_alert_active": bool(account.get("balance_alert_active")),
+                "enabled": site["enabled"],
+                "status": site["status"],
+                "usage_divisor": site_usage_divisor(site),
+                "group_name": site.get("group_name"),
+                "group_order": site.get("group_order"),
+            })
+    return entries
 
 
 def save_daily_usage_cache(
-    site_id: int,
+    account_id: int,
     usage_date: str,
     amount: float,
     currency: str,
@@ -2175,81 +2338,95 @@ def save_daily_usage_cache(
 ) -> None:
     db_execute(
         """
-        INSERT INTO daily_usage_cache (site_id, usage_date, amount, currency, fetched_at)
+        INSERT INTO account_daily_usage_cache (account_id, usage_date, amount, currency, fetched_at)
         VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(site_id) DO UPDATE SET
+        ON CONFLICT(account_id) DO UPDATE SET
             usage_date = excluded.usage_date,
             amount = excluded.amount,
             currency = excluded.currency,
             fetched_at = excluded.fetched_at
         """,
-        (site_id, usage_date, amount, currency, fetched_at),
+        (account_id, usage_date, amount, currency, fetched_at),
     )
 
 
-def get_daily_usage_cache(site_id: int, usage_date: str) -> Optional[Dict[str, Any]]:
+def get_daily_usage_cache(account_id: int, usage_date: str) -> Optional[Dict[str, Any]]:
     return db_query_one(
         """
         SELECT amount, currency, fetched_at
-        FROM daily_usage_cache
-        WHERE site_id = ? AND usage_date = ?
+        FROM account_daily_usage_cache
+        WHERE account_id = ? AND usage_date = ?
         """,
-        (site_id, usage_date),
+        (account_id, usage_date),
     )
 
 
-def today_usage_for_site(site: Dict[str, Any], now: Optional[datetime] = None) -> Dict[str, Any]:
+def today_usage_for_account(
+    site: Dict[str, Any],
+    account: Optional[Dict[str, Any]],
+    index: int = 0,
+    account_count: int = 1,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
     now = now or app_now()
     usage_date = now.date().isoformat()
     usage_divisor = site_usage_divisor(site)
+    account_id = account.get("id") if account else None
+    endpoint = site_sub2api_usage_endpoint(site) if site.get("platform") == "sub2api" else None
+    base = {
+        "id": site["id"],
+        "account_id": account_id,
+        "name": account_display_name(site, account, index, account_count),
+        "site_name": site["name"],
+        "account_name": account_label(account, index) if account else None,
+        "usage_divisor": usage_divisor,
+        "currency": "CNY",
+    }
 
     def failed_result(error: Any) -> Dict[str, Any]:
-        cached = get_daily_usage_cache(int(site["id"]), usage_date)
+        cached = get_daily_usage_cache(int(account_id), usage_date) if account_id is not None else None
         if cached:
             raw_amount = float(cached["amount"])
             return {
-                "id": site["id"],
-                "name": site["name"],
+                **base,
                 "success": True,
                 "live_success": False,
                 "cached": True,
                 "amount": converted_money_amount(raw_amount, usage_divisor),
                 "raw_amount": raw_amount,
-                "usage_divisor": usage_divisor,
-                "currency": "CNY",
                 "raw_currency": cached.get("currency") or "USD",
                 "fetched_at": cached["fetched_at"],
                 "error": str(error or "查询失败"),
-                "sub2api_usage_endpoint": site_sub2api_usage_endpoint(site) if site.get("platform") == "sub2api" else None,
+                "sub2api_usage_endpoint": endpoint,
             }
         return {
-            "id": site["id"],
-            "name": site["name"],
+            **base,
             "success": False,
             "live_success": False,
             "cached": False,
             "amount": None,
             "raw_amount": None,
-            "usage_divisor": usage_divisor,
-            "currency": "CNY",
             "raw_currency": "USD",
             "fetched_at": None,
             "error": str(error or "查询失败"),
-            "sub2api_usage_endpoint": site_sub2api_usage_endpoint(site) if site.get("platform") == "sub2api" else None,
+            "sub2api_usage_endpoint": endpoint,
         }
 
     try:
-        if not site.get("login_enabled"):
+        if not account:
+            if (site.get("platform") or "newapi") == "sub2api":
+                return failed_result("未配置账号，无法查询今日消耗")
             return failed_result("未启用登录检测，无法查询今日消耗")
+        account_site = site_with_account(site, account)
         if (site.get("platform") or "newapi") == "sub2api":
-            ok, usage, error = fetch_sub2api_today_usage(site, now)
+            ok, usage, error = fetch_sub2api_today_usage(account_site, now)
         else:
             start_timestamp = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
             end_timestamp = int(now.timestamp())
             ok, usage, error = fetch_newapi_today_usage(
                 site["base_url"],
-                site.get("access_token") or "",
-                site.get("access_user_id") or "",
+                account_site.get("access_token") or "",
+                account_site.get("access_user_id") or "",
                 start_timestamp,
                 end_timestamp,
             )
@@ -2258,17 +2435,14 @@ def today_usage_for_site(site: Dict[str, Any], now: Optional[datetime] = None) -
         fetched_at = utc_now_iso()
         raw_amount = float(usage["amount"])
         currency = str(usage.get("currency") or "USD")
-        save_daily_usage_cache(int(site["id"]), usage_date, raw_amount, currency, fetched_at)
+        save_daily_usage_cache(int(account_id), usage_date, raw_amount, currency, fetched_at)
         return {
-            "id": site["id"],
-            "name": site["name"],
+            **base,
             "success": True,
             "live_success": True,
             "cached": False,
             "amount": converted_money_amount(raw_amount, usage_divisor),
             "raw_amount": raw_amount,
-            "usage_divisor": usage_divisor,
-            "currency": "CNY",
             "raw_currency": currency,
             "fetched_at": fetched_at,
             "error": None,
@@ -2278,6 +2452,23 @@ def today_usage_for_site(site: Dict[str, Any], now: Optional[datetime] = None) -
         }
     except Exception as exc:
         return failed_result(exc)
+
+
+def resolve_site_account(site: Dict[str, Any], account_id: Any = None) -> Tuple[Optional[Dict[str, Any]], int, int]:
+    accounts = list_site_accounts(int(site["id"]))
+    if site.get("platform") != "sub2api" and not site.get("login_enabled"):
+        accounts = []
+    if account_id in (None, ""):
+        return (accounts[0] if accounts else None), 0, len(accounts)
+    for index, account in enumerate(accounts):
+        if str(account["id"]) == str(account_id):
+            return account, index, len(accounts)
+    raise LookupError("账号不存在或不属于该站点")
+
+
+def today_usage_for_site(site: Dict[str, Any], now: Optional[datetime] = None, account_id: Any = None) -> Dict[str, Any]:
+    account, index, count = resolve_site_account(site, account_id)
+    return today_usage_for_account(site, account, index, count, now)
 
 
 def with_report_group(site: Dict[str, Any], result: Dict[str, Any]) -> Dict[str, Any]:
@@ -2291,13 +2482,24 @@ def bot_today_usage_payload() -> List[Dict[str, Any]]:
     if not sites:
         return []
     now = app_now()
+    accounts = accounts_by_site_id()
+    jobs: List[Tuple[Dict[str, Any], Optional[Dict[str, Any]], int, int]] = []
+    for site in sites:
+        site_accounts = accounts.get(int(site["id"]), [])
+        if site.get("platform") != "sub2api" and not site.get("login_enabled"):
+            site_accounts = []
+        for index, account in enumerate(site_accounts or [None]):
+            jobs.append((site, account, index, len(site_accounts)))
 
     results: Dict[int, Dict[str, Any]] = {}
-    with ThreadPoolExecutor(max_workers=min(4, len(sites))) as executor:
-        futures = {executor.submit(today_usage_for_site, site, now): int(site["id"]) for site in sites}
+    with ThreadPoolExecutor(max_workers=min(4, len(jobs))) as executor:
+        futures = {
+            executor.submit(today_usage_for_account, site, account, index, count, now): position
+            for position, (site, account, index, count) in enumerate(jobs)
+        }
         for future in as_completed(futures):
             results[futures[future]] = future.result()
-    return [with_report_group(site, results[int(site["id"])]) for site in sites]
+    return [with_report_group(job[0], results[position]) for position, job in enumerate(jobs)]
 
 
 def site_detection_lock(site_id: int) -> threading.Lock:
@@ -2840,78 +3042,250 @@ def notification_groups_for_site(site: Dict[str, Any]) -> List[str]:
     return normalize_notify_groups(site.get("notify_groups_json"))
 
 
-def site_notifies_public_ratio(site: Dict[str, Any]) -> bool:
-    value = site.get("notify_public_ratio")
-    return True if value is None else bool(value)
+MAX_ACCOUNT_NAME_LENGTH = 40
 
 
-def site_account_key(site: Dict[str, Any]) -> Tuple[str, str]:
-    platform = str(site.get("platform") or "newapi").strip().lower()
+def list_site_accounts(site_id: int) -> List[Dict[str, Any]]:
+    return db_query_all(
+        "SELECT * FROM site_accounts WHERE site_id = ? ORDER BY sort_order ASC, id ASC",
+        (site_id,),
+    )
+
+
+def accounts_by_site_id() -> Dict[int, List[Dict[str, Any]]]:
+    grouped: Dict[int, List[Dict[str, Any]]] = {}
+    for account in db_query_all("SELECT * FROM site_accounts ORDER BY site_id ASC, sort_order ASC, id ASC"):
+        grouped.setdefault(int(account["site_id"]), []).append(account)
+    return grouped
+
+
+def account_label(account: Optional[Dict[str, Any]], index: int = 0) -> str:
+    account = account or {}
+    for value in (account.get("name"), account.get("login_username")):
+        text = str(value or "").strip()
+        if text:
+            return text
+    user_id = str(account.get("access_user_id") or "").strip()
+    if user_id:
+        return f"ID {user_id}"
+    return f"账号{index + 1}"
+
+
+def account_display_name(site: Dict[str, Any], account: Optional[Dict[str, Any]], index: int, account_count: int) -> str:
+    if account_count <= 1:
+        return str(site["name"])
+    return f"{site['name']}·{account_label(account, index)}"
+
+
+def site_with_account(site: Dict[str, Any], account: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    account = account or {}
+    merged = dict(site)
+    merged["auth_mode"] = account.get("auth_mode") or "password"
+    for column in SITE_CREDENTIAL_COLUMNS:
+        merged[column] = account.get(column) or ""
+    merged["auth_alert_active"] = account.get("auth_alert_active") or 0
+    merged["account_id"] = account.get("id")
+    return merged
+
+
+def account_auth_from_payload(payload: Any) -> Optional[Dict[str, str]]:
+    refreshed = payload.get("refreshed_auth") if isinstance(payload, dict) else None
+    if not isinstance(refreshed, dict):
+        return None
+    return {
+        "access_token": str(refreshed.get("access_token") or "").strip(),
+        "refresh_token": str(refreshed.get("refresh_token") or "").strip(),
+        "token_expires_at": str(refreshed.get("token_expires_at") or "").strip() or refreshed_token_expiry(refreshed) or "",
+    }
+
+
+def save_account_auth(account_id: Any, auth: Optional[Dict[str, Any]]) -> None:
+    if account_id is None or not auth:
+        return
+    db_execute(
+        """
+        UPDATE site_accounts
+        SET access_token = COALESCE(NULLIF(?, ''), access_token),
+            refresh_token = COALESCE(NULLIF(?, ''), refresh_token),
+            token_expires_at = COALESCE(NULLIF(?, ''), token_expires_at),
+            updated_at = ?
+        WHERE id = ?
+        """,
+        (
+            str(auth.get("access_token") or ""),
+            str(auth.get("refresh_token") or ""),
+            str(auth.get("token_expires_at") or ""),
+            utc_now_iso(),
+            account_id,
+        ),
+    )
+
+
+def account_identity(platform: str, account: Dict[str, Any]) -> Tuple[str, Any]:
     if platform == "sub2api":
-        if str(site.get("auth_mode") or "password").strip().lower() == "token":
-            return ("sub2api-token", "")
-        return ("sub2api-user", str(site.get("login_username") or "").strip().lower())
-    if site.get("login_enabled") and str(site.get("access_user_id") or "").strip():
-        return ("newapi-user", str(site.get("access_user_id") or "").strip())
-    return ("newapi-public", "")
+        if account.get("auth_mode") == "token":
+            return ("token", {account.get("access_token"), account.get("refresh_token")} - {""})
+        return ("user", str(account.get("login_username") or "").strip().lower())
+    return ("newapi", str(account.get("access_user_id") or "").strip())
 
 
-def same_site_account(candidate: Dict[str, Any], existing: Dict[str, Any]) -> bool:
-    candidate_key = site_account_key(candidate)
-    if candidate_key != site_account_key(existing):
+def same_account_identity(platform: str, first: Dict[str, Any], second: Dict[str, Any]) -> bool:
+    first_kind, first_key = account_identity(platform, first)
+    second_kind, second_key = account_identity(platform, second)
+    if first_kind != second_kind:
         return False
-    if candidate_key[0] != "sub2api-token":
-        return True
-    candidate_tokens = {str(candidate.get(key) or "").strip() for key in ("access_token", "refresh_token")} - {""}
-    existing_tokens = {str(existing.get(key) or "").strip() for key in ("access_token", "refresh_token")} - {""}
-    return bool(candidate_tokens & existing_tokens)
+    if first_kind == "token":
+        return bool(first_key & second_key)
+    return bool(first_key) and first_key == second_key
+
+def normalize_account_inputs(
+    platform: str,
+    login_enabled: bool,
+    raw_accounts: Any,
+    existing_accounts: List[Dict[str, Any]],
+    stored_platform: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    if platform == "newapi" and not login_enabled:
+        return []
+    if not isinstance(raw_accounts, list):
+        raise ValueError("accounts 必须是数组")
+    existing_by_id = {int(account["id"]): account for account in existing_accounts}
+    same_platform = stored_platform is None or stored_platform == platform
+    normalized: List[Dict[str, Any]] = []
+    for index, item in enumerate(raw_accounts):
+        if not isinstance(item, dict):
+            raise ValueError("账号配置格式无效")
+        stored: Dict[str, Any] = {}
+        account_id = item.get("id")
+        if account_id not in (None, ""):
+            try:
+                stored = existing_by_id[int(account_id)]
+            except (KeyError, TypeError, ValueError):
+                raise ValueError("账号不存在或不属于该站点")
+        name = str(item["name"] if "name" in item else stored.get("name") or "").strip()
+        if len(name) > MAX_ACCOUNT_NAME_LENGTH:
+            raise ValueError(f"账号名称不能超过 {MAX_ACCOUNT_NAME_LENGTH} 个字符")
+        saved = stored if same_platform else {}
+        prefix = f"{account_label({'name': name}, index)}：" if len(raw_accounts) > 1 else ""
+        account: Dict[str, Any] = {"id": stored.get("id"), "name": name, **{column: "" for column in SITE_CREDENTIAL_COLUMNS}}
+        if platform == "sub2api":
+            mode = str(item.get("auth_mode") or saved.get("auth_mode") or "password").strip().lower()
+            if mode not in {"password", "token"}:
+                raise ValueError(f"{prefix}auth_mode invalid")
+            same_mode = bool(saved) and (saved.get("auth_mode") or "password") == mode
+            account["auth_mode"] = mode
+            if mode == "password":
+                account["login_username"] = str(item.get("login_username") or "").strip() or (str(saved.get("login_username") or "") if same_mode else "")
+                account["login_password"] = str(item.get("login_password") or "") or (str(saved.get("login_password") or "") if same_mode else "")
+                if not account["login_username"] or not account["login_password"]:
+                    raise ValueError(f"{prefix}sub2api 需要填写普通用户邮箱和密码")
+            else:
+                account["access_token"] = str(item.get("access_token") or "").strip() or (str(saved.get("access_token") or "") if same_mode else "")
+                account["refresh_token"] = str(item.get("refresh_token") or "").strip() or (str(saved.get("refresh_token") or "") if same_mode else "")
+                if "token_expires_at" in item:
+                    account["token_expires_at"] = str(item.get("token_expires_at") or "").strip()
+                elif same_mode:
+                    account["token_expires_at"] = str(saved.get("token_expires_at") or "")
+                if not account["access_token"]:
+                    raise ValueError(f"{prefix}导入登录态时需要填写 auth_token")
+        else:
+            account["auth_mode"] = "password"
+            account["access_token"] = str(item.get("access_token") or "").strip() or str(saved.get("access_token") or "")
+            account["access_user_id"] = str(item.get("access_user_id") or "").strip() or str(saved.get("access_user_id") or "")
+            if not account["access_token"] or not account["access_user_id"]:
+                raise ValueError(f"{prefix}使用系统访问令牌时需要填写 NewAPI 用户 ID")
+            if not account["access_user_id"].isdigit():
+                raise ValueError(f"{prefix}{NEWAPI_USER_ID_INVALID_MESSAGE}")
+        account["credentials_changed"] = any(
+            str(account.get(column) or "") != str(stored.get(column) or "")
+            for column in ("auth_mode",) + SITE_CREDENTIAL_COLUMNS
+        )
+        for previous_index, previous in enumerate(normalized):
+            if same_account_identity(platform, previous, account):
+                raise ValueError(
+                    f"「{account_label(account, index)}」与「{account_label(previous, previous_index)}」是同一个账号，不能重复添加"
+                )
+        normalized.append(account)
+    if not normalized:
+        raise ValueError("sub2api 至少需要配置一个账号" if platform == "sub2api" else "开启认证增强后至少需要配置一个账号")
+    return normalized
 
 
-def find_duplicate_site_account(candidate: Dict[str, Any], exclude_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
-    base_url = normalize_base_url(str(candidate.get("base_url") or "")).lower()
-    for existing in db_query_all("SELECT * FROM sites WHERE lower(base_url) = ? ORDER BY id", (base_url,)):
+def legacy_account_input(body: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: body[key] for key in ("auth_mode",) + SITE_CREDENTIAL_COLUMNS if key in body}
+
+
+def sync_site_accounts(site_id: int, accounts: List[Dict[str, Any]]) -> None:
+    now = utc_now_iso()
+    keep_ids = {int(account["id"]) for account in accounts if account.get("id") is not None}
+    with DB_LOCK, connect_db() as conn:
+        for row in conn.execute("SELECT id FROM site_accounts WHERE site_id = ?", (site_id,)).fetchall():
+            if row["id"] not in keep_ids:
+                conn.execute("DELETE FROM site_accounts WHERE id = ?", (row["id"],))
+        for sort_order, account in enumerate(accounts):
+            values = [account["name"], sort_order, account["auth_mode"], *[account[column] for column in SITE_CREDENTIAL_COLUMNS]]
+            if account.get("id") is None:
+                conn.execute(
+                    f"""
+                    INSERT INTO site_accounts
+                    (site_id, name, sort_order, auth_mode, {", ".join(SITE_CREDENTIAL_COLUMNS)}, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, {", ".join("?" for _ in SITE_CREDENTIAL_COLUMNS)}, ?, ?)
+                    """,
+                    (site_id, *values, now, now),
+                )
+                continue
+            reset = ", auth_alert_active = 0, login_last_error = NULL" if account.get("credentials_changed") else ""
+            conn.execute(
+                f"""
+                UPDATE site_accounts
+                SET name = ?, sort_order = ?, auth_mode = ?, {", ".join(f"{column} = ?" for column in SITE_CREDENTIAL_COLUMNS)}{reset},
+                    updated_at = ?
+                WHERE id = ? AND site_id = ?
+                """,
+                (*values, now, account["id"], site_id),
+            )
+        conn.commit()
+
+
+def find_site_for_upstream(base_url: str, platform: str, exclude_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    key = normalize_base_url(base_url).lower()
+    for existing in db_query_all("SELECT id, name, base_url FROM sites WHERE platform = ? ORDER BY id", (platform,)):
         if exclude_id is not None and int(existing["id"]) == int(exclude_id):
             continue
-        if str(existing.get("platform") or "newapi") != str(candidate.get("platform") or "newapi"):
-            continue
-        if same_site_account(candidate, existing):
+        if normalize_base_url(str(existing.get("base_url") or "")).lower() == key:
             return existing
     return None
 
 
-def merged_site_account(site: Dict[str, Any], body: Dict[str, Any], platform: str) -> Dict[str, Any]:
-    if "login_enabled" not in body:
-        return {
-            **site,
-            "base_url": normalize_base_url(str(body["base_url"])) if "base_url" in body else site.get("base_url"),
-            "platform": platform,
-        }
-    auth_mode = str(body.get("auth_mode") or site.get("auth_mode") or "password").strip().lower() if platform == "sub2api" else "password"
-    login_enabled = bool(body["login_enabled"]) or platform == "sub2api"
-    supplied_token = str(body.get("access_token") or "").strip()
-    supplied_refresh = str(body.get("refresh_token") or "").strip()
+def duplicate_upstream_message(existing: Dict[str, Any]) -> str:
+    return f"该上游已有站点「{existing.get('name') or existing['id']}」，请在该站点的「认证配置」里添加账号"
+
+
+def account_summary(site: Dict[str, Any], account: Dict[str, Any], index: int) -> Dict[str, Any]:
+    raw_balance = account.get("current_balance")
     return {
-        "base_url": normalize_base_url(str(body["base_url"])) if "base_url" in body else site.get("base_url"),
-        "platform": platform,
-        "login_enabled": login_enabled,
-        "auth_mode": auth_mode,
-        "login_username": str(body.get("login_username") or "").strip() or site.get("login_username") or "",
-        "access_user_id": (str(body.get("access_user_id") or "").strip() or site.get("access_user_id") or "") if login_enabled else "",
-        "access_token": supplied_token or site.get("access_token") or "",
-        "refresh_token": supplied_refresh or site.get("refresh_token") or "",
+        "id": account["id"],
+        "name": account.get("name") or "",
+        "label": account_label(account, index),
+        "is_primary": index == 0,
+        "auth_mode": account.get("auth_mode") or "password",
+        "login_username": account.get("login_username") or "",
+        "access_user_id": account.get("access_user_id") or "",
+        "has_login_password": bool(account.get("login_password")),
+        "has_access_token": bool(account.get("access_token")),
+        "has_refresh_token": bool(account.get("refresh_token")),
+        "token_expires_at": account.get("token_expires_at") or "",
+        "auth_alert_active": bool(account.get("auth_alert_active")),
+        "login_last_error": account.get("login_last_error"),
+        "login_last_check_at": account.get("login_last_check_at"),
+        "current_balance": converted_balance(site, raw_balance),
+        "raw_current_balance": raw_balance,
+        "balance_currency": "CNY",
+        "raw_balance_currency": account.get("balance_currency") or "USD",
+        "balance_last_error": account.get("balance_last_error"),
+        "balance_last_check_at": account.get("balance_last_check_at"),
+        "balance_alert_active": bool(account.get("balance_alert_active")),
     }
-
-
-def duplicate_site_account_message(candidate: Dict[str, Any], existing: Dict[str, Any]) -> str:
-    kind, _ = site_account_key(candidate)
-    name = existing.get("name") or f"#{existing['id']}"
-    if kind == "newapi-public":
-        return f"该上游已有未开启认证的公开倍率监控「{name}」，不需要重复添加；如需监控小号，请开启认证增强并填写该账号的用户 ID"
-    if kind == "newapi-user":
-        return f"该上游的用户 ID {str(candidate.get('access_user_id') or '').strip()} 已在「{name}」中监控，不能重复添加同一账号"
-    if kind == "sub2api-user":
-        return f"该上游的账号 {str(candidate.get('login_username') or '').strip()} 已在「{name}」中监控，不能重复添加同一账号"
-    return f"这份登录态已在「{name}」中使用，不能重复添加同一账号"
 
 
 def filter_notification_changes(site: Dict[str, Any], changes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -2983,18 +3357,25 @@ def sub2api_auth_state_failed(site: Dict[str, Any], payload: Dict[str, Any], err
     return not site.get("refresh_token") or "refresh" in payload or "refreshed_auth" in payload
 
 
-def notify_sub2api_auth_failure(site: Dict[str, Any], error_message: Optional[str], checked_at: str) -> Tuple[bool, Optional[str]]:
-    subject = f"【{site['name']}】登录状态失效"
-    message = "\n".join([
-        subject,
-        f"站点：{site['name']}",
+def notify_sub2api_auth_failure(
+    site: Dict[str, Any],
+    error_message: Optional[str],
+    checked_at: str,
+    account_name: Optional[str] = None,
+) -> Tuple[bool, Optional[str]]:
+    display_name = f"{site['name']}·{account_name}" if account_name else site["name"]
+    subject = f"【{display_name}】登录状态失效"
+    lines = [subject, f"站点：{site['name']}"]
+    if account_name:
+        lines.append(f"账号：{account_name}")
+    lines.extend([
         f"地址：{site['base_url']}",
         "状态：AT 已失效，自动刷新未能恢复监控",
         f"错误：{error_message or '登录态刷新失败'}",
         f"时间：{fmt_local_time_for_message(checked_at)}",
         "请重新登录 sub2api，并更新 AT、RT 和 token_expires_at。",
     ])
-    return send_qq_message(subject, message)
+    return send_qq_message(subject, "\n".join(lines))
 
 
 def format_balance_amount(amount: float, currency: str = "USD") -> str:
@@ -3002,36 +3383,54 @@ def format_balance_amount(amount: float, currency: str = "USD") -> str:
     return f"{symbol}{amount:.2f}"
 
 
-def record_balance_event(
+def record_balance_events(
     site: Dict[str, Any],
     event_type: str,
-    amount: float,
+    items: List[Tuple[Optional[int], Optional[str], float]],
     threshold: float,
     checked_at: str,
     currency: str = "CNY",
 ) -> None:
+    """items: (account_id, account label or None for a single-account site, converted amount)."""
+    if not items:
+        return
     recovered = event_type == "balance_recovered"
-    message = (
-        f"余额已恢复至 {format_balance_amount(amount, currency)}，高于预警阈值 {format_balance_amount(threshold, currency)}"
-        if recovered
-        else f"余额仅剩 {format_balance_amount(amount, currency)}，已低于预警阈值 {format_balance_amount(threshold, currency)}"
-    )
-    db_execute(
-        """
-        INSERT INTO changes
-        (site_id, change_type, group_name, old_value, new_value, change_percent, message, created_at, acknowledged)
-        VALUES (?, ?, NULL, ?, ?, NULL, ?, ?, 0)
-        """,
-        (site["id"], event_type, json.dumps(threshold), json.dumps(amount), message, checked_at),
-    )
+    for account_id, account_name, amount in items:
+        message = (
+            f"余额已恢复至 {format_balance_amount(amount, currency)}，高于预警阈值 {format_balance_amount(threshold, currency)}"
+            if recovered
+            else f"余额仅剩 {format_balance_amount(amount, currency)}，已低于预警阈值 {format_balance_amount(threshold, currency)}"
+        )
+        if account_name:
+            message = f"账号「{account_name}」{message}"
+        db_execute(
+            """
+            INSERT INTO changes
+            (site_id, account_id, change_type, group_name, old_value, new_value, change_percent, message, created_at, acknowledged)
+            VALUES (?, ?, ?, NULL, ?, ?, NULL, ?, ?, 0)
+            """,
+            (site["id"], account_id, event_type, json.dumps(threshold), json.dumps(amount), message, checked_at),
+        )
+
     label = "余额恢复" if recovered else "低余额预警"
-    subject = f"【{platform_label(site)} {label}】{site['name']}：{format_balance_amount(amount, currency)}"
+    named = [item for item in items if item[1]]
+    if not named:
+        amount = items[0][2]
+        subject = f"【{platform_label(site)} {label}】{site['name']}：{format_balance_amount(amount, currency)}"
+        balance_lines = [f"当前余额：{format_balance_amount(amount, currency)}"]
+    else:
+        names = "、".join(str(name) for _, name, _ in named)
+        subject = f"【{platform_label(site)} {label}】{site['name']}：{names}{'余额已恢复' if recovered else '余额不足'}"
+        balance_lines = [
+            f"{'余额恢复账号' if recovered else '余额不足账号'}：{names}",
+            *[f"· {name}：{format_balance_amount(amount, currency)}" for _, name, amount in named],
+        ]
     body = "\n".join([
         "上游余额监控提醒",
         f"站点：{site['name']}",
         f"上游站点：{site.get('base_url') or '-'}",
         f"平台：{platform_label(site)}",
-        f"当前余额：{format_balance_amount(amount, currency)}",
+        *balance_lines,
         f"预警阈值：{format_balance_amount(threshold, currency)}",
         f"状态：{'余额已恢复' if recovered else '余额不足，请及时充值'}",
         f"时间：{fmt_local_time_for_message(checked_at)}",
@@ -3042,9 +3441,24 @@ def record_balance_event(
     send_qq_message(subject, body)
 
 
+def record_balance_event(
+    site: Dict[str, Any],
+    event_type: str,
+    amount: float,
+    threshold: float,
+    checked_at: str,
+    currency: str = "CNY",
+    account_id: Optional[int] = None,
+    account_name: Optional[str] = None,
+) -> None:
+    record_balance_events(site, event_type, [(account_id, account_name, amount)], threshold, checked_at, currency)
+
+
 def collect_site_groups(site: Dict[str, Any]) -> Tuple[bool, Dict[str, Dict[str, Any]], Dict[str, Any], str, Optional[str]]:
     platform = site.get("platform") or "newapi"
     if platform == "sub2api":
+        if site.get("account_id") is None and not (site.get("login_username") or site.get("access_token")):
+            return False, {}, {}, "/api/v1/groups/available", "未配置账号"
         ok, payload, error_message = fetch_sub2api_user_groups(
             site["base_url"],
             username=site.get("login_username") or "",
@@ -3067,22 +3481,227 @@ def detect_site(site_id: int) -> Dict[str, Any]:
         return _detect_site(site_id)
 
 
+def check_secondary_account(site: Dict[str, Any], account: Dict[str, Any]) -> Dict[str, Any]:
+    """Login and balance probe for an account that does not drive ratio detection."""
+    account_site = site_with_account(site, account)
+    if (site.get("platform") or "newapi") == "sub2api":
+        ok, payload, error = fetch_sub2api_user_groups(
+            site["base_url"],
+            username=account_site.get("login_username") or "",
+            password=account_site.get("login_password") or "",
+            auth_mode=account_site.get("auth_mode") or "password",
+            access_token=account_site.get("access_token") or "",
+            refresh_token=account_site.get("refresh_token") or "",
+            token_expires_at=account_site.get("token_expires_at"),
+            fetch_by_token=fetch_sub2api_profile_by_token,
+        )
+        payload = payload if isinstance(payload, dict) else {}
+        save_account_auth(account["id"], account_auth_from_payload(payload))
+        if ok and isinstance(payload.get("balance"), dict):
+            return {"balance_attempted": True, "balance": payload["balance"], "balance_error": None,
+                    "login_checked": True, "login_error": None, "auth_failed": False}
+        auth_problem = "login" in payload or is_sub2api_auth_error(payload, error)
+        message = error or payload.get("balance_error") or "sub2api 未返回余额"
+        return {
+            "balance_attempted": True,
+            "balance": None,
+            "balance_error": str(message),
+            "login_checked": True,
+            "login_error": str(message) if auth_problem else None,
+            "auth_failed": sub2api_auth_state_failed(account_site, payload, error),
+        }
+
+    ok, balance, error = fetch_newapi_balance(
+        site["base_url"], account_site.get("access_token") or "", account_site.get("access_user_id") or ""
+    )
+    return {
+        "balance_attempted": True,
+        "balance": balance if ok else None,
+        "balance_error": None if ok else error,
+        "login_checked": True,
+        "login_error": None if ok else (error or "登录检测失败"),
+        "auth_failed": False,
+    }
+
+
+def save_account_check(
+    site: Dict[str, Any],
+    account: Dict[str, Any],
+    check: Dict[str, Any],
+    checked_at: str,
+) -> None:
+    balance_info = check.get("balance")
+    if check.get("balance_attempted"):
+        db_execute(
+            """
+            INSERT INTO balance_snapshots (site_id, account_id, status, balance, currency, raw_json, error_message, checked_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                site["id"],
+                account["id"],
+                "success" if balance_info else "failed",
+                balance_info.get("amount") if balance_info else None,
+                balance_info.get("currency", "USD") if balance_info else "USD",
+                json.dumps(balance_info, ensure_ascii=False) if balance_info else None,
+                check.get("balance_error"),
+                checked_at,
+            ),
+        )
+    attempted = 1 if check.get("balance_attempted") else 0
+    login_checked = 1 if check.get("login_checked") else 0
+    db_execute(
+        """
+        UPDATE site_accounts
+        SET auth_alert_active = ?,
+            login_last_error = CASE WHEN ? = 1 THEN ? ELSE login_last_error END,
+            login_last_check_at = CASE WHEN ? = 1 THEN ? ELSE login_last_check_at END,
+            current_balance = COALESCE(?, current_balance),
+            balance_currency = COALESCE(?, balance_currency),
+            balance_last_error = CASE WHEN ? = 1 THEN ? ELSE balance_last_error END,
+            balance_last_check_at = CASE WHEN ? = 1 THEN ? ELSE balance_last_check_at END,
+            balance_alert_active = ?,
+            updated_at = ?
+        WHERE id = ?
+        """,
+        (
+            1 if check.get("auth_alert_active") else 0,
+            login_checked, check.get("login_error"),
+            login_checked, checked_at,
+            balance_info.get("amount") if balance_info else None,
+            balance_info.get("currency") if balance_info else None,
+            attempted, check.get("balance_error"),
+            attempted, checked_at,
+            1 if check.get("balance_alert_active") else 0,
+            checked_at,
+            account["id"],
+        ),
+    )
+
+
+def apply_account_alerts(
+    site: Dict[str, Any],
+    accounts: List[Dict[str, Any]],
+    checks: List[Dict[str, Any]],
+    checked_at: str,
+) -> None:
+    named = len(accounts) > 1
+    for index, (account, check) in enumerate(zip(accounts, checks)):
+        label = account_label(account, index) if named else None
+        auth_alert_active = bool(account.get("auth_alert_active"))
+        if check.get("auth_failed"):
+            if not auth_alert_active:
+                notification_ok, _ = notify_sub2api_auth_failure(site, check.get("login_error"), checked_at, label)
+                auth_alert_active = bool(notification_ok)
+        elif check.get("login_checked") and not check.get("login_error"):
+            auth_alert_active = False
+        check["auth_alert_active"] = auth_alert_active
+
+    alerts_enabled = bool(site.get("balance_alert_enabled"))
+    threshold = float(site.get("balance_alert_threshold") or 0)
+    low: List[Tuple[Optional[int], Optional[str], float]] = []
+    recovered: List[Tuple[Optional[int], Optional[str], float]] = []
+    for index, (account, check) in enumerate(zip(accounts, checks)):
+        active = bool(account.get("balance_alert_active")) and alerts_enabled
+        displayed = converted_balance_info(site, check.get("balance"))
+        check["displayed_balance"] = displayed
+        if displayed and alerts_enabled:
+            amount = float(displayed["amount"])
+            label = account_label(account, index) if named else None
+            if amount <= threshold and not active:
+                active = True
+                low.append((account["id"], label, amount))
+            elif amount > threshold and active:
+                active = False
+                recovered.append((account["id"], label, amount))
+        check["balance_alert_active"] = active
+    record_balance_events(site, "balance_low", low, threshold, checked_at, "CNY")
+    record_balance_events(site, "balance_recovered", recovered, threshold, checked_at, "CNY")
+    for account, check in zip(accounts, checks):
+        save_account_check(site, account, check, checked_at)
+
+
+def account_check_results(
+    site: Dict[str, Any],
+    accounts: List[Dict[str, Any]],
+    checks: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    return [
+        {
+            "account_id": account["id"],
+            "name": account_label(account, index),
+            "balance": check.get("displayed_balance"),
+            "balance_error": check.get("balance_error"),
+            "login_error": check.get("login_error"),
+            "balance_alert_active": bool(check.get("balance_alert_active")),
+        }
+        for index, (account, check) in enumerate(zip(accounts, checks))
+    ]
+
+
+def combined_account_errors(accounts: List[Dict[str, Any]], checks: List[Dict[str, Any]]) -> Optional[str]:
+    errors = [
+        (account_label(account, index), str(check["login_error"]))
+        for index, (account, check) in enumerate(zip(accounts, checks))
+        if check.get("login_error")
+    ]
+    if not errors:
+        return None
+    if len(accounts) == 1:
+        return errors[0][1]
+    return "；".join(f"{name}：{error}" for name, error in errors)
+
+
+def primary_sub2api_check(ratio_site: Dict[str, Any], ok: bool, payload: Any, error_message: Optional[str]) -> Dict[str, Any]:
+    payload = payload if isinstance(payload, dict) else {}
+    if ok:
+        balance = payload.get("balance") if isinstance(payload.get("balance"), dict) else None
+        return {
+            "balance_attempted": True,
+            "balance": balance,
+            "balance_error": None if balance else str(payload.get("balance_error") or "sub2api 未返回余额"),
+            "login_checked": True,
+            "login_error": None,
+            "auth_failed": False,
+        }
+    return {
+        "balance_attempted": False,
+        "balance": None,
+        "balance_error": None,
+        "login_checked": True,
+        "login_error": str(error_message or "登录检测失败"),
+        "auth_failed": sub2api_auth_state_failed(ratio_site, payload, error_message),
+    }
+
+
 def _detect_site(site_id: int) -> Dict[str, Any]:
     site = db_query_one("SELECT * FROM sites WHERE id = ?", (site_id,))
     if not site:
         return {"success": False, "message": "site not found"}
 
     checked_at = utc_now_iso()
-    ok, new_groups, payload, source, error_message = collect_site_groups(site)
+    platform = site.get("platform") or "newapi"
+    accounts = list_site_accounts(site_id)
+    if platform == "newapi" and not site.get("login_enabled"):
+        accounts = []
+    primary = accounts[0] if accounts else None
+    ratio_site = site_with_account(site, primary)
+    ok, new_groups, payload, source, error_message = collect_site_groups(ratio_site)
     latest_success = get_last_success_snapshot(site_id)
-    refreshed_auth = payload.get("refreshed_auth") if isinstance(payload, dict) else None
-    refreshed_access_token = ""
-    refreshed_refresh_token = ""
-    refreshed_expires_at = None
-    if isinstance(refreshed_auth, dict):
-        refreshed_access_token = str(refreshed_auth.get("access_token") or "").strip()
-        refreshed_refresh_token = str(refreshed_auth.get("refresh_token") or "").strip()
-        refreshed_expires_at = str(refreshed_auth.get("token_expires_at") or "").strip() or refreshed_token_expiry(refreshed_auth)
+    if primary and platform == "sub2api":
+        save_account_auth(primary["id"], account_auth_from_payload(payload))
+    if isinstance(payload, dict) and "refreshed_auth" in payload:
+        payload = dict(payload)
+        payload.pop("refreshed_auth", None)
+
+    checks: List[Dict[str, Any]] = []
+    for index, account in enumerate(accounts):
+        if index == 0 and platform == "sub2api":
+            checks.append(primary_sub2api_check(ratio_site, ok, payload, error_message))
+        elif index == 0 and ok:
+            checks.append({})
+        else:
+            checks.append(check_secondary_account(site, account))
 
     if not ok:
         db_execute(
@@ -3092,42 +3711,37 @@ def _detect_site(site_id: int) -> Dict[str, Any]:
             """,
             (site_id, source, json.dumps(payload, ensure_ascii=False), error_message, checked_at),
         )
+        apply_account_alerts(site, accounts, checks, checked_at)
 
         consecutive_failures = int(site["consecutive_failures"] or 0) + 1
         status = "failed" if consecutive_failures >= 3 else "warning"
         next_check_at = next_check_iso(int(site["interval_minutes"] or DEFAULT_INTERVAL_MINUTES))
-        auth_alert_active = bool(site.get("auth_alert_active"))
-        if sub2api_auth_state_failed(site, payload, error_message) and not auth_alert_active:
-            notification_ok, _ = notify_sub2api_auth_failure(site, error_message, checked_at)
-            if notification_ok:
-                auth_alert_active = True
         db_execute(
             """
             UPDATE sites
             SET status = ?, last_error = ?, last_check_at = ?, next_check_at = ?, consecutive_failures = ?,
-                access_token = COALESCE(NULLIF(?, ''), access_token),
-                refresh_token = COALESCE(NULLIF(?, ''), refresh_token),
-                token_expires_at = COALESCE(?, token_expires_at),
-                auth_alert_active = ?,
+                login_last_error = ?, login_last_check_at = COALESCE(?, login_last_check_at),
                 updated_at = ?
             WHERE id = ?
             """,
             (
                 status, error_message, checked_at, next_check_at, consecutive_failures,
-                refreshed_access_token, refreshed_refresh_token, refreshed_expires_at,
-                1 if auth_alert_active else 0, checked_at, site_id,
+                combined_account_errors(accounts, checks), checked_at if accounts else None,
+                checked_at, site_id,
             ),
         )
-        return {"success": False, "message": error_message, "status": status}
+        return {
+            "success": False,
+            "message": error_message,
+            "status": status,
+            "accounts": account_check_results(site, accounts, checks),
+        }
 
     groups_json = json.dumps(new_groups, ensure_ascii=False, sort_keys=True)
     hash_value = stable_hash(new_groups)
     login_groups: Dict[str, Dict[str, Any]] = {}
     login_groups_json: Optional[str] = None
     login_error: Optional[str] = None
-    if refreshed_auth and isinstance(payload, dict):
-        payload = dict(payload)
-        payload.pop("refreshed_auth", None)
 
     db_execute(
         """
@@ -3145,31 +3759,44 @@ def _detect_site(site_id: int) -> Dict[str, Any]:
                 changes = diff_groups(old_groups, new_groups)
         except Exception:
             changes = []
-    public_change_count = len(changes)
 
-    if (site.get("platform") or "newapi") == "newapi" and site.get("login_enabled") and site.get("access_token") and site.get("access_user_id"):
-        login_ok, login_payload, login_error_message = fetch_newapi_groups_with_access_token(
-            site["base_url"],
-            site["access_token"],
-            site.get("access_user_id") or "",
-        )
-        if login_ok:
-            login_groups = parse_groups_payload(login_payload)
-            login_groups_json = json.dumps(login_groups, ensure_ascii=False, sort_keys=True)
-            old_login_groups = {}
-            if site.get("current_login_groups_json"):
-                try:
-                    parsed_old_login = json.loads(site["current_login_groups_json"])
-                    if isinstance(parsed_old_login, dict):
-                        old_login_groups = parsed_old_login
-                except Exception:
-                    old_login_groups = {}
-            login_changes = diff_groups(old_login_groups, login_groups) if old_login_groups else []
-            for change in login_changes:
-                change["message"] = f"认证增强 {change['message']}"
-            changes.extend(login_changes)
+    if platform == "newapi" and primary:
+        if primary.get("access_token") and primary.get("access_user_id"):
+            login_ok, login_payload, login_error_message = fetch_newapi_groups_with_access_token(
+                site["base_url"],
+                primary["access_token"],
+                primary.get("access_user_id") or "",
+            )
+            if login_ok:
+                login_groups = parse_groups_payload(login_payload)
+                login_groups_json = json.dumps(login_groups, ensure_ascii=False, sort_keys=True)
+                old_login_groups = {}
+                if site.get("current_login_groups_json"):
+                    try:
+                        parsed_old_login = json.loads(site["current_login_groups_json"])
+                        if isinstance(parsed_old_login, dict):
+                            old_login_groups = parsed_old_login
+                    except Exception:
+                        old_login_groups = {}
+                login_changes = diff_groups(old_login_groups, login_groups) if old_login_groups else []
+                for change in login_changes:
+                    change["message"] = f"认证增强 {change['message']}"
+                changes.extend(login_changes)
+            else:
+                login_error = login_error_message or "认证增强采集失败"
         else:
-            login_error = login_error_message or "认证增强采集失败"
+            login_error = "主账号缺少系统访问令牌或用户 ID"
+        balance_ok, fetched_balance, balance_error = fetch_newapi_balance(
+            site["base_url"], primary.get("access_token") or "", primary.get("access_user_id") or ""
+        )
+        checks[0] = {
+            "balance_attempted": True,
+            "balance": fetched_balance if balance_ok else None,
+            "balance_error": None if balance_ok else balance_error,
+            "login_checked": True,
+            "login_error": login_error,
+            "auth_failed": False,
+        }
 
     for change in changes:
         severity = "info"
@@ -3200,59 +3827,15 @@ def _detect_site(site_id: int) -> Dict[str, Any]:
         change["severity"] = severity
 
     notification_site = remap_notification_group_names(site, changes)
-    pushed_changes = changes if site_notifies_public_ratio(site) else changes[public_change_count:]
-    notify_changes(notification_site, filter_notification_changes(notification_site, pushed_changes), checked_at)
+    notify_changes(notification_site, filter_notification_changes(notification_site, changes), checked_at)
 
-    balance_attempted = False
-    balance_info: Optional[Dict[str, Any]] = None
-    balance_error: Optional[str] = None
-    if (site.get("platform") or "newapi") == "sub2api":
-        balance_attempted = True
-        if isinstance(payload, dict) and isinstance(payload.get("balance"), dict):
-            balance_info = payload.get("balance")
-        else:
-            balance_error = str(payload.get("balance_error") or "sub2api 未返回余额") if isinstance(payload, dict) else "sub2api 未返回余额"
-    elif site.get("login_enabled") and site.get("access_token"):
-        balance_attempted = True
-        balance_ok, fetched_balance, balance_error = fetch_newapi_balance(
-            site["base_url"], site.get("access_token") or "", site.get("access_user_id") or ""
-        )
-        if balance_ok:
-            balance_info = fetched_balance
-
-    if balance_attempted:
-        db_execute(
-            """
-            INSERT INTO balance_snapshots (site_id, status, balance, currency, raw_json, error_message, checked_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                site_id,
-                "success" if balance_info else "failed",
-                balance_info.get("amount") if balance_info else None,
-                balance_info.get("currency", "USD") if balance_info else "USD",
-                json.dumps(balance_info, ensure_ascii=False) if balance_info else None,
-                balance_error,
-                checked_at,
-            ),
-        )
-
-    alert_active = bool(site.get("balance_alert_active"))
-    if not site.get("balance_alert_enabled"):
-        alert_active = False
-    displayed_balance_info = converted_balance_info(site, balance_info)
-    if displayed_balance_info and site.get("balance_alert_enabled"):
-        amount = float(displayed_balance_info["amount"])
-        threshold = float(site.get("balance_alert_threshold") or 0)
-        if amount <= threshold and not alert_active:
-            alert_active = True
-            record_balance_event(site, "balance_low", amount, threshold, checked_at, "CNY")
-        elif amount > threshold and alert_active:
-            alert_active = False
-            record_balance_event(site, "balance_recovered", amount, threshold, checked_at, "CNY")
+    apply_account_alerts(site, accounts, checks, checked_at)
 
     next_check_at = next_check_iso(int(site["interval_minutes"] or DEFAULT_INTERVAL_MINUTES))
-    effective_status = "warning" if login_error or alert_active or (site.get("balance_alert_enabled") and balance_error) else "ok"
+    any_login_error = any(check.get("login_error") for check in checks)
+    any_alert = any(check.get("balance_alert_active") for check in checks)
+    any_balance_error = any(check.get("balance_error") for check in checks)
+    effective_status = "warning" if any_login_error or any_alert or (site.get("balance_alert_enabled") and any_balance_error) else "ok"
     db_execute(
         """
         UPDATE sites
@@ -3265,15 +3848,6 @@ def _detect_site(site_id: int) -> Dict[str, Any]:
             current_login_groups_json = COALESCE(?, current_login_groups_json),
             login_last_error = ?,
             login_last_check_at = ?,
-            access_token = COALESCE(NULLIF(?, ''), access_token),
-            refresh_token = COALESCE(NULLIF(?, ''), refresh_token),
-            token_expires_at = COALESCE(?, token_expires_at),
-            auth_alert_active = 0,
-            current_balance = COALESCE(?, current_balance),
-            balance_currency = COALESCE(?, balance_currency),
-            balance_last_error = CASE WHEN ? = 1 THEN ? ELSE balance_last_error END,
-            balance_last_check_at = CASE WHEN ? = 1 THEN ? ELSE balance_last_check_at END,
-            balance_alert_active = ?,
             updated_at = ?
         WHERE id = ?
         """,
@@ -3283,23 +3857,14 @@ def _detect_site(site_id: int) -> Dict[str, Any]:
             next_check_at,
             groups_json,
             login_groups_json,
-            login_error,
-            checked_at if site.get("login_enabled") else None,
-            refreshed_access_token,
-            refreshed_refresh_token,
-            refreshed_expires_at,
-            balance_info.get("amount") if balance_info else None,
-            balance_info.get("currency") if balance_info else None,
-            1 if balance_attempted else 0,
-            balance_error,
-            1 if balance_attempted else 0,
-            checked_at if balance_attempted else None,
-            1 if alert_active else 0,
+            combined_account_errors(accounts, checks),
+            checked_at if accounts else None,
             checked_at,
             site_id,
         ),
     )
 
+    primary_check = checks[0] if checks else {}
     return {
         "success": not bool(login_error),
         "message": login_error or "ok",
@@ -3307,8 +3872,9 @@ def _detect_site(site_id: int) -> Dict[str, Any]:
         "groups": new_groups,
         "login_groups": login_groups,
         "changes": changes,
-        "balance": displayed_balance_info,
-        "balance_error": balance_error,
+        "balance": primary_check.get("displayed_balance"),
+        "balance_error": primary_check.get("balance_error"),
+        "accounts": account_check_results(site, accounts, checks),
     }
 
 
@@ -3424,7 +3990,28 @@ def site_summary(site: Dict[str, Any]) -> Dict[str, Any]:
         "SELECT * FROM changes WHERE site_id = ? ORDER BY id DESC LIMIT 1",
         (site["id"],),
     )
-    raw_current_balance = site.get("current_balance")
+    accounts = list_site_accounts(int(site["id"]))
+    if site["platform"] != "sub2api" and not site.get("login_enabled"):
+        accounts = []
+    primary = accounts[0] if accounts else {}
+    known_balances = [float(a["current_balance"]) for a in accounts if a.get("current_balance") is not None]
+    raw_current_balance = sum(known_balances) if known_balances else None
+    multiple = len(accounts) > 1
+
+    def joined_errors(column: str) -> Optional[str]:
+        errors = [
+            (account_label(account, index), str(account[column]))
+            for index, account in enumerate(accounts)
+            if account.get(column)
+        ]
+        if not errors:
+            return None
+        if not multiple:
+            return errors[0][1]
+        return "；".join(f"{name}：{error}" for name, error in errors)
+
+    check_times = [str(a["balance_last_check_at"]) for a in accounts if a.get("balance_last_check_at")]
+    login_times = [str(a["login_last_check_at"]) for a in accounts if a.get("login_last_check_at")]
     return {
         "id": site["id"],
         "name": site["name"],
@@ -3440,27 +4027,28 @@ def site_summary(site: Dict[str, Any]) -> Dict[str, Any]:
         "sub2api_usage_endpoint": site_sub2api_usage_endpoint(site),
         "notify_all_groups": not bool(notify_groups),
         "notify_groups": notify_groups,
-        "notify_public_ratio": site_notifies_public_ratio(site),
         "login_enabled": bool(site.get("login_enabled")),
-        "auth_mode": site.get("auth_mode") or "password",
-        "login_username": site.get("login_username") or "",
-        "has_login_password": bool(site.get("login_password")),
-        "has_access_token": bool(site.get("access_token")),
-        "has_refresh_token": bool(site.get("refresh_token")),
-        "token_expires_at": site.get("token_expires_at") or "",
-        "auth_alert_active": bool(site.get("auth_alert_active")),
-        "access_user_id": site.get("access_user_id") or "",
-        "login_last_error": site.get("login_last_error"),
-        "login_last_check_at": site.get("login_last_check_at"),
+        "accounts": [account_summary(site, account, index) for index, account in enumerate(accounts)],
+        "account_count": len(accounts),
+        "auth_mode": primary.get("auth_mode") or "password",
+        "login_username": primary.get("login_username") or "",
+        "has_login_password": bool(primary.get("login_password")),
+        "has_access_token": bool(primary.get("access_token")),
+        "has_refresh_token": bool(primary.get("refresh_token")),
+        "token_expires_at": primary.get("token_expires_at") or "",
+        "auth_alert_active": any(a.get("auth_alert_active") for a in accounts),
+        "access_user_id": primary.get("access_user_id") or "",
+        "login_last_error": joined_errors("login_last_error"),
+        "login_last_check_at": max(login_times) if login_times else site.get("login_last_check_at"),
         "balance_alert_enabled": bool(site.get("balance_alert_enabled")),
         "balance_alert_threshold": float(site.get("balance_alert_threshold") or 0),
         "current_balance": converted_balance(site, raw_current_balance),
         "balance_currency": "CNY",
         "raw_current_balance": raw_current_balance,
-        "raw_balance_currency": site.get("balance_currency") or "USD",
-        "balance_last_error": site.get("balance_last_error"),
-        "balance_last_check_at": site.get("balance_last_check_at"),
-        "balance_alert_active": bool(site.get("balance_alert_active")),
+        "raw_balance_currency": primary.get("balance_currency") or "USD",
+        "balance_last_error": joined_errors("balance_last_error"),
+        "balance_last_check_at": max(check_times) if check_times else None,
+        "balance_alert_active": any(a.get("balance_alert_active") for a in accounts),
         "status": site["status"],
         "last_error": site["last_error"],
         "last_check_at": site["last_check_at"],
@@ -3738,32 +4326,22 @@ class Handler(BaseHTTPRequestHandler):
                     sub2api_usage_endpoint = validate_sub2api_usage_endpoint(body.get("sub2api_usage_endpoint"))
                 except ValueError as exc:
                     return json_response(self, {"success": False, "message": str(exc)}, 400)
-                login_enabled = bool(body.get("login_enabled", False))
-                login_username = str(body.get("login_username") or "").strip()
-                login_password = str(body.get("login_password") or "")
-                access_token = str(body.get("access_token") or "").strip()
-                access_user_id = str(body.get("access_user_id") or "").strip()
-                refresh_token = str(body.get("refresh_token") or "").strip()
-                token_expires_at = str(body.get("token_expires_at") or "").strip()
-                auth_mode = str(body.get("auth_mode") or "password").strip().lower()
+                login_enabled = bool(body.get("login_enabled", False)) or platform == "sub2api"
                 balance_alert_enabled = bool(body.get("balance_alert_enabled", False))
                 balance_alert_threshold = float(body.get("balance_alert_threshold") or 0)
                 notify_all_groups = bool(body.get("notify_all_groups", True))
                 notify_groups = normalize_notify_groups(body.get("notify_groups"))
                 if platform not in {"newapi", "sub2api"}:
                     return json_response(self, {"success": False, "message": "platform invalid"}, 400)
-                if auth_mode not in {"password", "token"}:
-                    return json_response(self, {"success": False, "message": "auth_mode invalid"}, 400)
                 if not name or not base_url:
                     return json_response(self, {"success": False, "message": "name/base_url required"}, 400)
-                if platform == "newapi" and login_enabled and (not access_token or not access_user_id):
-                    return json_response(self, {"success": False, "message": "使用系统访问令牌时需要填写 NewAPI 用户 ID"}, 400)
-                if platform == "newapi" and login_enabled and not access_user_id.isdigit():
-                    return json_response(self, {"success": False, "message": NEWAPI_USER_ID_INVALID_MESSAGE}, 400)
-                if platform == "sub2api" and auth_mode == "password" and (not login_username or not login_password):
-                    return json_response(self, {"success": False, "message": "sub2api 需要填写普通用户邮箱和密码"}, 400)
-                if platform == "sub2api" and auth_mode == "token" and not access_token:
-                    return json_response(self, {"success": False, "message": "导入登录态时需要填写 auth_token"}, 400)
+                raw_accounts = body.get("accounts")
+                if raw_accounts is None:
+                    raw_accounts = [legacy_account_input(body)] if login_enabled else []
+                try:
+                    accounts = normalize_account_inputs(platform, login_enabled, raw_accounts, [])
+                except ValueError as exc:
+                    return json_response(self, {"success": False, "message": str(exc)}, 400)
                 if balance_alert_enabled and balance_alert_threshold < 0:
                     return json_response(self, {"success": False, "message": "余额预警阈值不能小于 0"}, 400)
                 if platform == "newapi" and balance_alert_enabled and not login_enabled:
@@ -3774,26 +4352,15 @@ class Handler(BaseHTTPRequestHandler):
                     report_group_id = validate_report_group_id(body.get("report_group_id"))
                 except ValueError as exc:
                     return json_response(self, {"success": False, "message": str(exc)}, 400)
-                notify_public_ratio = bool(body.get("notify_public_ratio", True))
-                candidate = {
-                    "base_url": base_url,
-                    "platform": platform,
-                    "login_enabled": login_enabled or platform == "sub2api",
-                    "auth_mode": auth_mode if platform == "sub2api" else "password",
-                    "login_username": login_username,
-                    "access_user_id": access_user_id if platform == "newapi" and login_enabled else "",
-                    "access_token": access_token,
-                    "refresh_token": refresh_token,
-                }
-                duplicate = find_duplicate_site_account(candidate)
-                if duplicate:
-                    return json_response(self, {"success": False, "message": duplicate_site_account_message(candidate, duplicate)}, 409)
+                existing = find_site_for_upstream(base_url, platform)
+                if existing:
+                    return json_response(self, {"success": False, "message": duplicate_upstream_message(existing)}, 409)
                 now = utc_now_iso()
                 site_id = db_execute(
                     """
                     INSERT INTO sites
-                    (name, base_url, platform, enabled, interval_minutes, usage_divisor, sub2api_usage_endpoint, notify_groups_json, login_enabled, auth_mode, login_username, login_password, access_token, access_user_id, refresh_token, token_expires_at, balance_alert_enabled, balance_alert_threshold, status, last_error, last_check_at, next_check_at, consecutive_failures, current_groups_json, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'unknown', NULL, NULL, ?, 0, NULL, ?, ?)
+                    (name, base_url, platform, enabled, interval_minutes, usage_divisor, sub2api_usage_endpoint, notify_groups_json, login_enabled, auth_mode, balance_alert_enabled, balance_alert_threshold, status, last_error, last_check_at, next_check_at, consecutive_failures, current_groups_json, report_group_id, report_sort_order, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'password', ?, ?, 'unknown', NULL, NULL, ?, 0, NULL, ?, ?, ?, ?)
                     """,
                     (
                         name,
@@ -3804,25 +4371,17 @@ class Handler(BaseHTTPRequestHandler):
                         usage_divisor,
                         sub2api_usage_endpoint if platform == "sub2api" else "dashboard",
                         None if notify_all_groups else json.dumps(notify_groups, ensure_ascii=False),
-                        1 if (login_enabled or platform == "sub2api") else 0,
-                        auth_mode if platform == "sub2api" else "password",
-                        login_username if platform == "sub2api" and auth_mode == "password" else "",
-                        login_password if platform == "sub2api" and auth_mode == "password" else "",
-                        access_token if ((platform == "newapi" and login_enabled) or (platform == "sub2api" and auth_mode == "token")) else "",
-                        access_user_id if platform == "newapi" and login_enabled else "",
-                        refresh_token if platform == "sub2api" and auth_mode == "token" else "",
-                        token_expires_at if platform == "sub2api" and auth_mode == "token" else "",
+                        1 if login_enabled else 0,
                         1 if balance_alert_enabled else 0,
                         balance_alert_threshold,
                         next_check_iso(interval),
+                        report_group_id,
+                        next_report_sort_order(report_group_id),
                         now,
                         now,
                     ),
                 )
-                db_execute(
-                    "UPDATE sites SET report_group_id = ?, report_sort_order = ?, notify_public_ratio = ? WHERE id = ?",
-                    (report_group_id, next_report_sort_order(report_group_id), 1 if notify_public_ratio else 0, site_id),
-                )
+                sync_site_accounts(site_id, accounts)
                 return json_response(self, {"success": True, "id": site_id})
 
             if path == "/api/report-groups":
@@ -3849,7 +4408,12 @@ class Handler(BaseHTTPRequestHandler):
                 site = db_query_one("SELECT * FROM sites WHERE id = ?", (site_id,))
                 if not site:
                     return json_response(self, {"success": False, "message": "site not found"}, 404)
-                return json_response(self, today_usage_for_site(site))
+                body = read_json_body(self)
+                account_id = body.get("account_id") if isinstance(body, dict) else None
+                try:
+                    return json_response(self, today_usage_for_site(site, account_id=account_id))
+                except LookupError as exc:
+                    return json_response(self, {"success": False, "message": str(exc)}, 404)
 
             if path.startswith("/api/sites/") and path.endswith("/auth/test"):
                 try:
@@ -3859,7 +4423,17 @@ class Handler(BaseHTTPRequestHandler):
                 site = db_query_one("SELECT * FROM sites WHERE id = ?", (site_id,))
                 if not site:
                     return json_response(self, {"success": False, "message": "site not found"}, 404)
-                return json_response(self, test_site_authentication(site, read_json_body(self)))
+                body = read_json_body(self)
+                body = body if isinstance(body, dict) else {}
+                accounts = list_site_accounts(site_id)
+                account: Optional[Dict[str, Any]] = None
+                if "account_id" not in body:
+                    account = accounts[0] if accounts else None
+                elif body.get("account_id") not in (None, ""):
+                    account = next((item for item in accounts if str(item["id"]) == str(body["account_id"])), None)
+                    if account is None:
+                        return json_response(self, {"success": False, "message": "账号不存在或不属于该站点"}, 404)
+                return json_response(self, test_site_authentication(site_with_account(site, account), body))
 
             if path == "/api/notifications/test-email":
                 body = read_json_body(self)
@@ -4006,101 +4580,42 @@ class Handler(BaseHTTPRequestHandler):
                     return json_response(self, {"success": False, "message": "指定分组通知模式至少需要选择一个分组"}, 400)
                 fields.append("notify_groups_json = ?")
                 params.append(None if notify_all_groups else json.dumps(notify_groups, ensure_ascii=False))
+            reset_balance_alerts = False
             if "balance_alert_enabled" in body:
                 balance_alert_enabled = bool(body["balance_alert_enabled"])
                 if target_platform == "newapi" and balance_alert_enabled and not bool(body.get("login_enabled", site.get("login_enabled"))):
                     return json_response(self, {"success": False, "message": "NewAPI 余额监控需要开启认证增强监控"}, 400)
                 fields.append("balance_alert_enabled = ?")
                 params.append(1 if balance_alert_enabled else 0)
-                if not balance_alert_enabled:
-                    fields.append("balance_alert_active = 0")
+                reset_balance_alerts = not balance_alert_enabled
             if "balance_alert_threshold" in body:
                 threshold = float(body["balance_alert_threshold"] or 0)
                 if threshold < 0:
                     return json_response(self, {"success": False, "message": "余额预警阈值不能小于 0"}, 400)
                 fields.append("balance_alert_threshold = ?")
                 params.append(threshold)
-            if "login_enabled" in body:
-                login_enabled = bool(body["login_enabled"])
-                login_username = str(body.get("login_username") or "").strip()
-                login_password = str(body.get("login_password") or "")
-                access_token = str(body.get("access_token") or "").strip()
-                access_user_id = str(body.get("access_user_id") or "").strip()
-                refresh_token = str(body.get("refresh_token") or "").strip()
-                token_expires_at = str(body.get("token_expires_at") or "").strip()
-                auth_mode = str(body.get("auth_mode") or site.get("auth_mode") or "password").strip().lower()
-                existing_access_token = site.get("access_token") or ""
-                existing_access_user_id = site.get("access_user_id") or ""
-                existing_refresh_token = site.get("refresh_token") or ""
-                existing_username = site.get("login_username") or ""
-                existing_password = site.get("login_password") or ""
-                if auth_mode not in {"password", "token"}:
-                    return json_response(self, {"success": False, "message": "auth_mode invalid"}, 400)
-                if target_platform == "newapi":
-                    has_token_after_update = bool(access_token or existing_access_token)
-                    has_user_id_after_update = bool(access_user_id or existing_access_user_id)
-                    if login_enabled and (not has_token_after_update or not has_user_id_after_update):
-                        return json_response(self, {"success": False, "message": "使用系统访问令牌时需要填写 NewAPI 用户 ID"}, 400)
-                    if login_enabled and access_user_id and not access_user_id.isdigit():
-                        return json_response(self, {"success": False, "message": NEWAPI_USER_ID_INVALID_MESSAGE}, 400)
-                if target_platform == "sub2api" and auth_mode == "password" and (not (login_username or existing_username) or not (login_password or existing_password)):
-                    return json_response(self, {"success": False, "message": "sub2api 需要填写普通用户邮箱和密码"}, 400)
-                if target_platform == "sub2api" and auth_mode == "token" and not (access_token or existing_access_token):
-                    return json_response(self, {"success": False, "message": "导入登录态时需要填写 auth_token"}, 400)
-                fields.append("login_enabled = ?")
-                params.append(1 if (login_enabled or target_platform == "sub2api") else 0)
-                fields.append("auth_mode = ?")
-                params.append(auth_mode if target_platform == "sub2api" else "password")
-                if target_platform == "sub2api":
-                    fields.append("auth_alert_active = 0")
-                    if auth_mode == "password" and login_username:
-                        fields.append("login_username = ?")
-                        params.append(login_username)
-                    if auth_mode == "password" and login_password:
-                        fields.append("login_password = ?")
-                        params.append(login_password)
-                    if auth_mode == "token":
-                        fields.append("login_username = ?")
-                        params.append("")
-                        fields.append("login_password = ?")
-                        params.append("")
-                        if access_token:
-                            fields.append("access_token = ?")
-                            params.append(access_token)
-                        if refresh_token or not existing_refresh_token:
-                            fields.append("refresh_token = ?")
-                            params.append(refresh_token)
-                        fields.append("token_expires_at = ?")
-                        params.append(token_expires_at)
+            stored_platform = str(site.get("platform") or "newapi")
+            platform_changed = target_platform != stored_platform
+            new_accounts: Optional[List[Dict[str, Any]]] = None
+            if "accounts" in body or "login_enabled" in body or platform_changed:
+                login_enabled = bool(body.get("login_enabled", site.get("login_enabled"))) or target_platform == "sub2api"
+                existing_accounts = list_site_accounts(site_id)
+                raw_accounts = body.get("accounts")
+                if raw_accounts is None:
+                    legacy = legacy_account_input(body)
+                    if platform_changed or not existing_accounts:
+                        raw_accounts = [legacy] if login_enabled else []
                     else:
-                        fields.append("access_token = ?")
-                        params.append("")
-                        fields.append("refresh_token = ?")
-                        params.append("")
-                        fields.append("token_expires_at = ?")
-                        params.append("")
-                    fields.append("access_user_id = ?")
-                    params.append("")
-                else:
-                    fields.append("login_username = ?")
-                    params.append("")
-                    fields.append("login_password = ?")
-                    params.append("")
-                    fields.append("refresh_token = ?")
-                    params.append("")
-                    fields.append("token_expires_at = ?")
-                    params.append("")
-                    if not login_enabled:
-                        fields.append("access_token = ?")
-                        params.append("")
-                        fields.append("access_user_id = ?")
-                        params.append("")
-                    if login_enabled and access_token:
-                        fields.append("access_token = ?")
-                        params.append(access_token)
-                    if login_enabled and access_user_id:
-                        fields.append("access_user_id = ?")
-                        params.append(access_user_id)
+                        raw_accounts = [{"id": existing_accounts[0]["id"], **legacy}]
+                        raw_accounts.extend({"id": account["id"]} for account in existing_accounts[1:])
+                try:
+                    new_accounts = normalize_account_inputs(
+                        target_platform, login_enabled, raw_accounts, existing_accounts, stored_platform
+                    )
+                except ValueError as exc:
+                    return json_response(self, {"success": False, "message": str(exc)}, 400)
+                fields.append("login_enabled = ?")
+                params.append(1 if login_enabled else 0)
             if "report_group_id" in body:
                 try:
                     report_group_id = validate_report_group_id(body["report_group_id"])
@@ -4111,9 +4626,6 @@ class Handler(BaseHTTPRequestHandler):
                     params.append(report_group_id)
                     fields.append("report_sort_order = ?")
                     params.append(next_report_sort_order(report_group_id))
-            if "notify_public_ratio" in body:
-                fields.append("notify_public_ratio = ?")
-                params.append(1 if body["notify_public_ratio"] else 0)
             if "status" in body:
                 fields.append("status = ?")
                 params.append(str(body["status"]))
@@ -4121,16 +4633,21 @@ class Handler(BaseHTTPRequestHandler):
             if not fields:
                 return json_response(self, {"success": False, "message": "no fields"}, 400)
 
-            candidate = merged_site_account(site, body, target_platform)
-            duplicate = find_duplicate_site_account(candidate, exclude_id=site_id)
-            if duplicate:
-                return json_response(self, {"success": False, "message": duplicate_site_account_message(candidate, duplicate)}, 409)
+            if "base_url" in body or platform_changed:
+                target_base_url = normalize_base_url(str(body.get("base_url") or site["base_url"]))
+                existing = find_site_for_upstream(target_base_url, target_platform, exclude_id=site_id)
+                if existing:
+                    return json_response(self, {"success": False, "message": duplicate_upstream_message(existing)}, 409)
 
             fields.append("updated_at = ?")
             params.append(utc_now_iso())
             params.append(site_id)
 
             db_execute(f"UPDATE sites SET {', '.join(fields)} WHERE id = ?", params)
+            if new_accounts is not None:
+                sync_site_accounts(site_id, new_accounts)
+            if reset_balance_alerts:
+                db_execute("UPDATE site_accounts SET balance_alert_active = 0 WHERE site_id = ?", (site_id,))
             return json_response(self, {"success": True})
 
         if path == "/api/notifications/settings":
