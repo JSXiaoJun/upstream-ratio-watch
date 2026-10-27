@@ -28,6 +28,7 @@ class MockUpstreamHandler(BaseHTTPRequestHandler):
     last_feishu_payload = None
     last_qq_payload = None
     last_qq_authorization = None
+    qq_health = {"success": True, "onebot_connected": True, "qq_online": True}
 
     def log_message(self, *_args):
         pass
@@ -42,6 +43,9 @@ class MockUpstreamHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         original_path = self.path
+        if original_path == "/health":
+            self.send_json(self.__class__.qq_health)
+            return
         path = original_path.split("?", 1)[0]
         api_index = path.find("/api/")
         if api_index > 0:
@@ -99,7 +103,7 @@ class MockUpstreamHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
             self.__class__.last_feishu_payload = json.loads(self.rfile.read(length))
             self.send_json({"code": 0, "msg": "success"})
-        elif path == "/qq-notify":
+        elif path in ("/qq-notify", "/api/notify"):
             length = int(self.headers.get("Content-Length", "0"))
             self.__class__.last_qq_payload = json.loads(self.rfile.read(length))
             self.__class__.last_qq_authorization = self.headers.get("Authorization")
@@ -122,6 +126,7 @@ class BalanceMonitoringTest(unittest.TestCase):
         MockUpstreamHandler.last_feishu_payload = None
         MockUpstreamHandler.last_qq_payload = None
         MockUpstreamHandler.last_qq_authorization = None
+        MockUpstreamHandler.qq_health = {"success": True, "onebot_connected": True, "qq_online": True}
         self.temp_dir = tempfile.TemporaryDirectory()
         self.original_db_path = app.DB_PATH
         self.original_auth_config_path = app.AUTH_CONFIG_PATH
@@ -539,6 +544,95 @@ class BalanceMonitoringTest(unittest.TestCase):
         self.assertTrue(settings["qq_has_api_token"])
         self.assertNotIn("qq_api_token", settings)
         self.assertEqual("123456789", settings["qq_group_id"])
+
+    def test_qq_bot_health_url_is_derived_from_notify_url(self):
+        self.assertEqual("http://qq-monitor-bot:3100/health", app.qq_bot_health_url("http://qq-monitor-bot:3100/api/notify"))
+        self.assertEqual("https://bot.example.com/qq/health", app.qq_bot_health_url("https://bot.example.com/qq/api/notify/"))
+        self.assertEqual("", app.qq_bot_health_url("not a url"))
+
+    def test_qq_bot_offline_alerts_other_channels_once_and_recovery_notifies_group(self):
+        app.update_notification_settings({
+            "qq_enabled": True,
+            "qq_api_url": f"{self.base_url}/api/notify",
+            "qq_api_token": "notify-secret",
+            "qq_group_id": "123456789",
+        })
+        monitor = app.QqBotHealthMonitor(offline_threshold=2)
+        with patch.object(app, "send_email_message", return_value=(True, None)) as email,                 patch.object(app, "send_wecom_message", return_value=(True, None)) as wecom,                 patch.object(app, "send_feishu_message", return_value=(True, None)) as feishu:
+            self.assertIsNone(monitor.run_once())
+            self.assertEqual("online", app.notification_settings_payload()["qq_bot_status"])
+
+            MockUpstreamHandler.qq_health = {
+                "success": True, "onebot_connected": True, "qq_online": False,
+                "qq_status_reason": "账号在其他设备登录",
+            }
+            self.assertIsNone(monitor.run_once())
+            email.assert_not_called()
+            self.assertEqual("offline", monitor.run_once())
+            self.assertIsNone(monitor.run_once())
+            email.assert_called_once()
+            wecom.assert_called_once()
+            feishu.assert_called_once()
+            subject, body = email.call_args.args
+            self.assertEqual("【QQ 监控机器人】已掉线", subject)
+            self.assertIn("账号在其他设备登录", body)
+            self.assertIn("123456789", body)
+            settings = app.notification_settings_payload()
+            self.assertEqual("offline", settings["qq_bot_status"])
+            self.assertIn("QQ 账号已掉线", settings["qq_bot_last_error"])
+            MockUpstreamHandler.last_qq_payload = None
+
+            MockUpstreamHandler.qq_health = {"success": True, "onebot_connected": True, "qq_online": True}
+            self.assertEqual("online", monitor.run_once())
+            self.assertEqual("123456789", MockUpstreamHandler.last_qq_payload["group_id"])
+            self.assertEqual("【QQ 监控机器人】已恢复", MockUpstreamHandler.last_qq_payload["subject"])
+            self.assertIn("掉线时长", MockUpstreamHandler.last_qq_payload["message"])
+            self.assertEqual(2, email.call_count)
+            self.assertIsNone(monitor.run_once())
+            self.assertEqual(2, email.call_count)
+
+    def test_qq_bot_offline_alert_sends_real_email_through_smtp(self):
+        app.update_notification_settings({
+            "qq_enabled": True,
+            "qq_api_url": f"{self.base_url}/api/notify",
+            "qq_api_token": "notify-secret",
+            "qq_group_id": "123456789",
+            "email_enabled": True,
+            "smtp_host": "smtp.example.com",
+            "smtp_port": 465,
+            "smtp_username": "bot@example.com",
+            "smtp_password": "auth-code",
+            "smtp_use_ssl": True,
+            "smtp_to": "me@example.com",
+        })
+        MockUpstreamHandler.qq_health = {"success": True, "onebot_connected": True, "qq_online": False}
+        monitor = app.QqBotHealthMonitor(offline_threshold=1)
+        with patch.object(app.smtplib, "SMTP_SSL") as smtp_ssl:
+            self.assertEqual("offline", monitor.run_once())
+        smtp_ssl.assert_called_once_with("smtp.example.com", 465, timeout=app.HTTP_TIMEOUT_SECONDS)
+        smtp = smtp_ssl.return_value.__enter__.return_value
+        smtp.login.assert_called_once_with("bot@example.com", "auth-code")
+        email = smtp.send_message.call_args.args[0]
+        self.assertEqual("【QQ 监控机器人】已掉线", email["Subject"])
+        self.assertEqual("me@example.com", email["To"])
+        self.assertIn("QQ 账号已掉线", email.get_content())
+        settings = app.notification_settings_payload()
+        self.assertIsNone(settings["email_last_error"])
+        self.assertIsNotNone(settings["email_last_sent_at"])
+
+    def test_qq_bot_unreachable_or_disconnected_counts_as_offline(self):
+        self.assertIn("无法访问", app.check_qq_bot_health("http://127.0.0.1:9/api/notify"))
+        MockUpstreamHandler.qq_health = {"success": True, "onebot_connected": False, "qq_online": False}
+        self.assertIn("OneBot", app.check_qq_bot_health(f"{self.base_url}/api/notify"))
+        MockUpstreamHandler.qq_health = {"success": True, "onebot_connected": True, "qq_online": None}
+        self.assertIsNone(app.check_qq_bot_health(f"{self.base_url}/api/notify"))
+
+    def test_qq_bot_health_check_is_skipped_when_qq_push_disabled(self):
+        MockUpstreamHandler.qq_health = {"success": True, "onebot_connected": False}
+        monitor = app.QqBotHealthMonitor(offline_threshold=1)
+        with patch.object(app, "send_email_message") as email:
+            self.assertIsNone(monitor.run_once())
+        email.assert_not_called()
 
     def test_qq_notification_configuration_rejects_invalid_group(self):
         with self.assertRaisesRegex(ValueError, "有效的 QQ 群号"):

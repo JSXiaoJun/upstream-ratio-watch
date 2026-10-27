@@ -830,9 +830,14 @@ function renderNotificationSettings(options = {}) {
   if (settings.qq_has_api_token) qqParts.push('接口 Token 已保存');
   if (settings.qq_group_id) qqParts.push(`通知群：${settings.qq_group_id}`);
   if (settings.qq_last_sent_at) qqParts.push(`上次发送：${fmtTime(settings.qq_last_sent_at)}`);
+  if (settings.qq_bot_status === 'online') qqParts.push('机器人在线');
+  if (settings.qq_bot_status === 'offline') {
+    const since = settings.qq_bot_status_changed_at ? `（${fmtTime(settings.qq_bot_status_changed_at)} 起）` : '';
+    qqParts.push(`机器人已掉线${since}：${settings.qq_bot_last_error || '原因未知'}`);
+  }
   if (settings.qq_last_error) qqParts.push(`错误：${settings.qq_last_error}`);
   els.qqStatus.textContent = qqParts.join(' · ');
-  els.qqStatus.classList.toggle('error', !!settings.qq_last_error);
+  els.qqStatus.classList.toggle('error', !!settings.qq_last_error || settings.qq_bot_status === 'offline');
 
   els.emailEnabled.checked = !!settings.email_enabled;
   els.smtpHost.value = settings.smtp_host || '';

@@ -32,7 +32,7 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 STATIC_DIR = APP_DIR / "static"
 DB_PATH = DATA_DIR / "app.db"
-APP_VERSION = "1.14.0"
+APP_VERSION = "1.15.0"
 AUTH_CONFIG_PATH = Path(os.getenv("AUTH_CONFIG_PATH") or (DATA_DIR / "auth.json"))
 AUTH_COOKIE_NAME = "upstream_watch_session"
 DEFAULT_SESSION_DAYS = 30
@@ -42,6 +42,9 @@ DEFAULT_INTERVAL_MINUTES = 3
 MIN_INTERVAL_MINUTES = 1
 HTTP_TIMEOUT_SECONDS = 15
 SCAN_INTERVAL_SECONDS = 10
+QQ_BOT_HEALTH_INTERVAL_SECONDS = max(10, int(os.getenv("QQ_BOT_HEALTH_INTERVAL_SECONDS", "300")))
+# A NapCat restart or quick re-login should not page anyone.
+QQ_BOT_OFFLINE_THRESHOLD = max(1, int(os.getenv("QQ_BOT_OFFLINE_THRESHOLD", "2")))
 SERVER_HOST = os.getenv("HOST", "127.0.0.1")
 SERVER_PORT = int(os.getenv("PORT", "8000"))
 APP_TIMEZONE_NAME = os.getenv("APP_TIMEZONE") or os.getenv("TZ") or "Asia/Shanghai"
@@ -561,6 +564,10 @@ def init_db() -> None:
                 qq_group_id TEXT,
                 qq_last_error TEXT,
                 qq_last_sent_at TEXT,
+                qq_bot_status TEXT,
+                qq_bot_status_changed_at TEXT,
+                qq_bot_last_error TEXT,
+                qq_bot_checked_at TEXT,
                 email_enabled INTEGER NOT NULL DEFAULT 0,
                 smtp_host TEXT,
                 smtp_port INTEGER NOT NULL DEFAULT 465,
@@ -721,6 +728,10 @@ def init_db() -> None:
             "qq_group_id": "TEXT",
             "qq_last_error": "TEXT",
             "qq_last_sent_at": "TEXT",
+            "qq_bot_status": "TEXT",
+            "qq_bot_status_changed_at": "TEXT",
+            "qq_bot_last_error": "TEXT",
+            "qq_bot_checked_at": "TEXT",
             "smtp_host": "TEXT",
             "smtp_port": "INTEGER NOT NULL DEFAULT 465",
             "smtp_username": "TEXT",
@@ -1908,6 +1919,10 @@ def notification_settings_payload() -> Dict[str, Any]:
         "qq_group_id": settings.get("qq_group_id") or "",
         "qq_last_error": settings.get("qq_last_error"),
         "qq_last_sent_at": settings.get("qq_last_sent_at"),
+        "qq_bot_status": settings.get("qq_bot_status") or "unknown",
+        "qq_bot_status_changed_at": settings.get("qq_bot_status_changed_at"),
+        "qq_bot_last_error": settings.get("qq_bot_last_error"),
+        "qq_bot_checked_at": settings.get("qq_bot_checked_at"),
         "email_enabled": bool(settings.get("email_enabled")),
         "smtp_host": settings.get("smtp_host") or "",
         "smtp_port": int(settings.get("smtp_port") or 465),
@@ -3378,6 +3393,149 @@ def notify_sub2api_auth_failure(
     return send_qq_message(subject, "\n".join(lines))
 
 
+def qq_bot_health_url(api_url: str) -> str:
+    parsed = urlparse(str(api_url or "").strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    path = parsed.path.rstrip("/")
+    if path.endswith("/api/notify"):
+        path = path[: -len("/api/notify")]
+    return parsed._replace(path=f"{path}/health", params="", query="", fragment="").geturl()
+
+
+def check_qq_bot_health(api_url: str) -> Optional[str]:
+    """Returns None when the bot and its QQ account are online, otherwise the reason."""
+    health_url = qq_bot_health_url(api_url)
+    if not health_url:
+        return "QQ 通知接口地址无效"
+    ok, payload, error = request_json(health_url)
+    if not ok or not isinstance(payload, dict):
+        return f"机器人服务无法访问：{error or '无响应'}"
+    if not payload.get("onebot_connected"):
+        return "机器人与 NapCat 的 OneBot 连接已断开"
+    if payload.get("qq_online") is False:
+        reason = str(payload.get("qq_status_reason") or "").strip()
+        return f"QQ 账号已掉线{f'：{reason}' if reason else ''}"
+    return None
+
+
+def format_duration_text(seconds: float) -> str:
+    minutes = max(0, int(seconds // 60))
+    if minutes < 1:
+        return "不到 1 分钟"
+    if minutes < 60:
+        return f"{minutes} 分钟"
+    hours, rest = divmod(minutes, 60)
+    return f"{hours} 小时 {rest} 分钟" if rest else f"{hours} 小时"
+
+
+def send_qq_bot_offline_alert(error: str, offline_at: str) -> None:
+    settings = get_notification_settings()
+    group_id = normalize_qq_group_id(settings.get("qq_group_id"))
+    subject = "【QQ 监控机器人】已掉线"
+    message = "\n".join([
+        subject,
+        f"通知群：{group_id or '未配置'}",
+        f"原因：{error}",
+        f"时间：{fmt_local_time_for_message(offline_at)}",
+        "掉线期间 QQ 群收不到监控通知，请登录 NapCat WebUI 检查 QQ 登录状态。",
+    ])
+    # The QQ channel is the thing that is down, so this goes out everywhere else.
+    send_email_message(subject, message)
+    send_wecom_message(subject, message)
+    send_feishu_message(subject, message)
+    log_notification("qq", "failed", group_id, message, error)
+
+
+def send_qq_bot_recovery_notice(offline_at: Optional[str], recovered_at: str) -> None:
+    subject = "【QQ 监控机器人】已恢复"
+    lines = [subject]
+    offline_dt = parse_iso_dt(offline_at)
+    recovered_dt = parse_iso_dt(recovered_at)
+    if offline_at:
+        lines.append(f"掉线时间：{fmt_local_time_for_message(offline_at)}")
+    lines.append(f"恢复时间：{fmt_local_time_for_message(recovered_at)}")
+    if offline_dt and recovered_dt:
+        lines.append(f"掉线时长：{format_duration_text((recovered_dt - offline_dt).total_seconds())}")
+    lines.append("掉线期间发出的 QQ 通知不会补发，可在推送日志中查看。")
+    message = "\n".join(lines)
+    send_qq_message(subject, message)
+    send_email_message(subject, message)
+    send_wecom_message(subject, message)
+    send_feishu_message(subject, message)
+
+
+class QqBotHealthMonitor:
+    def __init__(self, offline_threshold: int = QQ_BOT_OFFLINE_THRESHOLD) -> None:
+        self.offline_threshold = offline_threshold
+        self.failures = 0
+        self.first_failure_at: Optional[str] = None
+
+    def run_once(self) -> Optional[str]:
+        """Checks the bot once. Returns 'offline' or 'online' when a notice was sent."""
+        settings = get_notification_settings()
+        if not settings.get("qq_enabled") or not str(settings.get("qq_api_url") or "").strip():
+            self.failures = 0
+            self.first_failure_at = None
+            return None
+
+        checked_at = utc_now_iso()
+        error = check_qq_bot_health(settings.get("qq_api_url"))
+        status = settings.get("qq_bot_status") or "unknown"
+
+        if error is None:
+            self.failures = 0
+            self.first_failure_at = None
+            if status == "online":
+                db_execute(
+                    "UPDATE notification_settings SET qq_bot_checked_at = ?, qq_bot_last_error = NULL WHERE id = 1",
+                    (checked_at,),
+                )
+                return None
+            db_execute(
+                """
+                UPDATE notification_settings
+                SET qq_bot_status = 'online', qq_bot_status_changed_at = ?, qq_bot_last_error = NULL, qq_bot_checked_at = ?
+                WHERE id = 1
+                """,
+                (checked_at, checked_at),
+            )
+            if status == "offline":
+                send_qq_bot_recovery_notice(settings.get("qq_bot_status_changed_at"), checked_at)
+                return "online"
+            return None
+
+        self.failures += 1
+        self.first_failure_at = self.first_failure_at or checked_at
+        if status == "offline" or self.failures < self.offline_threshold:
+            db_execute(
+                "UPDATE notification_settings SET qq_bot_checked_at = ?, qq_bot_last_error = ? WHERE id = 1",
+                (checked_at, error),
+            )
+            return None
+        offline_at = self.first_failure_at
+        db_execute(
+            """
+            UPDATE notification_settings
+            SET qq_bot_status = 'offline', qq_bot_status_changed_at = ?, qq_bot_last_error = ?, qq_bot_checked_at = ?
+            WHERE id = 1
+            """,
+            (offline_at, error, checked_at),
+        )
+        send_qq_bot_offline_alert(error, offline_at)
+        return "offline"
+
+
+def qq_bot_health_worker() -> None:
+    monitor = QqBotHealthMonitor()
+    while not STOP_EVENT.is_set():
+        try:
+            monitor.run_once()
+        except Exception:
+            print(f"QQ 机器人健康检查失败：{traceback.format_exc(limit=2)}")
+        STOP_EVENT.wait(QQ_BOT_HEALTH_INTERVAL_SECONDS)
+
+
 def format_balance_amount(amount: float, currency: str = "USD") -> str:
     symbol = "$" if currency == "USD" else "¥" if currency in {"CNY", "RMB"} else f"{currency} "
     return f"{symbol}{amount:.2f}"
@@ -4710,6 +4868,7 @@ def main() -> None:
 
     worker = threading.Thread(target=schedule_worker, daemon=True)
     worker.start()
+    threading.Thread(target=qq_bot_health_worker, daemon=True).start()
 
     server = ThreadingHTTPServer((SERVER_HOST, SERVER_PORT), Handler)
     print(f"Upstream Ratio Watch running at http://{SERVER_HOST}:{SERVER_PORT}")
