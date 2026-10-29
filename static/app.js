@@ -98,6 +98,7 @@ const els = {
   smtpUseSsl: document.getElementById('smtpUseSsl'),
   smtpFrom: document.getElementById('smtpFrom'),
   smtpTo: document.getElementById('smtpTo'),
+  emailBotOfflineOnly: document.getElementById('emailBotOfflineOnly'),
   notifyStatus: document.getElementById('notifyStatus'),
   testEmailBtn: document.getElementById('testEmailBtn'),
   siteReportGroup: document.getElementById('siteReportGroup'),
@@ -847,6 +848,7 @@ function renderNotificationSettings(options = {}) {
   els.smtpUseSsl.checked = settings.smtp_use_ssl !== false;
   els.smtpFrom.value = settings.smtp_from || '';
   els.smtpTo.value = settings.smtp_to || '';
+  els.emailBotOfflineOnly.checked = !!settings.email_bot_offline_only;
   const parts = [];
   parts.push(settings.email_enabled ? '邮箱推送已启用' : '邮箱推送未启用');
   if (settings.has_smtp_password) parts.push('密码已保存');
@@ -1131,6 +1133,7 @@ function notificationPayload() {
     smtp_use_ssl: els.smtpUseSsl.checked,
     smtp_from: els.smtpFrom.value.trim(),
     smtp_to: els.smtpTo.value.trim(),
+    email_bot_offline_only: els.emailBotOfflineOnly.checked,
   };
 }
 

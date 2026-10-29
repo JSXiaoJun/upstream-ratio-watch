@@ -578,6 +578,7 @@ def init_db() -> None:
                 smtp_to TEXT,
                 email_last_error TEXT,
                 email_last_sent_at TEXT,
+                email_bot_offline_only INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -741,6 +742,7 @@ def init_db() -> None:
             "smtp_to": "TEXT",
             "email_last_error": "TEXT",
             "email_last_sent_at": "TEXT",
+            "email_bot_offline_only": "INTEGER NOT NULL DEFAULT 0",
         }
         for column_name, column_type in notification_columns.items():
             if column_name not in setting_columns:
@@ -1931,6 +1933,7 @@ def notification_settings_payload() -> Dict[str, Any]:
         "smtp_use_ssl": bool(settings.get("smtp_use_ssl")),
         "smtp_from": settings.get("smtp_from") or "",
         "smtp_to": settings.get("smtp_to") or "",
+        "email_bot_offline_only": bool(settings.get("email_bot_offline_only")),
         "email_last_error": settings.get("email_last_error"),
         "email_last_sent_at": settings.get("email_last_sent_at"),
         "updated_at": settings.get("updated_at"),
@@ -2594,6 +2597,7 @@ def update_notification_settings(body: Dict[str, Any]) -> None:
     smtp_use_ssl = bool(body.get("smtp_use_ssl", True))
     smtp_from = str(body.get("smtp_from") or "").strip()
     smtp_to = str(body.get("smtp_to") or "").strip()
+    email_bot_offline_only = bool(body.get("email_bot_offline_only", False))
 
     if email_enabled:
         if not smtp_host or not smtp_port or not smtp_username or not (smtp_password or settings.get("smtp_password")) or not smtp_to:
@@ -2619,6 +2623,7 @@ def update_notification_settings(body: Dict[str, Any]) -> None:
         "feishu_enabled = ?",
         "qq_enabled = ?",
         "email_enabled = ?",
+        "email_bot_offline_only = ?",
         "wecom_webhook = ?",
         "feishu_webhook = ?",
         "qq_api_url = ?",
@@ -2636,6 +2641,7 @@ def update_notification_settings(body: Dict[str, Any]) -> None:
         1 if feishu_enabled else 0,
         1 if qq_enabled else 0,
         1 if email_enabled else 0,
+        1 if email_bot_offline_only else 0,
         wecom_webhook if wecom_webhook else (settings.get("wecom_webhook") or ""),
         feishu_webhook if feishu_webhook else (settings.get("feishu_webhook") or ""),
         qq_api_url if qq_api_url else (settings.get("qq_api_url") or ""),
@@ -2725,10 +2731,13 @@ def send_qq_message(subject: str, message: str) -> Tuple[bool, Optional[str]]:
     return True, None
 
 
-def send_email_message(subject: str, message: str) -> Tuple[bool, Optional[str]]:
+def send_email_message(subject: str, message: str, kind: str = "alert") -> Tuple[bool, Optional[str]]:
     settings = get_notification_settings()
     if not settings.get("email_enabled"):
-        return True, "邮箱推送未启用，未发送测试邮件"
+        return True, "邮箱推送未启用，未发送邮件"
+    # "只推送机器人掉线/恢复" mode: skip change, balance and auth alerts.
+    if kind not in {"test", "qq_bot"} and settings.get("email_bot_offline_only"):
+        return True, None
 
     smtp_host = str(settings.get("smtp_host") or "").strip()
     smtp_port = int(settings.get("smtp_port") or 465)
@@ -3441,7 +3450,7 @@ def send_qq_bot_offline_alert(error: str, offline_at: str) -> None:
         "掉线期间 QQ 群收不到监控通知，请登录 NapCat WebUI 检查 QQ 登录状态。",
     ])
     # The QQ channel is the thing that is down, so this goes out everywhere else.
-    send_email_message(subject, message)
+    send_email_message(subject, message, kind="qq_bot")
     send_wecom_message(subject, message)
     send_feishu_message(subject, message)
     log_notification("qq", "failed", group_id, message, error)
@@ -3460,7 +3469,7 @@ def send_qq_bot_recovery_notice(offline_at: Optional[str], recovered_at: str) ->
     lines.append("掉线期间发出的 QQ 通知不会补发，可在推送日志中查看。")
     message = "\n".join(lines)
     send_qq_message(subject, message)
-    send_email_message(subject, message)
+    send_email_message(subject, message, kind="qq_bot")
     send_wecom_message(subject, message)
     send_feishu_message(subject, message)
 
@@ -4598,7 +4607,7 @@ class Handler(BaseHTTPRequestHandler):
                 if body:
                     update_notification_settings(body)
                 message = "这是一封上游分组倍率监控测试邮件。"
-                ok, error_message = send_email_message("上游倍率监控邮箱测试", message)
+                ok, error_message = send_email_message("上游倍率监控邮箱测试", message, kind="test")
                 return json_response(self, {"success": ok, "message": error_message or "测试邮件已发送"})
 
             if path == "/api/notifications/test-wecom":

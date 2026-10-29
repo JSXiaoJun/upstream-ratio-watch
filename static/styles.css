@@ -581,6 +581,9 @@ body {
 .notify-grid .field:nth-child(6) {
   grid-column: span 1;
 }
+.notify-grid .field.notify-wide-field {
+  grid-column: 1 / -1;
+}
 .qq-notify-grid {
   grid-template-columns: minmax(0, 1fr) minmax(150px, 0.35fr);
 }

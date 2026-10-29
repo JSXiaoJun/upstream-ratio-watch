@@ -364,10 +364,14 @@
                   <span>收件人</span>
                   <input id="smtpTo" class="input" autocomplete="email" placeholder="多个邮箱用逗号分隔" />
                 </label>
+                <label class="field switch-row notify-wide-field">
+                  <span>只推送 QQ 机器人掉线/恢复提醒</span>
+                  <input id="emailBotOfflineOnly" type="checkbox" />
+                </label>
               </div>
               <div class="notify-footer">
                 <div>
-                  <p class="field-help">常见配置：SSL 端口 465；STARTTLS 可关闭 SSL 后使用 587。</p>
+                  <p class="field-help">常见配置：SSL 端口 465；STARTTLS 可关闭 SSL 后使用 587。勾选上方开关后，倍率、分组和余额提醒只发到其他渠道，邮箱只收机器人掉线/恢复。</p>
                   <div class="notify-status" id="emailStatus">未配置</div>
                 </div>
                 <div class="dialog-actions">

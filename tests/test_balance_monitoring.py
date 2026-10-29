@@ -591,6 +591,48 @@ class BalanceMonitoringTest(unittest.TestCase):
             self.assertIsNone(monitor.run_once())
             self.assertEqual(2, email.call_count)
 
+    def test_email_can_be_limited_to_qq_bot_alerts(self):
+        app.update_notification_settings({
+            "email_enabled": True,
+            "smtp_host": "smtp.example.com",
+            "smtp_port": 465,
+            "smtp_username": "bot@example.com",
+            "smtp_password": "auth-code",
+            "smtp_use_ssl": True,
+            "smtp_to": "me@example.com",
+            "email_bot_offline_only": True,
+        })
+        self.assertTrue(app.notification_settings_payload()["email_bot_offline_only"])
+
+        site_id = self.add_site("newapi", 10)
+        site = app.db_query_one("SELECT * FROM sites WHERE id = ?", (site_id,))
+        changes = [{
+            "change_type": "ratio_changed",
+            "group_name": "default",
+            "old_value": 1,
+            "new_value": 1.5,
+            "change_percent": 50,
+        }]
+
+        with patch.object(app.smtplib, "SMTP_SSL") as smtp_ssl:
+            app.notify_changes(site, changes, app.utc_now_iso())
+            smtp_ssl.assert_not_called()
+
+            self.assertEqual((True, None), app.send_email_message("倍率变动", "正文"))
+            smtp_ssl.assert_not_called()
+
+            ok, error = app.send_email_message("【QQ 监控机器人】已掉线", "正文", kind="qq_bot")
+            self.assertTrue(ok, error)
+            smtp_ssl.assert_called_once()
+
+            ok, error = app.send_email_message("【QQ 监控机器人】已恢复", "正文", kind="qq_bot")
+            self.assertTrue(ok, error)
+            self.assertEqual(2, smtp_ssl.call_count)
+
+            ok, error = app.send_email_message("上游倍率监控邮箱测试", "正文", kind="test")
+            self.assertTrue(ok, error)
+            self.assertEqual(3, smtp_ssl.call_count)
+
     def test_qq_bot_offline_alert_sends_real_email_through_smtp(self):
         app.update_notification_settings({
             "qq_enabled": True,
