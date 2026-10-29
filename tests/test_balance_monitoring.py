@@ -591,6 +591,35 @@ class BalanceMonitoringTest(unittest.TestCase):
             self.assertIsNone(monitor.run_once())
             self.assertEqual(2, email.call_count)
 
+    def test_blank_email_fields_keep_saved_settings(self):
+        app.update_notification_settings({
+            "email_enabled": True,
+            "smtp_host": "smtp.qq.com",
+            "smtp_port": 465,
+            "smtp_username": "bot@example.com",
+            "smtp_password": "auth-code",
+            "smtp_use_ssl": True,
+            "smtp_from": "bot@example.com",
+            "smtp_to": "me@example.com",
+        })
+        # A form that lost its values (or was never filled) must not wipe the config.
+        app.update_notification_settings({
+            "email_enabled": True,
+            "smtp_host": "",
+            "smtp_port": 0,
+            "smtp_username": "",
+            "smtp_password": "",
+            "smtp_from": "",
+            "smtp_to": "",
+        })
+        payload = app.notification_settings_payload()
+        self.assertEqual("smtp.qq.com", payload["smtp_host"])
+        self.assertEqual(465, payload["smtp_port"])
+        self.assertEqual("bot@example.com", payload["smtp_username"])
+        self.assertEqual("bot@example.com", payload["smtp_from"])
+        self.assertEqual("me@example.com", payload["smtp_to"])
+        self.assertTrue(payload["has_smtp_password"])
+
     def test_email_can_be_limited_to_qq_bot_alerts(self):
         app.update_notification_settings({
             "email_enabled": True,

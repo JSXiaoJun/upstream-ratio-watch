@@ -32,7 +32,7 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 STATIC_DIR = APP_DIR / "static"
 DB_PATH = DATA_DIR / "app.db"
-APP_VERSION = "1.15.0"
+APP_VERSION = "1.16.0"
 AUTH_CONFIG_PATH = Path(os.getenv("AUTH_CONFIG_PATH") or (DATA_DIR / "auth.json"))
 AUTH_COOKIE_NAME = "upstream_watch_session"
 DEFAULT_SESSION_DAYS = 30
@@ -2590,13 +2590,15 @@ def update_notification_settings(body: Dict[str, Any]) -> None:
     qq_group_id_raw = str(body.get("qq_group_id") or "").strip()
     qq_group_id = normalize_qq_group_id(qq_group_id_raw)
     email_enabled = bool(body.get("email_enabled", False))
-    smtp_host = str(body.get("smtp_host") or "").strip()
-    smtp_port = int(body.get("smtp_port") or 465)
-    smtp_username = str(body.get("smtp_username") or "").strip()
+    # Blank SMTP fields keep the saved value, so a partial form (or a form that
+    # was rendered without the saved values) can never wipe a working config.
+    smtp_host = str(body.get("smtp_host") or "").strip() or str(settings.get("smtp_host") or "").strip()
+    smtp_port = int(body.get("smtp_port") or settings.get("smtp_port") or 465)
+    smtp_username = str(body.get("smtp_username") or "").strip() or str(settings.get("smtp_username") or "").strip()
     smtp_password = str(body.get("smtp_password") or "")
     smtp_use_ssl = bool(body.get("smtp_use_ssl", True))
-    smtp_from = str(body.get("smtp_from") or "").strip()
-    smtp_to = str(body.get("smtp_to") or "").strip()
+    smtp_from = str(body.get("smtp_from") or "").strip() or str(settings.get("smtp_from") or "").strip()
+    smtp_to = str(body.get("smtp_to") or "").strip() or str(settings.get("smtp_to") or "").strip()
     email_bot_offline_only = bool(body.get("email_bot_offline_only", False))
 
     if email_enabled:
