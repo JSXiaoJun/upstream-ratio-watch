@@ -1292,13 +1292,86 @@ class BalanceMonitoringTest(unittest.TestCase):
     def test_low_balance_notification_includes_upstream_site(self):
         site_id = self.add_site("newapi", 10, token="system-token")
         site = app.db_query_one("SELECT * FROM sites WHERE id = ?", (site_id,))
-        with patch.object(app, "send_qq_message") as send_qq, \
-                patch.object(app, "send_email_message"), \
-                patch.object(app, "send_wecom_message"), \
-                patch.object(app, "send_feishu_message"):
+        with patch.object(app, "send_qq_message", return_value=(True, None)) as send_qq, \
+                patch.object(app, "send_email_message", return_value=(True, None)), \
+                patch.object(app, "send_wecom_message", return_value=(True, None)), \
+                patch.object(app, "send_feishu_message", return_value=(True, None)):
             app.record_balance_event(site, "balance_low", 8.0, 10.0, app.utc_now_iso())
         body = send_qq.call_args[0][1]
         self.assertIn(f"上游站点：{site['base_url']}", body)
+
+    def test_undelivered_low_balance_alert_is_resent_to_failed_channels_only(self):
+        site_id = self.add_site("newapi", 10, token="system-token")
+        qq_results = [(False, "OneBot WebSocket 未连接"), (False, "OneBot send_group_msg 响应超时"), (True, None)]
+
+        with patch.object(app, "send_qq_message", side_effect=qq_results) as send_qq, \
+                patch.object(app, "send_email_message", return_value=(True, None)) as send_email, \
+                patch.object(app, "send_wecom_message", return_value=(True, None)) as send_wecom, \
+                patch.object(app, "send_feishu_message", return_value=(True, None)):
+            app.detect_site(site_id)
+            account = self.account(site_id)
+            self.assertTrue(account["balance_alert_active"])
+            self.assertEqual("qq", account["balance_alert_pending"])
+
+            app.detect_site(site_id)
+            self.assertEqual("qq", self.account(site_id)["balance_alert_pending"])
+
+            app.detect_site(site_id)
+            self.assertEqual("", self.account(site_id)["balance_alert_pending"])
+
+            app.detect_site(site_id)
+
+        self.assertEqual(3, send_qq.call_count)
+        self.assertNotIn("补发", send_qq.call_args_list[0].args[0])
+        self.assertIn("低余额预警（补发）", send_qq.call_args_list[2].args[0])
+        self.assertIn("当前余额：¥8.00", send_qq.call_args_list[2].args[1])
+        self.assertEqual(1, send_email.call_count)
+        self.assertEqual(1, send_wecom.call_count)
+        self.assertEqual(1, len(app.db_query_all("SELECT id FROM changes WHERE change_type = 'balance_low'")))
+
+    def test_failed_channel_raising_does_not_block_qq_and_is_retried(self):
+        site_id = self.add_site("newapi", 10, token="system-token")
+        with patch.object(app, "send_qq_message", return_value=(True, None)) as send_qq, \
+                patch.object(app, "send_email_message", side_effect=[RuntimeError("smtp down"), (True, None)]) as send_email, \
+                patch.object(app, "send_wecom_message", return_value=(True, None)), \
+                patch.object(app, "send_feishu_message", return_value=(True, None)):
+            app.detect_site(site_id)
+            self.assertEqual(1, send_qq.call_count)
+            self.assertEqual("email", self.account(site_id)["balance_alert_pending"])
+
+            app.detect_site(site_id)
+        self.assertEqual(1, send_qq.call_count)
+        self.assertEqual(2, send_email.call_count)
+        self.assertEqual("", self.account(site_id)["balance_alert_pending"])
+
+    def test_recovery_drops_undelivered_low_balance_alert(self):
+        site_id = self.add_site("newapi", 10, token="system-token")
+        with patch.object(app, "send_qq_message", return_value=(False, "QQ 账号已离线")) as send_qq, \
+                patch.object(app, "send_email_message", return_value=(True, None)), \
+                patch.object(app, "send_wecom_message", return_value=(True, None)), \
+                patch.object(app, "send_feishu_message", return_value=(True, None)):
+            app.detect_site(site_id)
+            MockUpstreamHandler.newapi_quota = 6_000_000
+            app.detect_site(site_id)
+            app.detect_site(site_id)
+
+        account = self.account(site_id)
+        self.assertFalse(account["balance_alert_active"])
+        self.assertEqual("", account["balance_alert_pending"])
+        self.assertEqual(["低余额预警", "余额恢复"], [
+            "余额恢复" if "余额恢复" in call.args[0] else "低余额预警" for call in send_qq.call_args_list
+        ])
+
+    def test_disabling_balance_alert_clears_pending_resend(self):
+        site_id = self.add_site("newapi", 10, token="system-token")
+        app.db_execute(
+            "UPDATE site_accounts SET balance_alert_active = 1, balance_alert_pending = 'qq' WHERE site_id = ?",
+            (site_id,),
+        )
+        self.api_request(f"/api/sites/{site_id}", "PUT", {"balance_alert_enabled": False})
+        account = self.account(site_id)
+        self.assertFalse(account["balance_alert_active"])
+        self.assertEqual("", account["balance_alert_pending"])
 
     def api_error(self, path, method, body):
         with self.assertRaises(urllib.error.HTTPError) as context:
@@ -1469,9 +1542,9 @@ class BalanceMonitoringTest(unittest.TestCase):
         self.add_account(site_id, name="账号2", token="second-token", user_id="2")
 
         with patch.object(app, "send_qq_message", return_value=(True, None)) as send_qq, \
-                patch.object(app, "send_email_message"), \
-                patch.object(app, "send_wecom_message"), \
-                patch.object(app, "send_feishu_message"):
+                patch.object(app, "send_email_message", return_value=(True, None)), \
+                patch.object(app, "send_wecom_message", return_value=(True, None)), \
+                patch.object(app, "send_feishu_message", return_value=(True, None)):
             result = app.detect_site(site_id)
             app.detect_site(site_id)
         self.assertEqual(1, send_qq.call_count)

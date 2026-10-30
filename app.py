@@ -628,6 +628,7 @@ def init_db() -> None:
                 balance_last_error TEXT,
                 balance_last_check_at TEXT,
                 balance_alert_active INTEGER NOT NULL DEFAULT 0,
+                balance_alert_pending TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY(site_id) REFERENCES sites(id) ON DELETE CASCADE
@@ -655,6 +656,9 @@ def init_db() -> None:
             table_columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()}
             if "account_id" not in table_columns:
                 conn.execute(f"ALTER TABLE {table_name} ADD COLUMN account_id INTEGER")
+        account_columns = {row["name"] for row in conn.execute("PRAGMA table_info(site_accounts)").fetchall()}
+        if "balance_alert_pending" not in account_columns:
+            conn.execute("ALTER TABLE site_accounts ADD COLUMN balance_alert_pending TEXT NOT NULL DEFAULT ''")
         columns = {
             row["name"]
             for row in conn.execute("PRAGMA table_info(sites)").fetchall()
@@ -3552,6 +3556,37 @@ def format_balance_amount(amount: float, currency: str = "USD") -> str:
     return f"{symbol}{amount:.2f}"
 
 
+BALANCE_ALERT_CHANNELS = ("email", "wecom", "feishu", "qq")
+
+
+def parse_pending_channels(raw: Any) -> List[str]:
+    names = {item.strip() for item in str(raw or "").split(",")}
+    return [channel for channel in BALANCE_ALERT_CHANNELS if channel in names]
+
+
+def send_alert_to_channels(subject: str, body: str, channels: Optional[Iterable[str]] = None) -> List[str]:
+    """Sends to the given channels (all by default) and returns the ones that failed."""
+    senders = {
+        "email": lambda: send_email_message(subject, body),
+        "wecom": lambda: send_wecom_message(subject, body),
+        "feishu": lambda: send_feishu_message(subject, body),
+        "qq": lambda: send_qq_message(subject, body),
+    }
+    wanted = set(BALANCE_ALERT_CHANNELS if channels is None else channels)
+    failed: List[str] = []
+    for channel in BALANCE_ALERT_CHANNELS:
+        if channel not in wanted:
+            continue
+        try:
+            ok, _ = senders[channel]()
+        except Exception:
+            print(f"{channel} 推送异常：{traceback.format_exc(limit=2)}")
+            ok = False
+        if not ok:
+            failed.append(channel)
+    return failed
+
+
 def record_balance_events(
     site: Dict[str, Any],
     event_type: str,
@@ -3559,12 +3594,16 @@ def record_balance_events(
     threshold: float,
     checked_at: str,
     currency: str = "CNY",
-) -> None:
-    """items: (account_id, account label or None for a single-account site, converted amount)."""
+    channels: Optional[Iterable[str]] = None,
+    resend: bool = False,
+) -> List[str]:
+    """items: (account_id, account label or None for a single-account site, converted amount).
+
+    A resend only notifies `channels` and does not record another change. Returns the channels that failed."""
     if not items:
-        return
+        return []
     recovered = event_type == "balance_recovered"
-    for account_id, account_name, amount in items:
+    for account_id, account_name, amount in ([] if resend else items):
         message = (
             f"余额已恢复至 {format_balance_amount(amount, currency)}，高于预警阈值 {format_balance_amount(threshold, currency)}"
             if recovered
@@ -3581,7 +3620,7 @@ def record_balance_events(
             (site["id"], account_id, event_type, json.dumps(threshold), json.dumps(amount), message, checked_at),
         )
 
-    label = "余额恢复" if recovered else "低余额预警"
+    label = ("余额恢复" if recovered else "低余额预警") + ("（补发）" if resend else "")
     named = [item for item in items if item[1]]
     if not named:
         amount = items[0][2]
@@ -3604,10 +3643,7 @@ def record_balance_events(
         f"状态：{'余额已恢复' if recovered else '余额不足，请及时充值'}",
         f"时间：{fmt_local_time_for_message(checked_at)}",
     ])
-    send_email_message(subject, body)
-    send_wecom_message(subject, body)
-    send_feishu_message(subject, body)
-    send_qq_message(subject, body)
+    return send_alert_to_channels(subject, body, channels)
 
 
 def record_balance_event(
@@ -3619,8 +3655,8 @@ def record_balance_event(
     currency: str = "CNY",
     account_id: Optional[int] = None,
     account_name: Optional[str] = None,
-) -> None:
-    record_balance_events(site, event_type, [(account_id, account_name, amount)], threshold, checked_at, currency)
+) -> List[str]:
+    return record_balance_events(site, event_type, [(account_id, account_name, amount)], threshold, checked_at, currency)
 
 
 def collect_site_groups(site: Dict[str, Any]) -> Tuple[bool, Dict[str, Dict[str, Any]], Dict[str, Any], str, Optional[str]]:
@@ -3730,6 +3766,7 @@ def save_account_check(
             balance_last_error = CASE WHEN ? = 1 THEN ? ELSE balance_last_error END,
             balance_last_check_at = CASE WHEN ? = 1 THEN ? ELSE balance_last_check_at END,
             balance_alert_active = ?,
+            balance_alert_pending = ?,
             updated_at = ?
         WHERE id = ?
         """,
@@ -3742,6 +3779,7 @@ def save_account_check(
             attempted, check.get("balance_error"),
             attempted, checked_at,
             1 if check.get("balance_alert_active") else 0,
+            ",".join(check.get("balance_alert_pending") or []),
             checked_at,
             account["id"],
         ),
@@ -3770,8 +3808,11 @@ def apply_account_alerts(
     threshold = float(site.get("balance_alert_threshold") or 0)
     low: List[Tuple[Optional[int], Optional[str], float]] = []
     recovered: List[Tuple[Optional[int], Optional[str], float]] = []
+    # Low-balance alerts that some channel failed to deliver, keyed by the channels still owed.
+    resends: Dict[Tuple[str, ...], List[Tuple[Optional[int], Optional[str], float]]] = {}
     for index, (account, check) in enumerate(zip(accounts, checks)):
         active = bool(account.get("balance_alert_active")) and alerts_enabled
+        pending = parse_pending_channels(account.get("balance_alert_pending")) if active else []
         displayed = converted_balance_info(site, check.get("balance"))
         check["displayed_balance"] = displayed
         if displayed and alerts_enabled:
@@ -3780,13 +3821,25 @@ def apply_account_alerts(
             if amount <= threshold and not active:
                 active = True
                 low.append((account["id"], label, amount))
+            elif amount <= threshold and pending:
+                resends.setdefault(tuple(pending), []).append((account["id"], label, amount))
             elif amount > threshold and active:
                 active = False
+                pending = []
                 recovered.append((account["id"], label, amount))
         check["balance_alert_active"] = active
-    record_balance_events(site, "balance_low", low, threshold, checked_at, "CNY")
+        check["balance_alert_pending"] = pending
+
+    failed_by_account: Dict[Any, List[str]] = {}
+    failed = record_balance_events(site, "balance_low", low, threshold, checked_at, "CNY")
+    failed_by_account.update({account_id: failed for account_id, _, _ in low})
+    for channels, items in resends.items():
+        failed = record_balance_events(site, "balance_low", items, threshold, checked_at, "CNY", channels=channels, resend=True)
+        failed_by_account.update({account_id: failed for account_id, _, _ in items})
     record_balance_events(site, "balance_recovered", recovered, threshold, checked_at, "CNY")
     for account, check in zip(accounts, checks):
+        if account["id"] in failed_by_account:
+            check["balance_alert_pending"] = failed_by_account[account["id"]]
         save_account_check(site, account, check, checked_at)
 
 
@@ -4816,7 +4869,10 @@ class Handler(BaseHTTPRequestHandler):
             if new_accounts is not None:
                 sync_site_accounts(site_id, new_accounts)
             if reset_balance_alerts:
-                db_execute("UPDATE site_accounts SET balance_alert_active = 0 WHERE site_id = ?", (site_id,))
+                db_execute(
+                    "UPDATE site_accounts SET balance_alert_active = 0, balance_alert_pending = '' WHERE site_id = ?",
+                    (site_id,),
+                )
             return json_response(self, {"success": True})
 
         if path == "/api/notifications/settings":
