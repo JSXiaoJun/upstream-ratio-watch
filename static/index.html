@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Upstream Ratio Watch</title>
-  <link rel="stylesheet" href="/styles.css" />
+  <link rel="stylesheet" href="/styles.css?v=__ASSET_VERSION__" />
 </head>
 <body>
   <div class="app-shell">
@@ -33,6 +33,9 @@
     </aside>
 
     <main class="main">
+      <div id="assetWarning" class="asset-warning" role="alert" hidden>
+        页面脚本还是旧版本（浏览器或反向代理缓存了 app.js），新功能点击没有反应。请按 Ctrl+F5（macOS 用 Cmd+Shift+R）强制刷新。
+      </div>
       <header class="topbar">
         <div>
           <div class="page-title">上游分组倍率监控</div>
@@ -534,6 +537,19 @@
     </div>
   </dialog>
 
-  <script src="/app.js"></script>
+  <script src="/app.js?v=__ASSET_VERSION__"></script>
+  <script>
+    // The markup and app.js ship in the same image. If a stale cached app.js is served
+    // (browser cache or a reverse proxy serving static files), say so instead of
+    // leaving new buttons silently inert.
+    function checkAssetWarning() {
+      var warning = document.getElementById('assetWarning');
+      if (!warning) return;
+      var features = window.__APP_SCRIPT_FEATURES__;
+      warning.hidden = !!(features && features.reportScope);
+    }
+    if (document.readyState === 'complete') checkAssetWarning();
+    else window.addEventListener('load', checkAssetWarning);
+  </script>
 </body>
 </html>

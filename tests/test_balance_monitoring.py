@@ -912,6 +912,20 @@ class BalanceMonitoringTest(unittest.TestCase):
         summary = app.site_summary(app.db_query_one("SELECT * FROM sites WHERE id = ?", (site_id,)))
         self.assertFalse(summary["report_hidden"])
 
+    def test_pages_reference_versioned_assets(self):
+        request = urllib.request.Request(f"{self.api_url}/", headers={"Cookie": self.session_cookie})
+        with urllib.request.urlopen(request) as response:
+            html = response.read().decode()
+        self.assertNotIn("__ASSET_VERSION__", html)
+        self.assertIn(f"/app.js?v={app.APP_VERSION}", html)
+        self.assertIn(f"/styles.css?v={app.APP_VERSION}", html)
+        self.assertIn('id="assetWarning"', html)
+
+        with urllib.request.urlopen(f"{self.api_url}/login") as response:
+            login_html = response.read().decode()
+        self.assertNotIn("__ASSET_VERSION__", login_html)
+        self.assertIn(f"/login.js?v={app.APP_VERSION}", login_html)
+
     def test_site_today_usage_api_queries_one_site_and_reports_cache_fallback(self):
         site_id = self.add_site("sub2api", 5)
         app.db_execute("UPDATE sites SET usage_divisor = 10 WHERE id = ?", (site_id,))

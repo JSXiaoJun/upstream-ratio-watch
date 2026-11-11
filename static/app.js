@@ -1,3 +1,7 @@
+// Marks which client features this bundle contains. index.html checks it after load
+// so a stale cached app.js shows a "force refresh" banner instead of dead buttons.
+window.__APP_SCRIPT_FEATURES__ = { reportScope: true };
+
 const state = {
   sites: [],
   changes: [],
@@ -142,6 +146,12 @@ function escapeHtml(str) {
     .replaceAll('<', '&lt;')
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;');
+}
+
+// Wiring that tolerates a missing element: a markup/bundle mismatch must never
+// break the rest of the page.
+function on(element, event, handler) {
+  if (element) element.addEventListener(event, handler);
 }
 
 function badgeClass(status) {
@@ -865,6 +875,10 @@ function updateReportScopeCount() {
 }
 
 function openReportScope() {
+  if (!els.reportScopeDialog || !els.reportScopeList) {
+    showToast('页面脚本没有更新，请按 Ctrl+F5（macOS 用 Cmd+Shift+R）强制刷新', 'error');
+    return;
+  }
   // Default everything to reported; the panel is the single place that edits this.
   state.reportScopeDraft = new Set(state.sites.filter((site) => !site.report_hidden).map((site) => site.id));
   state.reportScopeKeyword = '';
@@ -1579,12 +1593,12 @@ async function handleSiteTableClick(e) {
 els.sitesBody.addEventListener('click', handleSiteTableClick);
 els.overviewSitesBody.addEventListener('click', handleSiteTableClick);
 
-els.reportScopeBtn.addEventListener('click', openReportScope);
-els.reportScopeSearch.addEventListener('input', () => {
+on(els.reportScopeBtn, 'click', openReportScope);
+on(els.reportScopeSearch, 'input', () => {
   state.reportScopeKeyword = els.reportScopeSearch.value;
   renderReportScope();
 });
-els.reportScopeList.addEventListener('change', (event) => {
+on(els.reportScopeList, 'change', (event) => {
   const input = event.target.closest('[data-report-scope-site]');
   if (!input) return;
   const draft = reportScopeSiteIds();
@@ -1594,21 +1608,21 @@ els.reportScopeList.addEventListener('change', (event) => {
   input.closest('.report-scope-row')?.classList.toggle('off', !input.checked);
   updateReportScopeCount();
 });
-els.reportScopeSelectAll.addEventListener('click', () => {
+on(els.reportScopeSelectAll, 'click', () => {
   const draft = reportScopeSiteIds();
   visibleReportScopeSites().filter((site) => site.enabled).forEach((site) => draft.add(site.id));
   renderReportScope();
 });
-els.reportScopeClear.addEventListener('click', () => {
+on(els.reportScopeClear, 'click', () => {
   const draft = reportScopeSiteIds();
   visibleReportScopeSites().filter((site) => site.enabled).forEach((site) => draft.delete(site.id));
   renderReportScope();
 });
-els.saveReportScopeBtn.addEventListener('click', () => {
+on(els.saveReportScopeBtn, 'click', () => {
   saveReportScope().catch((err) => console.error(err));
 });
-els.cancelReportScopeBtn.addEventListener('click', () => els.reportScopeDialog.close());
-els.closeReportScopeBtn.addEventListener('click', () => els.reportScopeDialog.close());
+on(els.cancelReportScopeBtn, 'click', () => els.reportScopeDialog?.close());
+on(els.closeReportScopeBtn, 'click', () => els.reportScopeDialog?.close());
 
 els.form.addEventListener('submit', async (e) => {
   e.preventDefault();

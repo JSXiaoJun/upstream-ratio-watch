@@ -32,7 +32,7 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 STATIC_DIR = APP_DIR / "static"
 DB_PATH = DATA_DIR / "app.db"
-APP_VERSION = "1.17.0"
+APP_VERSION = "1.17.1"
 AUTH_CONFIG_PATH = Path(os.getenv("AUTH_CONFIG_PATH") or (DATA_DIR / "auth.json"))
 AUTH_COOKIE_NAME = "upstream_watch_session"
 DEFAULT_SESSION_DAYS = 30
@@ -4403,6 +4403,24 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _serve_page(self, path: Path) -> None:
+        """Serves an HTML page with the app version baked into its asset URLs.
+
+        The version query string is what keeps a stale cached /app.js (browser cache,
+        or a reverse proxy serving static files itself) from pairing with new markup.
+        """
+        if not path.exists():
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        html = path.read_text(encoding="utf-8").replace("__ASSET_VERSION__", APP_VERSION)
+        data = html.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
@@ -4427,7 +4445,7 @@ class Handler(BaseHTTPRequestHandler):
         if path in {"/login", "/login.html"}:
             if self._auth_session():
                 return redirect_response(self, "/")
-            return self._serve_file(STATIC_DIR / "login.html", "text/html; charset=utf-8")
+            return self._serve_page(STATIC_DIR / "login.html")
         if path == "/login.js":
             return self._serve_file(STATIC_DIR / "login.js", "application/javascript; charset=utf-8")
         if path == "/styles.css":
@@ -4437,7 +4455,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/":
-            return self._serve_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
+            return self._serve_page(STATIC_DIR / "index.html")
         if path == "/app.js":
             return self._serve_file(STATIC_DIR / "app.js", "application/javascript; charset=utf-8")
         if path == "/api/overview":
