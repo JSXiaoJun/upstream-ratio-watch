@@ -827,6 +827,91 @@ class BalanceMonitoringTest(unittest.TestCase):
         self.assertTrue(all(site["live_success"] for site in payload["data"]))
         self.assertTrue(all(not site["cached"] for site in payload["data"]))
 
+    def test_report_visibility_hides_sites_from_all_bot_endpoints(self):
+        hidden_id = self.add_site("sub2api", 5)
+        app.db_execute("UPDATE sites SET name = ? WHERE id = ?", ("不汇报上游", hidden_id))
+        shown_id = self.add_site("newapi", 5, token="system-token")
+        app.db_execute("UPDATE sites SET name = ? WHERE id = ?", ("汇报上游", shown_id))
+        app.update_notification_settings({
+            "qq_enabled": True,
+            "qq_api_url": f"{self.base_url}/qq-notify",
+            "qq_api_token": "scope-secret",
+            "qq_group_id": "123456789",
+        })
+
+        # Every site participates in reports until it is unchecked.
+        self.assertEqual(["不汇报上游", "汇报上游"], [item["name"] for item in app.bot_balance_payload()])
+
+        result = self.api_request("/api/report-visibility", "PUT", {"site_ids": [shown_id]})
+        self.assertEqual({"success": True, "reported": 1, "hidden": 1}, result)
+        self.assertEqual(["汇报上游"], [item["name"] for item in app.bot_balance_payload()])
+
+        bot_headers = {"Authorization": "Bearer scope-secret", "Content-Type": "application/json"}
+        with urllib.request.urlopen(urllib.request.Request(
+            f"{self.api_url}/api/bot/balances", headers=bot_headers
+        )) as response:
+            self.assertEqual(["汇报上游"], [item["name"] for item in json.loads(response.read())["data"]])
+
+        with urllib.request.urlopen(urllib.request.Request(
+            f"{self.api_url}/api/bot/usages/today", data=b"{}", headers=bot_headers, method="POST"
+        )) as response:
+            self.assertEqual(["汇报上游"], [item["name"] for item in json.loads(response.read())["data"]])
+
+        def fake_detect(_site_id):
+            return {"success": True, "message": "ok", "groups": {"默认分组": {"ratio": 1}}, "login_groups": {}}
+
+        with patch.object(app, "detect_site", side_effect=fake_detect):
+            with urllib.request.urlopen(urllib.request.Request(
+                f"{self.api_url}/api/bot/ratios", data=b"{}", headers=bot_headers, method="POST"
+            )) as response:
+                self.assertEqual(["汇报上游"], [item["name"] for item in json.loads(response.read())["data"]])
+
+        self.api_request("/api/report-visibility", "PUT", {"site_ids": [hidden_id, shown_id]})
+        self.assertEqual(["不汇报上游", "汇报上游"], [item["name"] for item in app.bot_balance_payload()])
+
+    def test_report_visibility_requires_session_and_known_sites(self):
+        site_id = self.add_site("sub2api", 5)
+
+        unauthorized = urllib.request.Request(
+            f"{self.api_url}/api/report-visibility",
+            data=json.dumps({"site_ids": []}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="PUT",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as context:
+            urllib.request.urlopen(unauthorized)
+        self.assertEqual(401, context.exception.code)
+
+        code, message = self.api_error("/api/report-visibility", "PUT", {"site_ids": [site_id, 9999]})
+        self.assertEqual(400, code)
+        self.assertIn("刷新", message)
+        self.assertFalse(app.db_query_one("SELECT report_hidden FROM sites WHERE id = ?", (site_id,))["report_hidden"])
+
+        code, _message = self.api_error("/api/report-visibility", "PUT", {})
+        self.assertEqual(400, code)
+
+        self.api_request("/api/report-visibility", "PUT", {"site_ids": []})
+        self.assertTrue(app.db_query_one("SELECT report_hidden FROM sites WHERE id = ?", (site_id,))["report_hidden"])
+
+    def test_disabled_site_is_never_reported(self):
+        site_id = self.add_site("sub2api", 5)
+        app.db_execute("UPDATE sites SET enabled = 0 WHERE id = ?", (site_id,))
+        self.assertEqual([], app.bot_balance_payload())
+
+        summary = app.site_summary(app.db_query_one("SELECT * FROM sites WHERE id = ?", (site_id,)))
+        self.assertFalse(summary["enabled"])
+        self.assertFalse(summary["report_hidden"])
+
+    def test_report_hidden_column_defaults_to_zero(self):
+        site_id = self.add_site("sub2api", 5)
+        columns = {row["name"] for row in app.db_query_all("PRAGMA table_info(sites)")}
+        self.assertIn("report_hidden", columns)
+        row = app.db_query_one("SELECT report_hidden FROM sites WHERE id = ?", (site_id,))
+        self.assertEqual(0, row["report_hidden"])
+
+        summary = app.site_summary(app.db_query_one("SELECT * FROM sites WHERE id = ?", (site_id,)))
+        self.assertFalse(summary["report_hidden"])
+
     def test_site_today_usage_api_queries_one_site_and_reports_cache_fallback(self):
         site_id = self.add_site("sub2api", 5)
         app.db_execute("UPDATE sites SET usage_divisor = 10 WHERE id = ?", (site_id,))

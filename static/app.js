@@ -17,6 +17,8 @@ const state = {
   reportGroups: [],
   reportLayout: null,
   reportLayoutDirty: false,
+  reportScopeDraft: null,
+  reportScopeKeyword: '',
   botSettings: null,
   botSettingsDirty: false,
 };
@@ -43,6 +45,18 @@ const els = {
   addSiteBtn: document.getElementById('addSiteBtn'),
   searchInput: document.getElementById('searchInput'),
   statusFilter: document.getElementById('statusFilter'),
+  reportScopeBtn: document.getElementById('reportScopeBtn'),
+  reportScopeSummary: document.getElementById('reportScopeSummary'),
+  reportScopeDialog: document.getElementById('reportScopeDialog'),
+  reportScopeSearch: document.getElementById('reportScopeSearch'),
+  reportScopeList: document.getElementById('reportScopeList'),
+  reportScopeCount: document.getElementById('reportScopeCount'),
+  reportScopeMsg: document.getElementById('reportScopeMsg'),
+  reportScopeSelectAll: document.getElementById('reportScopeSelectAll'),
+  reportScopeClear: document.getElementById('reportScopeClear'),
+  saveReportScopeBtn: document.getElementById('saveReportScopeBtn'),
+  cancelReportScopeBtn: document.getElementById('cancelReportScopeBtn'),
+  closeReportScopeBtn: document.getElementById('closeReportScopeBtn'),
   dialog: document.getElementById('siteDialog'),
   form: document.getElementById('siteForm'),
   dialogTitle: document.getElementById('dialogTitle'),
@@ -477,6 +491,7 @@ function renderStats() {
 }
 
 function renderActiveView() {
+  updateReportScopeSummary();
   if (state.activeView === 'overview') {
     renderStats();
     els.overviewSitesBody.innerHTML = siteRows(state.sites);
@@ -580,7 +595,7 @@ function renderReportBoard() {
               <span class="report-site-order">${siteIndex + 1}</span>
               <div class="report-site-name">
                 <strong>${escapeHtml(site.name)}</strong>
-                <span>${escapeHtml(platformLabel(site))}${site.enabled ? '' : ' · 已停用'}</span>
+                <span>${escapeHtml(platformLabel(site))}${site.enabled ? '' : ' · 已停用'}${site.enabled && site.report_hidden ? ' · 不汇报' : ''}</span>
               </div>
               <div class="action-row">
                 <button class="btn btn-secondary btn-small" type="button" data-report-site-move="-1" data-group-index="${groupIndex}" data-site-index="${siteIndex}" ${siteIndex === 0 ? 'disabled' : ''} aria-label="上移 ${escapeHtml(site.name)}">↑</button>
@@ -741,6 +756,8 @@ function siteRows(sites) {
           ${hiddenCount ? `<span class="tag strong">${hiddenCount} 个隐藏</span>` : '<span class="muted">无</span>'}
           ${site.platform === 'sub2api' ? '<span class="tag login">用户登录</span>' : site.login_enabled ? '<span class="tag login">认证增强</span>' : ''}
           ${Number(site.account_count || 0) > 1 ? `<span class="tag">${site.account_count} 个账号</span>` : ''}
+          ${site.enabled ? '' : '<span class="tag">已停用</span>'}
+          ${site.enabled && site.report_hidden ? '<span class="tag report-off">不汇报</span>' : ''}
         </td>
         <td>${site.current_groups_count || 0}</td>
         <td>${balanceCell(site)}</td>
@@ -774,6 +791,116 @@ function renderSites() {
   if (state.activeView === 'overview') {
     els.overviewSitesBody.innerHTML = siteRows(state.sites);
   }
+}
+
+function updateReportScopeSummary() {
+  if (!els.reportScopeSummary) return;
+  const enabled = state.sites.filter((site) => site.enabled);
+  const reported = enabled.filter((site) => !site.report_hidden).length;
+  els.reportScopeSummary.textContent = enabled.length
+    ? (reported === enabled.length
+      ? `全部 ${enabled.length} 个启用站点都参与汇报`
+      : `${reported} / ${enabled.length} 个启用站点参与汇报`)
+    : '';
+}
+
+function reportScopeSiteIds() {
+  return state.reportScopeDraft instanceof Set ? state.reportScopeDraft : new Set();
+}
+
+function visibleReportScopeSites() {
+  const keyword = state.reportScopeKeyword.trim().toLowerCase();
+  if (!keyword) return state.sites;
+  return state.sites.filter((site) => `${site.name} ${site.base_url}`.toLowerCase().includes(keyword));
+}
+
+function reportScopeGroups(sites) {
+  const groups = [];
+  sites.forEach((site) => {
+    const name = site.report_group_name || '未分组';
+    const last = groups[groups.length - 1];
+    if (last && last.name === name) last.sites.push(site);
+    else groups.push({ name, sites: [site] });
+  });
+  return groups;
+}
+
+function reportScopeRow(site) {
+  const draft = reportScopeSiteIds();
+  const checked = draft.has(site.id);
+  return `
+    <label class="report-scope-row${checked ? '' : ' off'}${site.enabled ? '' : ' disabled'}">
+      <input type="checkbox" data-report-scope-site="${site.id}" ${checked ? 'checked' : ''} ${site.enabled ? '' : 'disabled'} />
+      <span class="report-scope-name">
+        <strong>${escapeHtml(site.name)}</strong>
+        <span>${escapeHtml(platformLabel(site))} · ${escapeHtml(site.base_url)}</span>
+      </span>
+      <span class="report-scope-flag">${site.enabled ? '' : '<span class="tag">已停用</span>'}</span>
+    </label>
+  `;
+}
+
+function renderReportScope() {
+  const draft = reportScopeSiteIds();
+  const sites = visibleReportScopeSites();
+  els.reportScopeList.innerHTML = sites.length
+    ? reportScopeGroups(sites).map((group) => `
+        <section class="report-scope-group">
+          <div class="report-scope-group-head">
+            <span class="section-title">${escapeHtml(group.name)}</span>
+            <span class="muted">${group.sites.length} 个站点</span>
+          </div>
+          ${group.sites.map(reportScopeRow).join('')}
+        </section>
+      `).join('')
+    : `<div class="report-scope-empty">${state.sites.length ? '没有匹配的站点' : '还没有站点'}</div>`;
+  updateReportScopeCount();
+}
+
+function updateReportScopeCount() {
+  const draft = reportScopeSiteIds();
+  const enabled = state.sites.filter((site) => site.enabled);
+  const reported = enabled.filter((site) => draft.has(site.id)).length;
+  els.reportScopeCount.textContent = `已勾选 ${reported} / ${enabled.length} 个启用站点`;
+}
+
+function openReportScope() {
+  // Default everything to reported; the panel is the single place that edits this.
+  state.reportScopeDraft = new Set(state.sites.filter((site) => !site.report_hidden).map((site) => site.id));
+  state.reportScopeKeyword = '';
+  els.reportScopeSearch.value = '';
+  els.reportScopeMsg.textContent = '';
+  els.reportScopeMsg.classList.remove('error');
+  els.saveReportScopeBtn.disabled = false;
+  els.saveReportScopeBtn.textContent = '保存';
+  renderReportScope();
+  if (!els.reportScopeDialog.open) els.reportScopeDialog.showModal();
+}
+
+async function saveReportScope() {
+  els.reportScopeMsg.textContent = '正在保存...';
+  els.reportScopeMsg.classList.remove('error');
+  els.saveReportScopeBtn.disabled = true;
+  els.saveReportScopeBtn.textContent = '保存中...';
+  try {
+    await api('/api/report-visibility', {
+      method: 'PUT',
+      body: JSON.stringify({ site_ids: Array.from(reportScopeSiteIds()) }),
+    });
+  } catch (err) {
+    els.reportScopeMsg.textContent = err.message;
+    els.reportScopeMsg.classList.add('error');
+    showToast(`保存失败：${err.message}`, 'error');
+    els.saveReportScopeBtn.disabled = false;
+    els.saveReportScopeBtn.textContent = '保存';
+    return;
+  }
+  els.saveReportScopeBtn.disabled = false;
+  els.saveReportScopeBtn.textContent = '保存';
+  els.reportScopeDialog.close();
+  showToast('汇报范围已保存');
+  // A failed refresh must not be reported as a failed save.
+  refreshAll().catch((err) => console.error(err));
 }
 
 function changeRows(changes) {
@@ -951,6 +1078,7 @@ function renderDetail(site) {
       <div class="meta-card"><div class="k">下次检测</div><div class="v">${fmtTime(site.next_check_at)}</div></div>
       <div class="meta-card"><div class="k">连续失败</div><div class="v">${site.consecutive_failures || 0}</div></div>
       <div class="meta-card"><div class="k">启用状态</div><div class="v">${site.enabled ? '启用中' : '已停用'}</div></div>
+      <div class="meta-card"><div class="k">汇报范围</div><div class="v">${site.enabled && !site.report_hidden ? '参与机器人汇报' : '不汇报'}</div></div>
       <div class="meta-card wide"><div class="k">变化通知范围</div><div class="v">${site.notify_all_groups ? '全部分组' : escapeHtml((site.notify_groups || []).join('、') || '-')}</div></div>
       <div class="meta-card wide"><div class="k">监控模式</div><div class="v">${site.platform === 'sub2api' ? `sub2api 用户登录（${accounts.length} 个账号）` : site.login_enabled ? `认证增强监控（${accounts.length} 个账号）` : '公开分组监控'}</div></div>
     </div>
@@ -1450,6 +1578,37 @@ async function handleSiteTableClick(e) {
 
 els.sitesBody.addEventListener('click', handleSiteTableClick);
 els.overviewSitesBody.addEventListener('click', handleSiteTableClick);
+
+els.reportScopeBtn.addEventListener('click', openReportScope);
+els.reportScopeSearch.addEventListener('input', () => {
+  state.reportScopeKeyword = els.reportScopeSearch.value;
+  renderReportScope();
+});
+els.reportScopeList.addEventListener('change', (event) => {
+  const input = event.target.closest('[data-report-scope-site]');
+  if (!input) return;
+  const draft = reportScopeSiteIds();
+  const id = Number(input.dataset.reportScopeSite);
+  if (input.checked) draft.add(id);
+  else draft.delete(id);
+  input.closest('.report-scope-row')?.classList.toggle('off', !input.checked);
+  updateReportScopeCount();
+});
+els.reportScopeSelectAll.addEventListener('click', () => {
+  const draft = reportScopeSiteIds();
+  visibleReportScopeSites().filter((site) => site.enabled).forEach((site) => draft.add(site.id));
+  renderReportScope();
+});
+els.reportScopeClear.addEventListener('click', () => {
+  const draft = reportScopeSiteIds();
+  visibleReportScopeSites().filter((site) => site.enabled).forEach((site) => draft.delete(site.id));
+  renderReportScope();
+});
+els.saveReportScopeBtn.addEventListener('click', () => {
+  saveReportScope().catch((err) => console.error(err));
+});
+els.cancelReportScopeBtn.addEventListener('click', () => els.reportScopeDialog.close());
+els.closeReportScopeBtn.addEventListener('click', () => els.reportScopeDialog.close());
 
 els.form.addEventListener('submit', async (e) => {
   e.preventDefault();

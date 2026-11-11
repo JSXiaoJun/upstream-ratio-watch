@@ -108,6 +108,10 @@
             <div>
               <h2>站点列表</h2>
               <p>少量上游手动维护，每个站点单独设置平台类型、监控间隔和认证方式。</p>
+              <div class="panel-head-sub">
+                <button id="reportScopeBtn" class="btn btn-secondary btn-small" type="button">汇报范围</button>
+                <span id="reportScopeSummary" class="muted"></span>
+              </div>
             </div>
             <div class="toolbar">
               <input id="searchInput" class="input" type="search" placeholder="搜索站点或地址" />
@@ -497,6 +501,37 @@
         </div>
       </footer>
     </form>
+  </dialog>
+
+  <dialog id="reportScopeDialog" class="dialog report-scope-dialog">
+    <div class="dialog-card report-scope-card">
+      <div class="dialog-head">
+        <div>
+          <h3>汇报范围</h3>
+          <p class="dialog-subtitle">勾选的站点会出现在 QQ 机器人的“查利润”“查余额”“查倍率”里，取消勾选即不汇报。</p>
+        </div>
+        <button id="closeReportScopeBtn" class="icon-btn" type="button" aria-label="关闭">×</button>
+      </div>
+      <div class="report-scope-body">
+        <div class="report-scope-toolbar">
+          <input id="reportScopeSearch" class="input" type="search" placeholder="搜索站点或地址" />
+          <div class="action-row">
+            <button id="reportScopeSelectAll" class="btn btn-secondary btn-small" type="button">全选</button>
+            <button id="reportScopeClear" class="btn btn-secondary btn-small" type="button">全部取消</button>
+          </div>
+          <span id="reportScopeCount" class="muted"></span>
+        </div>
+        <p class="field-help">只影响机器人汇报：监控、倍率变化推送和余额预警都不受影响；已停用的站点本来就不汇报。</p>
+        <div id="reportScopeList" class="report-scope-list"></div>
+      </div>
+      <footer class="dialog-footer">
+        <div id="reportScopeMsg" class="dialog-msg"></div>
+        <div class="dialog-actions">
+          <button id="cancelReportScopeBtn" class="btn btn-secondary" type="button">取消</button>
+          <button id="saveReportScopeBtn" class="btn btn-primary" type="button">保存</button>
+        </div>
+      </footer>
+    </div>
   </dialog>
 
   <script src="/app.js"></script>

@@ -32,7 +32,7 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 STATIC_DIR = APP_DIR / "static"
 DB_PATH = DATA_DIR / "app.db"
-APP_VERSION = "1.16.0"
+APP_VERSION = "1.17.0"
 AUTH_CONFIG_PATH = Path(os.getenv("AUTH_CONFIG_PATH") or (DATA_DIR / "auth.json"))
 AUTH_COOKIE_NAME = "upstream_watch_session"
 DEFAULT_SESSION_DAYS = 30
@@ -703,6 +703,7 @@ def init_db() -> None:
             "balance_alert_active": "INTEGER NOT NULL DEFAULT 0",
             "report_group_id": "INTEGER",
             "report_sort_order": "INTEGER NOT NULL DEFAULT 0",
+            "report_hidden": "INTEGER NOT NULL DEFAULT 0",
             "notify_public_ratio": "INTEGER NOT NULL DEFAULT 1",
         }
         for column_name, column_type in site_columns.items():
@@ -1955,6 +1956,10 @@ def notification_bearer_token_matches(authorization: Any) -> bool:
 REPORT_GROUP_JOIN = "LEFT JOIN report_groups rg ON rg.id = sites.report_group_id"
 REPORT_ORDER_BY = "ORDER BY (rg.id IS NULL) ASC, rg.sort_order ASC, rg.id ASC, sites.report_sort_order ASC, sites.id ASC"
 REPORT_GROUP_COLUMNS = "rg.name AS group_name, rg.sort_order AS group_order"
+# A site is reported to the QQ robot only when monitoring is on and it was not
+# excluded in the “汇报范围” panel. Disabling monitoring has always removed a site
+# from 查利润/查倍率/查余额, and that stays true.
+REPORTED_SITES_WHERE = "WHERE sites.enabled = 1 AND sites.report_hidden = 0"
 MAX_REPORT_GROUP_NAME_LENGTH = 40
 UNGROUPED_REPORT_GROUP_NAME = "未分组"
 
@@ -2118,6 +2123,24 @@ def reorder_report_groups(group_ids: Any) -> None:
 
 def reorder_report_sites(layout: Any) -> None:
     save_report_order(layout=layout)
+
+
+def update_report_visibility(site_ids: Any) -> Dict[str, int]:
+    """Sets the sites checked in the 汇报范围 panel as reported, everything else as hidden."""
+    reported = parse_id_list(site_ids if site_ids is not None else [], "汇报站点")
+    now = utc_now_iso()
+    with DB_LOCK, connect_db() as conn:
+        existing = {int(row["id"]) for row in conn.execute("SELECT id FROM sites").fetchall()}
+        unknown = [site_id for site_id in reported if site_id not in existing]
+        if unknown:
+            raise ValueError("站点列表已变化，请刷新页面后重新勾选")
+        if reported:
+            placeholders = ",".join("?" * len(reported))
+            conn.execute(f"UPDATE sites SET report_hidden = 0, updated_at = ? WHERE id IN ({placeholders})", (now, *reported))
+            conn.execute(f"UPDATE sites SET report_hidden = 1, updated_at = ? WHERE id NOT IN ({placeholders})", (now, *reported))
+        else:
+            conn.execute("UPDATE sites SET report_hidden = 1, updated_at = ?", (now,))
+    return {"reported": len(reported), "hidden": len(existing) - len(reported)}
 
 
 MAX_BOT_ALIASES = 100
@@ -2324,7 +2347,7 @@ def update_bot_settings(body: Any) -> None:
 def bot_balance_payload() -> List[Dict[str, Any]]:
     accounts = accounts_by_site_id()
     entries: List[Dict[str, Any]] = []
-    for site in ordered_sites():
+    for site in ordered_sites(REPORTED_SITES_WHERE):
         site_accounts = accounts.get(int(site["id"]), [])
         for index, account in enumerate(site_accounts or [None]):
             account = account or {}
@@ -2500,7 +2523,7 @@ def with_report_group(site: Dict[str, Any], result: Dict[str, Any]) -> Dict[str,
 
 
 def bot_today_usage_payload() -> List[Dict[str, Any]]:
-    sites = ordered_sites("WHERE sites.enabled = 1")
+    sites = ordered_sites(REPORTED_SITES_WHERE)
     if not sites:
         return []
     now = app_now()
@@ -2538,7 +2561,7 @@ def ratio_groups_for_site(site: Dict[str, Any], result: Dict[str, Any]) -> Dict[
 
 
 def bot_live_ratio_payload() -> List[Dict[str, Any]]:
-    sites = ordered_sites("WHERE sites.enabled = 1")
+    sites = ordered_sites(REPORTED_SITES_WHERE)
     if not sites:
         return []
 
@@ -4243,6 +4266,7 @@ def site_summary(site: Dict[str, Any]) -> Dict[str, Any]:
         "report_group_id": site.get("report_group_id"),
         "report_group_name": site.get("group_name"),
         "report_sort_order": site.get("report_sort_order") or 0,
+        "report_hidden": bool(site.get("report_hidden")),
         "enabled": bool(site["enabled"]),
         "interval_minutes": site["interval_minutes"],
         "usage_divisor": site_usage_divisor(site),
@@ -4736,6 +4760,16 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 return json_response(self, {"success": False, "message": str(exc)}, 400)
             return json_response(self, {"success": True, "data": list_report_groups()})
+
+        if path == "/api/report-visibility":
+            try:
+                body = read_json_object(self)
+                if "site_ids" not in body:
+                    raise ValueError("缺少要参与汇报的站点列表")
+                result = update_report_visibility(body["site_ids"])
+            except ValueError as exc:
+                return json_response(self, {"success": False, "message": str(exc)}, 400)
+            return json_response(self, {"success": True, **result})
 
         if path.startswith("/api/report-groups/"):
             try:
